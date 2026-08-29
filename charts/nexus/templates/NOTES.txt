@@ -1,0 +1,38 @@
+Nexus Repository Manager has been deployed!
+
+1. Get the application URL:
+{{- if .Values.ingress.enabled }}
+{{- if .Values.ingress.host }}
+  https://{{ .Values.ingress.host }}
+{{- else }}
+  Ingress is enabled but no host is configured.
+  Set ingress.host in values.yaml
+{{- end }}
+{{- else }}
+  export POD_NAME=$(kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "nexus.name" . }},app.kubernetes.io/instance={{ .Release.Name }}" -o jsonpath="{.items[0].metadata.name}")
+  kubectl --namespace {{ .Release.Namespace }} port-forward $POD_NAME 8081:8081
+  echo "Visit http://127.0.0.1:8081 to use Nexus"
+{{- end }}
+
+2. Get the initial admin password:
+  kubectl -n {{ .Release.Namespace }} exec {{ include "nexus.fullname" . }}-0 -- cat /nexus-data/admin.password
+
+3. Security Notes:
+  ✓ Access is restricted to:
+    - Tailscale network (100.64.0.0/10)
+    - Kubernetes cluster networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
+{{- if .Values.apiIngress.ipAllowList.customIPs }}
+    - Custom IPs: {{ len .Values.apiIngress.ipAllowList.customIPs }} additional IP(s)
+{{- end }}
+  
+  To access Nexus:
+  - Connect via Tailscale VPN, OR
+  - Use kubectl port-forward (bypasses IP whitelist)
+
+4. Next Steps:
+  - Change the admin password via UI or API
+  - Create deployment user for CI/CD pipelines
+  - Configure Maven/Gradle repositories
+  - Set up GitHub environment secrets (NEXUS_USERNAME, NEXUS_PASSWORD)
+
+For more information, see: envs/shared/apps/nexus/README.md

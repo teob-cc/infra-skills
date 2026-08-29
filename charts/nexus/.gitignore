@@ -1,0 +1,12 @@
+# Helm package files
+*.tgz
+
+# Temporary values files
+values-*.yaml
+!values.yaml
+
+# Chart lock file
+Chart.lock
+
+# Dependency charts
+charts/

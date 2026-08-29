@@ -1,0 +1,349 @@
+name: Reusable Build and Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (dev/cit/prod)"
+        required: true
+        type: string
+      base_domain:
+        description: "Base domain of the environment, e.g. prod.example.com — registry is harbor.<base_domain>, nexus is nexus-api.<base_domain>"
+        required: true
+        type: string
+      image_name:
+        description: "Name of the Docker image"
+        required: true
+        type: string
+      sbt_build_command:
+        description: "SBT command to build Docker stage"
+        required: true
+        type: string
+      docker_context:
+        description: "Docker build context path"
+        required: true
+        type: string
+      helm_chart_path:
+        description: "Path to Helm chart directory"
+        required: true
+        type: string
+      image_tag:
+        description: "Custom image tag (optional)"
+        required: false
+        type: string
+        default: ""
+      build_image_tag:
+        description: "Custom build image tag (optional)"
+        required: false
+        type: string
+        default: "latest"
+      e2e_enabled:
+        description: "Run E2E tests after build (default: false)"
+        required: false
+        type: boolean
+        default: false
+      e2e_sbt_command:
+        description: "SBT command to run E2E tests"
+        required: false
+        type: string
+        default: 'sbt e2eTest'
+      harbor_registry:
+        description: "Harbor registry hostname (defaults to harbor.<base_domain>)"
+        required: false
+        type: string
+        default: ""
+      nexus_host:
+        description: "Nexus API hostname (defaults to nexus-api.<base_domain>)"
+        required: false
+        type: string
+        default: ""
+      gitops_repo:
+        description: "GitOps repo receiving version bumps (owner/name); defaults to <owner>/infra-envs"
+        required: false
+        type: string
+        default: ""
+      ci_email:
+        description: "Git author email for GitOps version-bump commits"
+        required: false
+        type: string
+        default: "ci-bot@users.noreply.github.com"
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
+      NEXUS_USERNAME:
+        required: true
+      NEXUS_PASSWORD:
+        required: true
+
+env:
+  HARBOR_REGISTRY: ${{ inputs.harbor_registry || format('harbor.{0}', inputs.base_domain) }}
+  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+  HARBOR_PROJECT: library
+  NEXUS_REGISTRY: ${{ inputs.nexus_host || format('nexus-api.{0}', inputs.base_domain) }}
+  NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+  NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+  IMAGE_NAME: ${{ inputs.image_name }}
+  ENV_NAME: ${{ inputs.environment }}
+  CONTEXT: ${{ inputs.docker_context }}
+  DOCKERFILE: ${{ format('{0}/Dockerfile', inputs.docker_context) }}
+
+jobs:
+  build-and-publish:
+    name: Build and publish image
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment }}
+
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      date: ${{ steps.meta.outputs.date }}
+
+    environment:
+      name: ${{ inputs.environment }}
+
+    permissions:
+      contents: write
+      packages: write
+
+    env:
+      PATH: /usr/lib/jvm/temurin-25-jdk-amd64/bin:/usr/local/sbt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      NPM_CONFIG_CACHE: /tmp/.npm
+      PNPM_HOME: /tmp/.pnpm
+      XDG_CONFIG_HOME: /tmp/.config
+      XDG_CACHE_HOME: /tmp/.cache
+
+    steps:
+      - name: Diagnostic - Runner Environment
+        run: |
+          echo "=== Runner Environment ==="
+          echo "User: $(whoami)"
+          echo "Home: $HOME"
+          echo "PWD: $PWD"
+          echo "PATH: $PATH"
+          echo ""
+          echo "=== Available Tools ==="
+          which java || echo "java not found"
+          which scala || echo "scala not found"
+          which sbt || echo "sbt not found"
+          which node || echo "node not found"
+          which docker || echo "docker not found"
+          echo ""
+          echo "=== Versions ==="
+          java -version 2>&1 || true
+          scala -version 2>&1 || true
+          sbt --version 2>&1 || true
+          node -v 2>&1 || true
+          docker --version 2>&1 || true
+          echo ""
+          echo "=== SBT Location Check ==="
+          ls -la /usr/local/sbt/bin/ 2>&1 || echo "/usr/local/sbt/bin not found"
+          ls -la /usr/local/bin/sbt 2>&1 || echo "/usr/local/bin/sbt not found"
+          find /usr/local -name sbt -type f 2>/dev/null || echo "sbt not found in /usr/local"
+          echo ""
+          echo "=== Home Directory Check ==="
+          ls -la /home/runner/ 2>&1 || echo "/home/runner not accessible"
+          ls -la /home/runner/.config/ 2>&1 || echo "/home/runner/.config not accessible"
+          df -h /home/runner 2>&1 || true
+          mount | grep runner || echo "No runner mounts"
+          echo ""
+          echo "=== Runner Image ==="
+          cat /etc/os-release || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show user
+        run: id && ls -la /var/run/docker.sock && env
+
+      - name: Log in to Harbor
+        run: |
+          set -euo pipefail
+          echo "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Compute version and tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${{ env.HARBOR_REGISTRY }}" ] || [ -z "${{ env.HARBOR_PROJECT }}" ]; then
+            echo "HARBOR_REGISTRY/HARBOR_PROJECT secrets are required" >&2
+            exit 1
+          fi
+
+          IMAGE_REGISTRY='${{ env.HARBOR_REGISTRY }}'
+          IMAGE_REPO='${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}'
+
+          SHORT_SHA="${GITHUB_SHA::8}"
+          RUN_ID='${{ github.run_id }}'
+          YYYYMM=$(date -u +%Y%m)
+          DD=$(date -u +%d)
+
+          # Canonical versions for this pipeline run
+          CHART_VERSION="${YYYYMM}.${DD}.${RUN_ID}+hash.${SHORT_SHA}"
+          IMAGE_TAG="${YYYYMM}.${DD}.${RUN_ID}-hash.${SHORT_SHA}"
+
+          IMAGE="${IMAGE_REGISTRY}/${IMAGE_REPO}"
+          TAGS="${IMAGE}:${IMAGE_TAG},${IMAGE}:latest"
+
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAGS="${IMAGE}:${{ inputs.image_tag }},${TAGS}"
+          fi
+
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u --iso-8601=seconds)" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker stage (sbt)
+        run: ${{ inputs.sbt_build_command }}
+
+      - name: Run E2E tests
+        if: inputs.e2e_enabled
+        run: ${{ inputs.e2e_sbt_command }}
+
+      - name: Build and push (podman/docker)
+        run: |
+          set -euo pipefail
+          CONTEXT="${{ env.CONTEXT }}"
+          DOCKERFILE="${{ env.DOCKERFILE }}"
+
+          # Parse tags into an array
+          IFS=',' read -ra TAGS_ARR <<< "${{ steps.meta.outputs.tags }}"
+          FIRST_TAG="${TAGS_ARR[0]}"
+
+          echo "Building ${FIRST_TAG} from $CONTEXT using $DOCKERFILE"
+          
+          # Use simple docker build (buildx cache flags not supported by legacy builder)
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=${{ steps.meta.outputs.date }}" \
+            --label "org.opencontainers.image.version=${{ steps.meta.outputs.image_tag }}" \
+            -f "$DOCKERFILE" -t "$FIRST_TAG" "$CONTEXT"
+
+          # Apply remaining tags to the same image
+          for ((i=1; i<${#TAGS_ARR[@]}; i++)); do
+            echo "Tagging ${TAGS_ARR[$i]}"
+            docker tag "$FIRST_TAG" "${TAGS_ARR[$i]}"
+          done
+
+          # Push all tags
+          for t in "${TAGS_ARR[@]}"; do
+            echo "Pushing $t"
+            docker push "$t"
+          done
+
+      - name: Show pushed tags
+        run: |
+          echo "Pushed to: ${{ steps.meta.outputs.image }}"
+          echo "Tags:"
+          IFS=',' read -ra T <<< "${{ steps.meta.outputs.tags }}"
+          for t in "${T[@]}"; do echo " - $t"; done
+
+      - name: Helm login & push chart as OCI
+        env:
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          helm registry login '${{ env.HARBOR_REGISTRY }}' -u '${{ env.HARBOR_USERNAME }}' -p '${{ env.HARBOR_PASSWORD }}'
+          CHART_SRC="${{ inputs.helm_chart_path }}"
+          CHART_REF="oci://${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/charts"
+
+          # Update image tag in values.yaml using IMAGE_TAG env var
+          VALUES_FILE="${CHART_SRC}/values.yaml"
+          cat $VALUES_FILE
+          sed -i -E "s/^([[:space:]]*tag:)[[:space:]]*(\"[^\"]*\"|[^[:space:]]+)$/\1 \"${IMAGE_TAG}\"/" "$VALUES_FILE"
+          
+          echo "Verifying image tag in values.yaml contains IMAGE_TAG=$IMAGE_TAG"
+          if grep -Eq "^[[:space:]]*tag:[[:space:]]*\"${IMAGE_TAG}\"" "$VALUES_FILE"; then
+            echo "OK: Found expected tag line:"
+            grep -n "^[[:space:]]*tag:" "$VALUES_FILE"
+          else
+            echo "ERROR: Didn't find expected tag in $VALUES_FILE"
+            echo "--- $VALUES_FILE ---"
+            sed -n '1,200p' "$VALUES_FILE"
+            exit 1
+          fi
+
+          # Validate chart before packaging
+          helm lint "$CHART_SRC"
+          
+          # Package chart with identical version and appVersion
+          helm package "$CHART_SRC" \
+            --version '${{ steps.meta.outputs.version }}' \
+            --app-version '${{ steps.meta.outputs.version }}'
+
+          CHART_TGZ=$(ls -1 ${{ env.IMAGE_NAME }}-*.tgz | head -n1)
+          echo "Pushing chart: $CHART_TGZ to $CHART_REF"
+          helm push "$CHART_TGZ" "$CHART_REF"
+
+  deploy:
+    name: Deploy
+    # Never deploy from a pull_request build. This job commits the version bump
+    # into infra-envs, which ArgoCD syncs, so without this gate merely opening a
+    # PR ships that branch to the target environment -- and because the last
+    # build to finish owns the environment, a PR could silently overwrite what
+    # main had just deployed. Push and workflow_dispatch still deploy as before.
+    if: github.event_name != 'pull_request'
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment }}
+    needs: build-and-publish
+    env:
+      VERSION: ${{ needs.build-and-publish.outputs.version }}
+      IMAGE_TAG: ${{ needs.build-and-publish.outputs.image_tag }}
+
+    outputs:
+      app_token: ${{ steps.mint.outputs.token }}
+    steps:
+      - id: read-env
+        shell: bash
+        run: |
+          echo "app_id=$GITHUB_APP_ID" >> "$GITHUB_OUTPUT"
+          # Mask every line of the private key so it never appears in logs
+          while IFS= read -r line; do
+            [ -n "$line" ] && echo "::add-mask::$line"
+          done <<< "$GITHUB_APP_PRIVATE_KEY"
+          {
+            echo "private_key<<EOF"
+            printf '%s\n' "$GITHUB_APP_PRIVATE_KEY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "owner=$RUNNER_ORG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ steps.read-env.outputs.app_id }}
+          private-key: ${{ steps.read-env.outputs.private_key }}
+          owner: ${{ steps.read-env.outputs.owner }}
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops_repo || format('{0}/infra-envs', github.repository_owner) }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          fetch-depth: 0
+
+      - name: Update version in GitOps repo
+        run: |
+          set -euo pipefail
+          cd gitops
+          git config user.name "ci-bot"
+          git config user.email "${{ inputs.ci_email }}"
+          APP_DIR="envs/${{ env.ENV_NAME }}/apps/${{ env.IMAGE_NAME }}"
+          CHART_FILE="${APP_DIR}/Chart.yaml"
+          
+          sed -i -E "s/^([[:space:]]+)version:.*/\1version: ${VERSION}/" "$CHART_FILE"
+          grep -E "^[[:space:]]+version:" "$CHART_FILE"
+          
+          git add "$CHART_FILE"
+          git commit -m "${{ env.IMAGE_NAME }}: set chart/app version=${VERSION}; deps.${{ env.IMAGE_NAME }}.version=${VERSION}; image.tag=${IMAGE_TAG}" || echo "No changes to commit"
+          # push back to infra repo
+          git push

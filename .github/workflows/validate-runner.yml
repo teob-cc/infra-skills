@@ -1,0 +1,262 @@
+name: Validate Runner Environment
+
+# Scheduled runs have no inputs: set the repository (or organization) variable
+# RUNNER_ENVIRONMENT so the daily drift check knows which environment to validate.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (e.g. prod)"
+        required: true
+        type: string
+      test_postgres:
+        description: "Test PostgreSQL connectivity"
+        required: false
+        type: boolean
+        default: true
+      test_nexus:
+        description: "Test Nexus connectivity"
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    # Run daily at 6 AM UTC to catch infrastructure drift
+    - cron: '0 6 * * *'
+
+env:
+  ENV_NAME: ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+
+jobs:
+  validate-runner:
+    name: Validate Runner (${{ inputs.environment || vars.RUNNER_ENVIRONMENT }})
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+
+    environment:
+      name: ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+
+    steps:
+      - name: Generate unique namespace
+        id: ns
+        run: |
+          # Create unique namespace for this run to prevent resource leaks
+          NS="runner-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "namespace=${NS}" >> "$GITHUB_OUTPUT"
+          echo "Using ephemeral namespace: ${NS}"
+
+      - name: Create ephemeral namespace
+        run: |
+          kubectl create namespace "${{ steps.ns.outputs.namespace }}" || true
+          # Label for easy cleanup
+          kubectl label namespace "${{ steps.ns.outputs.namespace }}" \
+            app.kubernetes.io/managed-by=github-actions \
+            github.com/run-id="${GITHUB_RUN_ID}" \
+            --overwrite
+
+      - name: Diagnostic - Runner Environment
+        run: |
+          echo "=== Runner Environment ==="
+          echo "User: $(whoami)"
+          echo "Home: $HOME"
+          echo "PWD: $PWD"
+          echo "Namespace: ${{ steps.ns.outputs.namespace }}"
+          echo ""
+          echo "=== Environment Variables ==="
+          echo "GITHUB_APP_ID: ${GITHUB_APP_ID:+set (hidden)}"
+          echo "NEXUS_USERNAME: ${NEXUS_USERNAME:-not set}"
+          echo "NEXUS_URL: ${NEXUS_URL:-not set}"
+          echo "POSTGRES_HOST: ${POSTGRES_HOST:-not set}"
+          echo "POSTGRES_PORT: ${POSTGRES_PORT:-not set}"
+          echo "POSTGRES_DATABASE: ${POSTGRES_DATABASE:-not set}"
+          echo "POSTGRES_USERNAME: ${POSTGRES_USERNAME:-not set}"
+          echo "POSTGRES_URL: ${POSTGRES_URL:+set (hidden)}"
+          echo ""
+          echo "=== Available Tools ==="
+          which kubectl || echo "kubectl not found"
+          which docker || echo "docker not found"
+          which psql || echo "psql not found (optional)"
+          which curl || echo "curl not found"
+          echo ""
+          echo "=== Kubernetes Context ==="
+          kubectl config current-context || echo "No context"
+          kubectl cluster-info || echo "Cannot reach cluster"
+
+      - name: Test PostgreSQL Connectivity
+        if: ${{ inputs.test_postgres != false }}
+        run: |
+          echo "=== PostgreSQL Connectivity Test ==="
+          
+          if [[ -z "${POSTGRES_HOST:-}" ]]; then
+            echo "⚠ POSTGRES_HOST not set - skipping PostgreSQL test"
+            echo "  Run 'tools/k3s/postgres.sh ${ENV_NAME}' and 'tools/k3s/github-action-runner.sh ${ENV_NAME}' to provision"
+            exit 0
+          fi
+          
+          echo "Host: ${POSTGRES_HOST}"
+          echo "Port: ${POSTGRES_PORT}"
+          echo "Database: ${POSTGRES_DATABASE}"
+          echo "Username: ${POSTGRES_USERNAME}"
+          
+          # Test TCP connectivity
+          echo ""
+          echo "Testing TCP connectivity to ${POSTGRES_HOST}:${POSTGRES_PORT}..."
+          if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${POSTGRES_HOST}/${POSTGRES_PORT}" 2>/dev/null; then
+            echo "✓ TCP connection successful"
+          else
+            echo "✗ TCP connection failed"
+            exit 1
+          fi
+          
+          # Test with psql if available
+          if command -v psql &>/dev/null; then
+            echo ""
+            echo "Testing PostgreSQL authentication..."
+            if PGPASSWORD="${POSTGRES_PASSWORD}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USERNAME}" -d "${POSTGRES_DATABASE}" -c "SELECT 1 AS test;" >/dev/null 2>&1; then
+              echo "✓ PostgreSQL authentication successful"
+              
+              # Run a simple query in the ephemeral namespace context
+              echo ""
+              echo "Running test query..."
+              PGPASSWORD="${POSTGRES_PASSWORD}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT}" -U "${POSTGRES_USERNAME}" -d "${POSTGRES_DATABASE}" -c "SELECT version();"
+            else
+              echo "✗ PostgreSQL authentication failed"
+              exit 1
+            fi
+          else
+            echo "ℹ psql not available - skipping authentication test"
+            echo "  TCP connectivity confirmed, authentication not tested"
+          fi
+
+      - name: Test Nexus Connectivity
+        if: ${{ inputs.test_nexus != false }}
+        run: |
+          echo "=== Nexus Connectivity Test ==="
+          
+          if [[ -z "${NEXUS_URL:-}" ]]; then
+            echo "⚠ NEXUS_URL not set - skipping Nexus test"
+            echo "  Run 'tools/k3s/nexus.sh ${ENV_NAME}' and 'tools/k3s/github-action-runner.sh ${ENV_NAME}' to provision"
+            exit 0
+          fi
+          
+          echo "URL: ${NEXUS_URL}"
+          echo "Username: ${NEXUS_USERNAME}"
+          
+          # Test HTTP connectivity
+          echo ""
+          echo "Testing HTTP connectivity..."
+          if curl -sf --max-time 10 "${NEXUS_URL}/service/rest/v1/status" >/dev/null 2>&1; then
+            echo "✓ Nexus is reachable"
+          else
+            echo "⚠ Nexus status endpoint not reachable (may be expected for some configurations)"
+          fi
+          
+          # Test authenticated access to maven-public
+          echo ""
+          echo "Testing authenticated access to maven-public repository..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+            -u "${NEXUS_USERNAME}:${NEXUS_PASSWORD}" \
+            "${NEXUS_URL}/repository/maven-public/")
+          
+          if [[ "$HTTP_CODE" == "200" ]]; then
+            echo "✓ Authenticated access successful (HTTP ${HTTP_CODE})"
+          else
+            echo "⚠ Authenticated access returned HTTP ${HTTP_CODE}"
+          fi
+
+      - name: Test Kubernetes Access
+        run: |
+          echo "=== Kubernetes Access Test ==="
+          NS="${{ steps.ns.outputs.namespace }}"
+          
+          echo "Testing namespace access..."
+          if kubectl get namespace "$NS" >/dev/null 2>&1; then
+            echo "✓ Can access namespace: ${NS}"
+          else
+            echo "✗ Cannot access namespace: ${NS}"
+            exit 1
+          fi
+          
+          echo ""
+          echo "Testing pod creation in ephemeral namespace..."
+          kubectl run test-pod --image=busybox:latest --restart=Never \
+            --namespace="$NS" \
+            --command -- sleep 5 || true
+          
+          # Wait for pod to be created
+          sleep 2
+          
+          if kubectl get pod test-pod -n "$NS" >/dev/null 2>&1; then
+            echo "✓ Can create pods in namespace"
+            kubectl delete pod test-pod -n "$NS" --ignore-not-found=true
+          else
+            echo "⚠ Pod creation may have failed (checking events)"
+            kubectl get events -n "$NS" --sort-by='.lastTimestamp' | tail -5
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  Runner Validation Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Environment: ${ENV_NAME}"
+          echo "Namespace: ${{ steps.ns.outputs.namespace }}"
+          echo "Run ID: ${GITHUB_RUN_ID}"
+          echo ""
+          echo "Credentials available:"
+          echo "  PostgreSQL: ${POSTGRES_HOST:+✓}${POSTGRES_HOST:-✗}"
+          echo "  Nexus: ${NEXUS_URL:+✓}${NEXUS_URL:-✗}"
+          echo ""
+
+      - name: Cleanup ephemeral namespace
+        if: always()
+        run: |
+          echo "Cleaning up ephemeral namespace: ${{ steps.ns.outputs.namespace }}"
+          kubectl delete namespace "${{ steps.ns.outputs.namespace }}" --ignore-not-found=true --wait=false
+          echo "✓ Namespace deletion initiated (async)"
+
+  cleanup-stale-namespaces:
+    name: Cleanup Stale Test Namespaces
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+    if: always()
+    needs: validate-runner
+
+    steps:
+      - name: Find and delete stale test namespaces
+        run: |
+          echo "=== Cleaning up stale test namespaces ==="
+          
+          # Find namespaces older than 1 hour with our label
+          STALE_NS=$(kubectl get namespaces \
+            -l app.kubernetes.io/managed-by=github-actions \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null || true)
+          
+          if [[ -z "$STALE_NS" ]]; then
+            echo "No test namespaces found"
+            exit 0
+          fi
+          
+          CURRENT_TIME=$(date +%s)
+          ONE_HOUR_AGO=$((CURRENT_TIME - 3600))
+          
+          echo "$STALE_NS" | while read -r ns timestamp; do
+            if [[ -z "$ns" ]]; then continue; fi
+            
+            # Convert timestamp to epoch
+            NS_TIME=$(date -d "$timestamp" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" +%s 2>/dev/null || echo "0")
+            
+            if [[ "$NS_TIME" -lt "$ONE_HOUR_AGO" ]]; then
+              echo "Deleting stale namespace: ${ns} (created: ${timestamp})"
+              kubectl delete namespace "$ns" --ignore-not-found=true --wait=false || true
+            else
+              echo "Keeping recent namespace: ${ns} (created: ${timestamp})"
+            fi
+          done
+          
+          echo ""
+          echo "✓ Stale namespace cleanup complete"

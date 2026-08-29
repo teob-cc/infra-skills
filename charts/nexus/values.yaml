@@ -1,0 +1,95 @@
+# Nexus Repository Manager Configuration
+
+# Nexus image configuration
+image:
+  repository: sonatype/nexus3
+  tag: "3.70.1"
+  pullPolicy: IfNotPresent
+
+# Resource limits and requests
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 4Gi
+
+# JVM configuration
+jvm:
+  xms: "1200M"
+  xmx: "1200M"
+  maxDirectMemorySize: "2G"
+
+# Persistent storage configuration
+persistence:
+  enabled: true
+  storageClass: "local-path"
+  size: 50Gi
+  accessMode: ReadWriteOnce
+  # Use existing PVC (for migration from kubectl-managed resources)
+  existingClaim: ""  # Set to "nexus-data" to reuse existing PVC
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8081
+
+# Ingress configuration (UI access via Pomerium SSO)
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: ""  # Will be set from env.properties
+  tls:
+    enabled: true
+    secretName: nexus-tls
+
+# API Ingress configuration (for package read/write with Nexus auth)
+# Exposes repository APIs on nexus-api.<env>.<domain> with HTTPS
+# Authentication is handled by Nexus itself (use deployment credentials)
+# Access is restricted to GitHub action runners (in-cluster) and Tailscale VPN
+apiIngress:
+  enabled: true  # Set to true to enable API-only ingress
+  className: traefik
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: ""  # Will be set to nexus-api.<env>.<domain>
+  tls:
+    enabled: true
+    secretName: nexus-api-tls
+  ipAllowList:
+    # Empty by default: add your own trusted source ranges here before enabling
+    # the API ingress for external access (office/home IPs, VPN egress ranges).
+    customIPs: []
+    #  - 203.0.113.10/32   # your office IP
+    #  - 198.51.100.0/24   # your VPN egress range
+
+# Probes configuration
+livenessProbe:
+  httpGet:
+    path: /
+    port: 8081
+  initialDelaySeconds: 180
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 6
+
+readinessProbe:
+  httpGet:
+    path: /
+    port: 8081
+  initialDelaySeconds: 180
+  periodSeconds: 30
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+# Deployment user credentials (for CI/CD)
+deploymentUser:
+  username: deployment
+  # Password will be generated or retrieved from secret
+
+# Admin credentials
+admin:
+  # Password will be generated or retrieved from secret
+  passwordSecret: nexus-admin-credentials

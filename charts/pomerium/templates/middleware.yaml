@@ -1,0 +1,16 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ .Values.middleware.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pomerium.labels" . | nindent 4 }}
+spec:
+  forwardAuth:
+    address: {{ required "config.authenticateServiceUrl" .Values.config.authenticateServiceUrl }}/.pomerium/api/v1/forwardauth
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-Pomerium-Jwt-Assertion
+      - X-Pomerium-Claim-Email
+      - X-Pomerium-Claim-Groups
+      - X-Pomerium-Authenticated-User-Id

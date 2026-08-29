@@ -1,0 +1,121 @@
+name: Build Custom GitHub Actions Runner Image
+
+# Push-triggered runs have no inputs: set the repository (or organization) variables
+# RUNNER_ENVIRONMENT and BASE_DOMAIN so those builds know where to run and push.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (e.g. prod)"
+        required: true
+        type: string
+      base_domain:
+        description: "Base domain of the environment, e.g. prod.example.com — registry is harbor.<base_domain>"
+        required: true
+        type: string
+      harbor_registry:
+        description: "Harbor registry hostname (defaults to harbor.<base_domain>)"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-runner-image.yml'
+      - 'images/github-runner/**'
+
+env:
+  DOCKERFILE: images/github-runner/Dockerfile
+  CONTEXT: images/github-runner
+  IMAGE_NAME: github-runner
+  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+  HARBOR_PROJECT: library
+
+jobs:
+  build-and-push:
+    runs-on:
+      - self-hosted
+      - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+
+    environment:
+      name: ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set Harbor registry URL
+        id: harbor
+        run: |
+          # Explicit harbor_registry input wins; otherwise derive harbor.<base_domain>
+          # (base_domain input on dispatch, BASE_DOMAIN variable on push).
+          HARBOR_REGISTRY="${{ inputs.harbor_registry || format('harbor.{0}', inputs.base_domain || vars.BASE_DOMAIN) }}"
+          if [ "$HARBOR_REGISTRY" = "harbor." ]; then
+            echo "No base_domain input and no BASE_DOMAIN repository variable set" >&2
+            exit 1
+          fi
+          echo "registry=${HARBOR_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "Using Harbor registry: ${HARBOR_REGISTRY}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.harbor.outputs.registry }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Compute tags
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE_REGISTRY="${{ steps.harbor.outputs.registry }}"
+          IMAGE_REPO="${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}"
+          SHA_TAG=${GITHUB_SHA::12}
+          DATE_TAG=$(date -u +%Y%m%d)
+
+          TAGS="${IMAGE_REGISTRY}/${IMAGE_REPO}:${SHA_TAG},${IMAGE_REGISTRY}/${IMAGE_REPO}:${DATE_TAG},${IMAGE_REGISTRY}/${IMAGE_REPO}:latest"
+
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE_REGISTRY}/${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u --iso-8601=seconds)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.date }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      - name: Move updated build cache
+        if: success()
+        run: |
+          # Remove old cache contents (not the directory itself, which may be a mount point)
+          rm -rf /tmp/.buildx-cache/* || true
+          # Move new cache contents
+          if [ -d /tmp/.buildx-cache-new ]; then
+            mv /tmp/.buildx-cache-new/* /tmp/.buildx-cache/ 2>/dev/null || true
+            rmdir /tmp/.buildx-cache-new || true
+          fi
+
+      - name: Show pushed tags
+        run: |
+          echo "Pushed to: ${{ steps.meta.outputs.image }}"
+          echo "Tags:"
+          IFS=',' read -ra T <<< "${{ steps.meta.outputs.tags }}"
+          for t in "${T[@]}"; do echo " - $t"; done

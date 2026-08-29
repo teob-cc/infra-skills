@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.configMapName | default "dex-config" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dex.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+{{ include "dex.config" . | indent 4 }}

@@ -1,0 +1,40 @@
+{{- if .Values.apiIngress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "nexus.fullname" . }}-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+  annotations:
+    {{- with .Values.apiIngress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.apiIngress.host }}
+    cert-manager.io/common-name: {{ .Values.apiIngress.host }}
+    {{- end }}
+    # IP whitelist middleware to restrict API access to GitHub runners and Tailscale VPN
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-{{ include "nexus.fullname" . }}-api-ip-whitelist@kubernetescrd
+spec:
+  ingressClassName: {{ .Values.apiIngress.className }}
+  {{- if and .Values.apiIngress.tls.enabled .Values.apiIngress.host }}
+  tls:
+  - hosts:
+    - {{ .Values.apiIngress.host }}
+    secretName: {{ .Values.apiIngress.tls.secretName }}
+  {{- end }}
+  rules:
+  {{- if .Values.apiIngress.host }}
+  - host: {{ .Values.apiIngress.host }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ include "nexus.fullname" . }}
+            port:
+              number: {{ .Values.service.port }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,20 @@
+# TEMPLATE ONLY. Copy this into your own `infra-envs` repo and replace the age
+# recipient below with YOUR OWN public key before encrypting anything:
+#
+#   age-keygen -y ~/.config/sops/age/keys.txt   # prints your recipient (age1...)
+#
+# The placeholder below is intentionally invalid so a verbatim copy fails loudly
+# rather than silently encrypting your secrets to someone else's key. See the
+# new-env skill, Step 4.
+creation_rules:
+  - path_regex: envs/.*/secrets.plain/.*\.(yaml|yml)$
+    # Only encrypt Kubernetes Secret payloads (common pattern)
+    encrypted_regex: '^(data|stringData)$'
+    age: [
+      'age1REPLACE_WITH_YOUR_OWN_RECIPIENT'
+    ]
+  - path_regex: envs/.*/secrets.plain/.*$
+    # Cover non-YAML plaintext files (encrypted using sops binary mode)
+    age: [
+      'age1REPLACE_WITH_YOUR_OWN_RECIPIENT'
+    ]

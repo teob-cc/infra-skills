@@ -1,0 +1,15 @@
+{
+  "name": "pragmasoft",
+  "owner": {
+    "name": "PragmaSoft",
+    "url": "https://pragmasoft.nl"
+  },
+  "description": "Sovereign Stack skills — provision a complete self-hosted platform on your own hardware with your own AI agent.",
+  "plugins": [
+    {
+      "name": "sovereign-stack",
+      "source": "./plugins/sovereign-stack",
+      "description": "First-contact onboarding (/onboard), environment scaffolding (/new-env), and full platform provisioning (/provision) on Hetzner bare-metal or Cloud — from an empty directory to a documented, running platform."
+    }
+  ]
+}

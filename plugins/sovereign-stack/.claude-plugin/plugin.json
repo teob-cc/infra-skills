@@ -1,0 +1,9 @@
+{
+  "name": "sovereign-stack",
+  "description": "Self-service onboarding onto a complete self-hosted platform (identity/SSO, CI/CD, GitOps, registries, databases, observability) on your own Hetzner servers, driven by your AI agent. Start with /sovereign-stack:onboard from an empty directory — the skill fetches the provisioning code, walks you through the credentials, provisions, and publishes your architecture docs.",
+  "version": "0.2.0",
+  "author": {
+    "name": "PragmaSoft",
+    "url": "https://pragmasoft.nl"
+  }
+}

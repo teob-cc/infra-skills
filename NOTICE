@@ -1,0 +1,13 @@
+infra-skills — open provisioning layer of the Sovereign Stack
+Copyright 2026 PayStream B.V.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This is the open provisioning layer of the Sovereign Stack: the scripts,
+charts, conventions, and agent skills that provision and operate a
+fully-owned environment. It is designed to be driven directly by the
+owner (and the owner's own AI agent) with no dependency on any hosted
+control plane.
+
+The facilitated multi-tenant control plane that orchestrates this layer
+is a separate commercial work under a different licence.

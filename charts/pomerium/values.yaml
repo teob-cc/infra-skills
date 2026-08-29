@@ -1,0 +1,52 @@
+replicaCount: 1
+
+fullnameOverride: pomerium-proxy
+
+image:
+  repository: pomerium/pomerium
+  tag: v0.32.6
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources: {}
+
+config:
+  authenticateServiceUrl: ""
+  idpProvider: oidc
+  idpProviderUrl: ""
+  idpClientId: pomerium
+  idpClientSecret: ""
+  cookieSecret: ""
+  sharedSecret: ""
+  routes: []
+
+secrets:
+  create: true
+  name: pomerium-secrets
+
+configSecret:
+  create: true
+  name: pomerium-config
+
+ingress:
+  enabled: true
+  className: ""
+  clusterIssuer: ""
+  annotations: {}
+  host: ""
+  tls:
+    secretName: pomerium-auth-tls
+
+middleware:
+  create: true
+  name: pomerium-auth
+  # Optional override for Traefik CRD API group. Auto-detected if empty.
+  # Allowed values: "traefik.io" or "containo.us"
+  apiGroupOverride: ""
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

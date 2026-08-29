@@ -1,0 +1,55 @@
+replicaCount: 1
+
+fullnameOverride: dex
+
+image:
+  repository: ghcr.io/dexidp/dex
+  tag: v2.37.0
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: dex
+
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  httpPort: 5556
+  telemetryPort: 5558
+
+configMapName: dex-config
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+config:
+  issuer: ""
+  github:
+    clientID: ""
+    clientSecret: ""
+    org: ""
+    loadAllGroups: true
+    useLoginAsID: true
+    teams: []
+  staticClients: []
+  enablePasswordDB: false
+
+ingress:
+  enabled: true
+  className: ""
+  clusterIssuer: ""
+  annotations: {}
+  host: ""
+  tls:
+    secretName: dex-tls
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

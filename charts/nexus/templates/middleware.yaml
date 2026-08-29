@@ -1,0 +1,22 @@
+{{- if .Values.apiIngress.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "nexus.fullname" . }}-api-ip-whitelist
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nexus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  ipAllowList:
+    sourceRange:
+      # Kubernetes internal networks (pods, services)
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+      # Tailscale CGNAT range
+      - "100.64.0.0/10"
+      {{- range .Values.apiIngress.ipAllowList.customIPs }}
+      - {{ . | quote }}
+      {{- end }}
+{{- end }}
