@@ -1459,7 +1459,30 @@ EOF
   else
     info "✓ Job name relabel rule already present"
   fi
-  
+
+  # Ensure kubelet/cadvisor metrics carry a `node` label. The dotdc Kubernetes
+  # dashboards (k8s_views_nodes etc.) filter per-pod panels by {node="$node"},
+  # which kube-prometheus-stack sets via relabeling but the plain prometheus
+  # chart does not — without it those panels are silently empty.
+  info "Ensuring node label relabel is present on kubelet/cadvisor scrape jobs..."
+  node_cm_file=$(mktemp)
+  kubectl get configmap -n "$NAMESPACE_OBSERVABILITY" prometheus-server -o yaml > "$node_cm_file"
+  node_prom_config=$(yq eval '.data."prometheus.yml"' "$node_cm_file")
+  if echo "$node_prom_config" | yq eval -e '[.scrape_configs[] | select(.job_name == "kubernetes-nodes-cadvisor") | .relabel_configs[] | select(.target_label == "node")] | length > 0' - >/dev/null 2>&1; then
+    info "✓ Node label relabel already present"
+  else
+    node_updated_config=$(echo "$node_prom_config" | yq eval '(.scrape_configs[] | select(.job_name == "kubernetes-nodes" or .job_name == "kubernetes-nodes-cadvisor") | .relabel_configs) += [{"source_labels": ["__meta_kubernetes_node_name"], "target_label": "node"}]' -)
+    if UPDATED_PROM_CONFIG="$node_updated_config" yq eval '.data."prometheus.yml" = strenv(UPDATED_PROM_CONFIG)' "$node_cm_file" | \
+        kubectl apply --server-side --field-manager=helm --force-conflicts -f - >/dev/null 2>&1; then
+      info "✓ Node label relabel added to kubernetes-nodes + kubernetes-nodes-cadvisor"
+      sleep 3  # Wait for configmap-reloader to pick up changes
+    else
+      warn "Failed to add node label relabel automatically"
+      warn "  kubectl edit configmap -n $NAMESPACE_OBSERVABILITY prometheus-server"
+    fi
+  fi
+  rm -f "$node_cm_file"
+
   info "✓ Prometheus installed successfully"
   info "  Endpoint: http://prometheus-server.${NAMESPACE_OBSERVABILITY}.svc.cluster.local"
   info "  Configured to scrape postgres-exporter from ${NAMESPACE_POSTGRES} namespace"
