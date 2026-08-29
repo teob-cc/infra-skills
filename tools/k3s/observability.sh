@@ -1591,6 +1591,11 @@ datasources:
       access: proxy
       url: http://prometheus-server
       isDefault: false
+      jsonData:
+        # Must match Prometheus's global scrape_interval (1m). Grafana otherwise
+        # assumes 15s, making rate-interval macro windows too small to span two
+        # samples — every rate() panel silently renders empty at short ranges.
+        timeInterval: 1m
 ${uce_pg_datasource_block}
 dashboardProviders:
   dashboardproviders.yaml:
