@@ -4,7 +4,7 @@ fullnameOverride: pomerium-proxy
 
 image:
   repository: pomerium/pomerium
-  tag: v0.32.6
+  tag: v0.33.1
   pullPolicy: IfNotPresent
 
 service:
@@ -22,6 +22,12 @@ config:
   cookieSecret: ""
   sharedSecret: ""
   routes: []
+  # Optional runtime feature flags rendered as `runtime_flags:` in config.yaml
+  # (e.g. {mcp: true}). Empty map renders nothing.
+  runtimeFlags: {}
+  # Domains allowed to host MCP client-ID metadata (rendered as
+  # `mcp_allowed_client_id_domains:`; required non-empty when runtimeFlags.mcp is on).
+  mcpAllowedClientIdDomains: []
 
 secrets:
   create: true

@@ -41,10 +41,20 @@ else
   exit 1
 fi
 
+ALLOW_ROUTE_REMOVAL=false
+for arg in "$@"; do
+  case "$arg" in
+    --allow-route-removal) ALLOW_ROUTE_REMOVAL=true ;;
+    *) echo "Unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
+
 # --- Validation ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
 need kubectl
 need helm
+need jq
+need yq
 
 # Validate kubectl context matches environment
 if ! provision::validate_kubectl_context; then
@@ -100,6 +110,30 @@ if ! helm list -n "$NAMESPACE_SSO" 2>/dev/null | grep -q "^${helm_release}"; the
   err "Pomerium Helm release '${helm_release}' not found in namespace: ${NAMESPACE_SSO}"
   err "Please run: tools/k3s/identity.sh ${ENV_NAME}"
   exit 1
+fi
+
+# --- Route-drift guard ------------------------------------------------------
+# The helm upgrade below replaces config.routes wholesale (last writer wins).
+# Applying from a stale envs checkout silently deletes every route committed
+# since it was last pulled — an entire app's hostname goes dark with no error.
+# Compare live route hosts against the file and refuse to drop any unless
+# --allow-route-removal is passed (deliberate removals are rare; pulls aren't).
+live_hosts=$(helm get values "$helm_release" -n "$NAMESPACE_SSO" -o json 2>/dev/null | \
+  jq -r '.config.routes // [] | .[].from' | sort -u)
+file_hosts=$(yq eval '.config.routes // [] | .[].from' "$env_routes_file" | sort -u)
+dropped_hosts=$(comm -23 <(echo "$live_hosts") <(echo "$file_hosts") | sed '/^$/d')
+if [[ -n "$dropped_hosts" ]]; then
+  if [[ "$ALLOW_ROUTE_REMOVAL" == "true" ]]; then
+    warn "Removing routes for hosts (per --allow-route-removal):"
+    while IFS= read -r h; do warn "  - $h"; done <<< "$dropped_hosts"
+  else
+    err "Refusing to apply: these hosts have live routes but none in ${env_routes_file}:"
+    while IFS= read -r h; do err "  - $h"; done <<< "$dropped_hosts"
+    err ""
+    err "Most likely the envs checkout is stale — git pull it and retry."
+    err "To deliberately remove these hosts' routes, re-run with --allow-route-removal."
+    exit 1
+  fi
 fi
 
 # Apply routes using Helm upgrade with existing values

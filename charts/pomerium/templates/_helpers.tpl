@@ -48,6 +48,20 @@ idp_client_secret: {{ required "config.idpClientSecret" .Values.config.idpClient
 idp_scopes: ["openid", "profile", "email", "groups"]
 cookie_secret: {{ required "config.cookieSecret" .Values.config.cookieSecret }}
 shared_secret: {{ required "config.sharedSecret" .Values.config.sharedSecret }}
+{{- if .Values.config.runtimeFlags }}
+# Pomerium runtime feature flags (e.g. `mcp: true` to enable the MCP authorization
+# server + `mcp:` route stanzas — default-off as of v0.32.x). Set per env in
+# pomerium-routes.yaml next to `config.routes`.
+runtime_flags:
+{{ toYaml .Values.config.runtimeFlags | indent 2 }}
+{{- end }}
+{{- if .Values.config.mcpAllowedClientIdDomains }}
+# Domains whose MCP client-ID metadata URLs Pomerium will fetch (wildcards allowed,
+# e.g. "*.example.com"). REQUIRED when the mcp runtime flag is on — client
+# registration 401s with "client domain not authorized" if the list is empty.
+mcp_allowed_client_id_domains:
+{{ toYaml .Values.config.mcpAllowedClientIdDomains | indent 2 }}
+{{- end }}
 {{- if .Values.config.routes }}
 routes:
 {{ toYaml .Values.config.routes | indent 2 }}
