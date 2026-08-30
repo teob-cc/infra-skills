@@ -15,13 +15,25 @@ yes.
 
 ## Step 0 — Preflight
 
-1. Confirm the user's **GitHub organisation** and that they are an owner/admin of it.
-2. Check tools: `git gh kubectl helm sops age yq jq curl` and an SSH key. `gh auth status` must
+1. **Gauge the operator.** This may be a product owner, not an engineer — ask early what their
+   role is, and calibrate every explanation that follows. With a non-technical operator,
+   introduce each service in one plain sentence before asking for anything connected to it:
+   **GitHub** is where the code lives and the login authority for every dashboard;
+   **Cloudflare** is the domain's address book, answering "where is `grafana.<domain>`?";
+   **Hetzner** is the actual rented computer; **Tailscale** is the private corridor for admin
+   access — the public Internet only ever sees port 443. Keep the calibration you learn here
+   for the whole session, including `/new-env` and `/provision` later.
+2. Confirm the user's **GitHub organisation** and that they are an owner/admin of it.
+3. Check tools: `git gh kubectl helm sops age yq jq curl` and an SSH key. `gh auth status` must
    be logged in. Offer install commands (brew/apt) for anything missing — after cloning (Step 1),
    `tools/preflight-local.sh` performs this whole toolchain check in one command.
-3. Confirm accounts: a domain with DNS on **Cloudflare**, a **Hetzner** account (Cloud project
-   or bare-metal server), a **Tailscale** account (free tier is fine).
-4. State the cost up front: a working delivery environment from ~€80/month on Hetzner, billed
+4. Confirm accounts: a domain with DNS on **Cloudflare**, a **Hetzner** account (Cloud project
+   or bare-metal server), a **Tailscale** account (free tier is fine). If an account is
+   missing, take them to the signup page and assist (browser-assisted where available, as in
+   Step 3): Cloudflare <https://dash.cloudflare.com/sign-up>, Hetzner
+   <https://accounts.hetzner.com/signUp>, Tailscale <https://login.tailscale.com/start>, and a
+   GitHub organisation <https://github.com/account/organizations/new>.
+5. State the cost up front: a working delivery environment from ~€80/month on Hetzner, billed
    to them at cost; a throwaway Cloud test environment costs cents per day.
 
 ## Step 1 — Get the platform code (clone, don't fork)
