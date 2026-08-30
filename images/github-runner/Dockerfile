@@ -12,8 +12,15 @@
 #
 # Keep this pinned to an explicit version+OS. Bumping it is then a one-line, reviewable change with
 # a visible blast radius, and the OS can't shift under the toolchain layers below (which assume
-# Ubuntu 24.04 / apt + lsb_release). Check https://hub.docker.com/r/summerwind/actions-runner-dind/tags
-# when GitHub starts requiring a newer runner; the tell is "Runner update in progress" in pod logs.
+# Ubuntu 24.04 / apt + lsb_release). The tell that a bump is due is "Runner update in progress"
+# in pod logs. Two commands answer "bump to what?":
+#
+#   what GitHub requires:   gh api repos/actions/runner/releases/latest --jq .tag_name
+#   what actually exists:   curl -s 'https://hub.docker.com/v2/repositories/summerwind/actions-runner-dind/tags?page_size=100' \
+#                             | jq -r '.results[].name' | grep 'ubuntu-24.04$' | sort -V | tail -3
+#
+# The two can disagree — actions/runner releases run ahead of summerwind's image publishing.
+# Pin the newest tag that EXISTS on Docker Hub; never pin a version the hub doesn't carry yet.
 FROM summerwind/actions-runner-dind:v2.336.0-ubuntu-24.04
 
 USER root
@@ -31,11 +38,75 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Version variables (matching builder image)
-ENV SCALA3_VERSION=3.8.2
-ENV SBT_VERSION=1.12.6
+# ============================================================================
+# VERSION MANIFEST — every explicit pin in this image, in one place.
+#
+# Agent instructions (yes, you — the agent asked to "update the runner image"):
+#
+#   1. Each pin below carries the exact command that prints its newest version.
+#      Run it. A PATCH or MINOR bump within the same major line: apply it here.
+#      A MAJOR bump changes the toolchain under every CI job in the org — that
+#      is a human decision; propose it in the PR description, don't apply it.
+#   2. Commit on a branch and open a PR. Merging to main triggers
+#      .github/workflows/build-runner-image.yml (path filter:
+#      images/github-runner/**), which builds on the environment's own
+#      self-hosted runners and pushes harbor.<base_domain>/library/github-runner.
+#   3. WATCH THE BUILD — never fire and forget; the image takes tens of minutes
+#      and a broken :latest tag breaks every CI job that follows:
+#        gh run list  -R <org>/<infra-repo> -w "Build Custom GitHub Actions Runner Image" -L1
+#        gh run watch -R <org>/<infra-repo> <run-id> --exit-status
+#      A failure within seconds, with no job logs, means the workflow had nowhere
+#      to run: RUNNER_ENVIRONMENT / BASE_DOMAIN repository variables unset, or
+#      the environment has no self-hosted runners yet (provision them first —
+#      tools/k3s/github-action-runner.sh <env> --bootstrap).
+#   4. Roll out: tools/k3s/github-action-runner.sh <env> — it auto-detects the
+#      fresh image in Harbor and replaces the runner deployment.
+#
+# Pinned elsewhere in this file (they live inside their own install layers):
+#   - Temurin JDK major (currently 25). Latest LTS:
+#       curl -s https://api.adoptium.net/v3/info/available_releases | jq .most_recent_lts
+#     Patch level floats via apt at build time; a new LTS major is a human decision.
+#   - Node.js major (currently 22, maintenance LTS until 2027-04). Active LTS:
+#       curl -s https://endoflife.date/api/nodejs.json | jq -r '[.[]|select((.lts != false) and (.lts <= (now|strftime("%Y-%m-%d"))))][0].cycle'
+#     Patch level floats via nodesource at build time; the major is a human decision.
+#   - npm major (currently 11; floats within it at build): npm view npm version
+#   - Rust: deliberately NOT pinned — rustup installs current stable at build
+#     time, so every rebuild is also a Rust update. To pin instead:
+#     sh.rustup.rs -s -- -y --default-toolchain <version>.
+# ============================================================================
+
+# Scala "Next" line. CAREFUL: `releases/latest` is the wrong query here — it returns
+# whatever was published most recently, usually a 3.3.x LTS backport. Newest Next release:
+#   gh api 'repos/scala/scala3/releases?per_page=30' --jq '[.[]|select(.prerelease|not)|.tag_name]' | jq -r 'sort_by(split(".")|map(tonumber? // 0))|last'
+ENV SCALA3_VERSION=3.8.4
+
+# sbt 1.x line (sbt 2.x exists — a MAJOR rewrite, ecosystem still migrating).
+# Newest 1.x, minus the leading v:
+#   gh api 'repos/sbt/sbt/releases?per_page=100' --jq '[.[]|select(.prerelease|not)|.tag_name|select(startswith("v1."))]|first'
+ENV SBT_VERSION=1.13.0
+
+# Yarn classic — 1.22.22 is the FINAL 1.x release; expect no updates, ever.
+# Yarn 2+ ("berry") is a per-project corepack concern, not this image's. Verify:
+#   npm view yarn version
 ENV YARN_VERSION=1.22.22
-ENV PNPM_VERSION=10.31.0
+
+# pnpm 10.x line (11.x exists — MAJOR; pnpm majors track project lockfiles, so
+# coordinate with the repos building on this runner before crossing):
+#   npm view pnpm@10 version
+ENV PNPM_VERSION=10.34.5
+
+# Playwright — bumping this also refreshes the Chromium pre-installed below:
+#   npm view @playwright/test version
+ENV PLAYWRIGHT_VERSION=1.62.1
+
+# Helm 3.x line (Helm 4 exists — MAJOR; the deploy workflows and bundled charts assume 3):
+#   gh api 'repos/helm/helm/releases?per_page=100' --jq '[.[]|select(.prerelease|not)|.tag_name|select(startswith("v3."))]|first'
+ARG HELM_VERSION=v3.21.4
+
+# yq — here `releases/latest` is fine:
+#   gh api repos/mikefarah/yq/releases/latest --jq .tag_name
+ARG YQ_VERSION=v4.53.6
+
 ENV PATH="/usr/local/sbt/bin:$PATH"
 
 # Use bash for parameter expansion
@@ -58,7 +129,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && npm install --global npm@11
 
 # Playwright: pin version and pre-install Chromium binary + OS deps into the image.
-ENV PLAYWRIGHT_VERSION=1.58.2
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN npm install --global @playwright/test@${PLAYWRIGHT_VERSION} \
     && npx playwright install-deps chromium \
@@ -102,7 +172,6 @@ RUN mkdir -p /tmp/sbt-warmup/project \
     && rm -rf /tmp/.sbt && mkdir -p /tmp/.sbt && chmod 1777 /tmp/.sbt
 
 # Install Helm (the deploy workflows lint/package charts and push them as OCI)
-ARG HELM_VERSION=v3.19.0
 RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o /tmp/helm.tgz \
     && tar -xzf /tmp/helm.tgz -C /tmp \
     && mv /tmp/linux-amd64/helm /usr/local/bin/helm \
@@ -110,7 +179,6 @@ RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" -o 
     && rm -rf /tmp/helm.tgz /tmp/linux-amd64
 
 # Install yq
-ARG YQ_VERSION=v4.44.6
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
@@ -139,7 +207,7 @@ RUN mkdir -p /home/runner/.config /home/runner/.cache /home/runner/.npm /home/ru
 
 USER runner
 
-# Ensure runner user cank write to home directory
+# Ensure runner user can write to home directory
 RUN mkdir -p ~/.config/jgit ~/.cache ~/.npm ~/.sbt ~/.ivy2
 
 # Set PATH for runner user
