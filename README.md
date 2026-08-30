@@ -28,8 +28,8 @@ kept current, and backed by humans, that's the commercial offering:
 
 ## Quickstart — with your AI agent
 
-Self-service onboarding: give your agent three API keys — Cloudflare, Hetzner, GitHub — and get
-a full environment back. The repo ships agent instructions (`CLAUDE.md`) and the skills that
+Self-service onboarding: give your agent four API keys — Cloudflare, Hetzner, GitHub,
+Tailscale — and get a full environment back. The repo ships agent instructions (`CLAUDE.md`) and the skills that
 drive it; the step-by-step walkthrough is in
 [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
 
@@ -45,7 +45,7 @@ Then say:
   creates your envs repo, walks you through the credentials (driving your browser to the token
   pages if you let it), provisions, and publishes your architecture docs.
 - **`/new-env`** — the agent interviews you (domain, server, GitHub org, components), scaffolds
-  your environment config, and walks you through the three keys and the few credentials only
+  your environment config, and walks you through the four keys and the few credentials only
   you can create.
 - **`/provision <env>`** — the agent runs the full provisioning sequence in dependency order,
   asking before anything destructive, and validates the result.
@@ -96,13 +96,33 @@ Each environment is a directory: `env.properties` (base domain, IPs, ACME email)
 `pomerium-routes.yaml` (auth-proxy routes), `apps/` (ArgoCD Applications), `secrets.plain/`
 (gitignored) and `secrets.sops/` (age-encrypted, committed). `/new-env` generates all of it.
 
-## Prerequisites
+## Prerequisites — in plain terms
 
-- A GitHub organisation and a domain with DNS on Cloudflare
-- A Hetzner account (bare-metal or Cloud), or any Ubuntu server you can SSH into
-- A Tailscale account (admin SSH runs over Tailscale; only 443 is open to the Internet)
-- Local: an SSH key, a SOPS age key (see `tools/sops/README.md`), and
-  `kubectl helm sops age yq jq curl`
+The platform stands on four accounts, all of them yours. If infrastructure is not your day
+job — maybe you're the product person who ended up operating this — here is what each service
+actually does in this stack, and where to sign up. Your agent explains any of this again during
+onboarding, at whatever depth you need, and can walk you through each signup page.
+
+- **[GitHub](https://github.com/account/organizations/new)** — an *organisation*, not just a
+  personal account: it holds your code, runs your build pipelines, and doubles as the login
+  authority — "sign in with GitHub, must be a member of your org" is the front door to every
+  dashboard the platform serves. Free.
+- **[Cloudflare](https://dash.cloudflare.com/sign-up)** — your domain's address book (DNS). It
+  answers "where is `grafana.your-domain.com`?" with your server's address; the provisioning
+  scripts maintain those records through its API. The free plan is enough — you point your
+  domain's nameservers at Cloudflare once, and everything after that is automatic.
+- **[Hetzner](https://accounts.hetzner.com/signUp)** — the actual computer. A German hosting
+  company renting serious hardware at honest prices: a capable bare-metal server from about
+  EUR 80,- per month, a throwaway Cloud test VM for cents per day. Billed to you directly — we
+  never sit between you and your server. Any Ubuntu server you can SSH into works too.
+- **[Tailscale](https://login.tailscale.com/start)** — the private corridor for administration.
+  The server keeps exactly one door open to the public Internet: port 443, the web. SSH and the
+  Kubernetes API travel over an encrypted private network that only your enrolled machines can
+  enter. The free tier is fine.
+
+Locally you need an SSH key, a SOPS age key (see `tools/sops/README.md`), and the CLIs
+`kubectl helm sops age yq jq curl` — `tools/preflight-local.sh` checks the whole list in
+one go.
 
 ## Verticals — what is swappable
 

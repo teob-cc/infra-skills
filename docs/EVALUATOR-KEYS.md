@@ -8,7 +8,7 @@ section quotes the function that consumes the file.
 
 ## How secrets flow (and why the control plane never sees them)
 
-You bring three provider credential sets (Hetzner, Cloudflare, GitHub) plus a domain and two
+You bring four provider credential sets (Hetzner, Cloudflare, GitHub, Tailscale) plus a domain and two
 locally generated keypairs. They all land as plaintext in a **git-ignored** `secrets.plain/`
 directory inside your own private `infra-envs` repo, then get SOPS-encrypted into `secrets.sops/`
 (the only form ever committed). The private age key that can decrypt them stays on your machine at
