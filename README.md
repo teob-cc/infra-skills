@@ -28,8 +28,8 @@ kept current, and backed by humans, that's the commercial offering:
 
 ## Quickstart — with your AI agent
 
-Self-service onboarding: give your agent three API keys — Cloudflare, Hetzner, GitHub — and get
-a full environment back. The repo ships agent instructions (`CLAUDE.md`) and the skills that
+Self-service onboarding: give your agent four API keys — Cloudflare, Hetzner, GitHub,
+Tailscale — and get a full environment back. The repo ships agent instructions (`CLAUDE.md`) and the skills that
 drive it; the step-by-step walkthrough is in
 [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md).
 
@@ -45,7 +45,7 @@ Then say:
   creates your envs repo, walks you through the credentials (driving your browser to the token
   pages if you let it), provisions, and publishes your architecture docs.
 - **`/new-env`** — the agent interviews you (domain, server, GitHub org, components), scaffolds
-  your environment config, and walks you through the three keys and the few credentials only
+  your environment config, and walks you through the four keys and the few credentials only
   you can create.
 - **`/provision <env>`** — the agent runs the full provisioning sequence in dependency order,
   asking before anything destructive, and validates the result.

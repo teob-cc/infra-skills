@@ -29,13 +29,15 @@ manual-minded.
 | Hetzner (bare-metal or Cloud) | The hardware. A working delivery environment from ~€80/mo |
 | Tailscale (free tier is fine) | Admin SSH — only 443 is open to the Internet |
 
-**The three keys** — created in your accounts, granted to your agent, stored only in your own
+**The four keys** — created in your accounts, granted to your agent, stored only in your own
 repo (age-encrypted):
 
 1. **Cloudflare API token** — scoped to DNS edit for your zone.
 2. **Hetzner Cloud API token** — Cloud environments only; bare-metal needs just SSH access.
 3. **GitHub App credentials** — for CI automation (runners, secrets). Plus one GitHub **OAuth
    App** for single sign-on — the `/new-env` skill walks you through creating both.
+4. **Tailscale API token** — admin SSH runs over Tailscale, not the public Internet; the
+   scripts mint short-lived per-node auth keys from this token themselves.
 
 **Local tools:** `kubectl helm sops age yq jq curl`, an SSH key, and an AI agent
 (Claude Code or compatible).
@@ -70,7 +72,7 @@ directory:
 
 The agent interviews you (domain, server type, GitHub org, optional components), creates your
 private envs repo with `env.properties`, routes, and secret templates, sets up SOPS/age
-encryption, and tells you exactly where each of the three keys goes. Secrets are edited into
+encryption, and tells you exactly where each of the four keys goes. Secrets are edited into
 files directly — never pasted into the chat.
 
 ## Step 3 — Provision
