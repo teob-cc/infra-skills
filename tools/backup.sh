@@ -9,7 +9,7 @@ set -euo pipefail
 #    (see BACKUP_APP_USER below)
 # 2. Creates backup-user (UID 11002) with SSH key for remote backups
 # 3. Installs rdiff-backup
-# 4. Sets up daily cron: backup at 06:00, cleanup (90 days) at 06:30
+# 4. Sets up daily cron: backup at 06:00, increment cleanup (${BACKUP_RETENTION:-30D}) at 06:30
 #
 # The backup runs over your VPN directly to the backup host (no SSH tunnel).
 #
@@ -58,7 +58,14 @@ K3S_STORAGE_EXCLUDES=(
   "${K3S_STORAGE_DIR}/*_postgres_postgres-cluster-*"  # live PGDATA — use pg_dump
   "${K3S_STORAGE_DIR}/*_observability_storage-loki-*" # logs are recreatable
   "${K3S_STORAGE_DIR}/*_harbor_data-harbor-trivy-*"   # CVE-DB cache
+  "${K3S_STORAGE_DIR}/*_harbor_harbor-registry*"      # images rebuild from source in CI
 )
+
+# How long increments are kept on the backup target. rdiff-backup stores a full
+# mirror plus reverse increments, so this bounds the increment tree, not the mirror:
+# the latest state is always present regardless. Raise it if your recovery window
+# is longer; at 90 days the increments can dwarf the mirror they serve.
+BACKUP_RETENTION="${BACKUP_RETENTION:-30D}"
 # --- Backup target (required; set these in your environment) ---
 BACKUP_TARGET_HOST="${BACKUP_TARGET_HOST:-}"    # your NAS/backup host reachable over your VPN
 BACKUP_TARGET_PORT="${BACKUP_TARGET_PORT:-22}"  # SSH port on the backup host
@@ -298,12 +305,12 @@ remote bash -c "\"cat > /tmp/backup-crontab.txt << 'CRON'
 0 6 * * * rdiff-backup --remote-schema '${RDIFF_SCHEMA_CRON}' ${DATA_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}
 
 # Backup ${K3S_STORAGE_DIR} (Harbor blobs, Nexus, Grafana, etc.) at 06:15.
-# Excludes live PGDATA (use pg_dump), Loki logs, and Trivy cache.
+# Excludes live PGDATA (use pg_dump), Loki logs, Trivy cache, and Harbor blobs.
 15 6 * * * [ -d ${K3S_STORAGE_DIR} ] && rdiff-backup ${RDIFF_EXCLUDES} --remote-schema '${RDIFF_SCHEMA_CRON}' ${K3S_STORAGE_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}-k3s-storage
 
-# Remove backups older than 90 days at 06:30
-30 6 * * * rdiff-backup --remove-older-than 90D --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
-35 6 * * * rdiff-backup --remove-older-than 90D --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR}
+# Remove increments older than ${BACKUP_RETENTION} at 06:30
+30 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
+35 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR}
 CRON
 crontab /tmp/backup-crontab.txt && rm /tmp/backup-crontab.txt\""
 
@@ -325,7 +332,7 @@ log "  Backup user:    ${BACKUP_USER} (UID ${BACKUP_UID})"
 log "  Sources:        ${DATA_DIR}, ${K3S_STORAGE_DIR} (excl. live PGDATA, Loki, Trivy)"
 log "  Remote (users): ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_BACKUP_DIR}"
 log "  Remote (k3s):   ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_K3S_BACKUP_DIR}"
-log "  Schedule:       daily 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup 90 days)"
+log "  Schedule:       daily 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup ${BACKUP_RETENTION})"
 log ""
 log "To run a backup now:  $0 ${ENV_NAME} --run-now"
 log "To check status:      $0 ${ENV_NAME} --show-status"
