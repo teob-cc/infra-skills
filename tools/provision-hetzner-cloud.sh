@@ -1206,6 +1206,33 @@ ${K3S_TLS_SANS}
 node-ip: @PRIVATE_IP_ADDR@
 flannel-iface: ${K3S_FLANNEL_IFACE}
 K3S_EOF
+
+    # Kubelet image garbage collection. The defaults (85/80, no max age) let one image
+    # tag per CI build pile up until the disk is nearly full -- a node that deploys a
+    # few times a day accumulates tens of GiB of tags nothing references any more.
+    # imageMaximumGCAge is the real lever: an image no container has used for 48h is
+    # evicted regardless of disk pressure, so a node keeps roughly the last two days of
+    # builds and everything else is re-pulled from the environment's own registry. It
+    # has to go through a config file -- there is no --image-maximum-gc-age kubelet flag.
+    # Only safe while no CronJob runs less often than the max age; raise it first if you
+    # add a weekly or monthly job.
+    #
+    # The thresholds are only a backstop, deliberately not tuned tight: they are a
+    # percentage of the *imagefs*, and kubelet can only ever delete images. On a node
+    # whose non-image data already exceeds the low threshold -- local-path PVCs sharing
+    # the root filesystem, say -- kubelet would re-run GC every cycle, evict every image
+    # not currently running, and still never reach the target. Keep the low threshold
+    # above the node's non-image floor; let imageMaximumGCAge do the actual work.
+    cat >/etc/rancher/k3s/kubelet.config <<KUBELET_EOF
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+imageMinimumGCAge: 2m
+imageMaximumGCAge: 48h
+imageGCHighThresholdPercent: 80
+imageGCLowThresholdPercent: 70
+KUBELET_EOF
+    printf 'kubelet-arg:\n  - "config=/etc/rancher/k3s/kubelet.config"\n' >>/etc/rancher/k3s/config.yaml
+    echo "[postinstall] Wrote kubelet image-GC config (max age 48h, thresholds 80/70)"
   else
     echo "[postinstall] Worker mode detected; skipping k3s server config"
   fi
