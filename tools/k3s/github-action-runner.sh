@@ -965,20 +965,24 @@ create_runner_deployment() {
   kubectl -n "$NAMESPACE_RUNNER" delete pvc "${ENV_NAME}-runner-buildx-cache" 2>/dev/null || true
   
   # Configure persistent cache volumes using hostPath
-  info "  Will mount hostPath volumes for Docker layer cache and buildx cache"
-  info "  Caches will persist on node filesystem at /var/lib/github-runner-cache/${ENV_NAME}/"
-  
+  #
+  # There is deliberately NO Docker layer cache here. `volumeMounts` in a
+  # RunnerSpec lands on the *runner* container, while dockerd runs in the
+  # injected `docker` sidecar — so a hostPath mounted at /var/lib/docker
+  # caches nothing (measured: 188K after five months on a busy node) while
+  # looking like it does. Moving it to `dockerVolumeMounts` is not the fix
+  # either: with replicas > 1 every dind would share one data-root, and
+  # dockerd requires exclusive access to it. Use a registry-backed cache
+  # instead (`--cache-from/--cache-to type=registry`), as the Rust workflow
+  # does.
+  info "  Will mount hostPath volume for the buildx cache"
+  info "  Cache will persist on node filesystem at /var/lib/github-runner-cache/${ENV_NAME}/"
+
   local cache_volume_mounts="
-        - name: docker-cache
-          mountPath: /var/lib/docker
         - name: buildx-cache
           mountPath: /tmp/.buildx-cache${maven_volume_mount}"
-  
+
   local cache_volumes="
-        - name: docker-cache
-          hostPath:
-            path: /var/lib/github-runner-cache/${ENV_NAME}/docker
-            type: DirectoryOrCreate
         - name: buildx-cache
           hostPath:
             path: /var/lib/github-runner-cache/${ENV_NAME}/buildx
@@ -1033,6 +1037,30 @@ spec:
       dockerEnabled: true
       image: ${runner_image}$(if [[ -n "$image_pull_policy" ]]; then echo "
       imagePullPolicy: ${image_pull_policy}"; fi)
+      # Entries here are merged by name into the containers ARC generates, so
+      # this adds to the injected dind sidecar without redefining it.
+      #
+      # The probe is load-bearing. Without it a dind whose containerd has
+      # stopped answering still reports 2/2 Running, so the runner keeps
+      # accepting jobs it cannot build; every one of them dies on
+      #   failed to solve: dial /var/run/docker/containerd/containerd.sock: timeout
+      # after exactly dockerd's 60s client timeout, which reads like a broken
+      # commit rather than a broken node. Observed on two repos at once,
+      # 2026-09-03, on runner pods that had idled ~33h. \`docker info\` reaches
+      # through dockerd to containerd, so it fails when containerd is wedged.
+      #
+      # The image is pinned because ARC's default is the floating \`docker:dind\`,
+      # which silently rolls major versions under a long-lived deployment.
+      containers:
+        - name: docker
+          image: docker:29.3-dind
+          livenessProbe:
+            exec:
+              command: ["docker", "info"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
       # Increase termination grace period to allow dockerd to shut down gracefully
       # This helps prevent PreStopHook failures when pod is being terminated
       terminationGracePeriodSeconds: 300
@@ -1169,8 +1197,7 @@ info "Services provisioned:"
 info "  ✓ Actions Runner Controller (namespace: ${NAMESPACE_RUNNER})"
 info "  ✓ Base builder image (harbor.${HOSTNAME}/library/base:latest)"
 info "  ✓ Runner Deployment: ${ENV_NAME}-runners"
-info "  ✓ Persistent caches: Docker (/var/lib/github-runner-cache/${ENV_NAME}/docker)"
-info "                       Buildx (/var/lib/github-runner-cache/${ENV_NAME}/buildx)"
+info "  ✓ Persistent cache:  Buildx (/var/lib/github-runner-cache/${ENV_NAME}/buildx)"
 info ""
 
 # Get GitHub organization for summary
