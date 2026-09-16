@@ -35,6 +35,11 @@ everything installation-specific (config, secrets, chart overrides) lives in the
 envs repo, never in infra-skills. A fork is only ever needed to modify the provisioning scripts
 themselves, and can be made later without losing anything.
 
+If the sovereign-stack plugin was installed before this clone, run `/plugin marketplace update`
+and `/reload-plugins` now so the skill text matches the scripts you just cloned. When a skill
+step contradicts what the scripts read, the scripts win — a stale plugin once handed out a
+secret template with key names no script reads.
+
 ## Step 2 — Create their envs repo and scaffold the environment
 
 ```bash
@@ -62,10 +67,16 @@ The complete set:
 | Credential | Where it goes | How to get it |
 |---|---|---|
 | Cloudflare API token (DNS edit, one zone) | `envs/shared/secrets.plain/cloudflare.yaml` | Cloudflare dashboard → API tokens |
-| Hetzner Cloud API token | `envs/shared/secrets.plain/hetzner-cloud-token.txt` | Hetzner Cloud console → project → API tokens (skip for bare-metal) |
+| Hetzner Cloud API token (Cloud VMs only) | `envs/shared/secrets.plain/hetzner-cloud-token.txt` | Hetzner Cloud console → project → API tokens |
+| Hetzner Robot webservice user (bare-metal only) | `envs/shared/secrets.plain/hetzner-webservice-user.txt` | Robot → Settings → Webservice and app settings; `user:password` on one line. A password — **instructed mode only**, the user writes the file |
 | GitHub App | `envs/shared/secrets.plain/github-app-credentials.yaml` | **Manifest flow** — see `new-env`; one click to create, one to install |
 | GitHub OAuth App (SSO) | `envs/<env>/secrets.plain/github-oauth-credentials.yaml` | Org settings → OAuth Apps; callback `https://dex.<domain>/callback` |
 | Tailscale API key | `envs/shared/secrets.plain/tailscale-api-key.txt` | Tailscale admin console → Keys → API key. The scripts mint per-node auth keys from it automatically |
+
+Tailscale prerequisite: the tailnet's SSH policy must contain an **`accept`** rule (default new
+tailnets ship one `check` rule: admin console → Access controls → `"ssh"` → change `"action":
+"check"` to `"accept"`). Nodes run Tailscale SSH; in check mode every session wants a browser
+re-auth and unattended provisioning hangs. `tools/validate-keys.sh <env>` reports this.
 
 Then encrypt (`tools/sops/encrypt.sh <env>`) and commit — verify `secrets.plain/` is gitignored
 before the first commit.
@@ -73,11 +84,24 @@ before the first commit.
 ## Step 4 — Provision
 
 Run `tools/validate-keys.sh <env>` first — it validates every credential from Step 3 before
-anything destructive happens. Then follow the `provision` skill for the full sequence (server →
-identity/SSO → registry → runners → GitOps → observability → optional databases), or run the
-resumable orchestrator `tools/up.sh <env>`. Confirm with the user before server creation/wipe.
-Finish with the validation checks (dex, harbor, argocd, grafana all serving) and
-`tools/doctor.sh <env>` — the read-only health check that becomes their routine smoke test.
+anything destructive happens and names the Robot server that a wipe would reinstall; read that
+back to the user and get an explicit yes. Then, in this order (from the infra-skills checkout):
+
+1. Server: `tools/provision-hetzner-baremetal.sh <env> --wipe` (or `provision-hetzner-cloud.sh`).
+   `up.sh` does **not** do this step. Expect rescue → installimage → reboot → K3s/Tailscale →
+   reboot → kubeconfig written and merged as context `<env>`.
+2. Stack: `tools/up.sh <env> --yes` (identity → secrets → harbor → runners → argocd →
+   observability → the env's `UP_OPTIONAL_STEPS`). It checkpoints; on a failure fix the cause
+   and re-run — it resumes. It ends with `tools/doctor.sh <env>`.
+3. Runner image: `tools/k3s/registry-credentials.sh <env> <envs-repo>`, copy
+   `docs/examples/envs-repo/build-runner-image.yml` into the envs repo, dispatch it with
+   `environment` + `base_domain`, then `tools/k3s/github-action-runner.sh <env>` to switch
+   from the vanilla to the custom image. If redpanda/scylla were installed, re-run
+   `tools/k3s/observability.sh <env>` once for their scrape jobs.
+
+Details and troubleshooting live in the `provision` skill. Finish with the validation checks
+(dex, harbor, argocd, grafana all serving) and `tools/doctor.sh <env>` — the read-only health
+check that becomes their routine smoke test. Read its CRIT/WARN lines into Step 5's day-2 table.
 
 ## Step 5 — Publish their architecture docs
 

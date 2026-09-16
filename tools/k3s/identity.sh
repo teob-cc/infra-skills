@@ -225,9 +225,17 @@ provision_cert_manager() {
   kubectl -n "$NAMESPACE_CERT_MANAGER" rollout status deploy/cert-manager-webhook --timeout=180s
   kubectl -n "$NAMESPACE_CERT_MANAGER" rollout status deploy/cert-manager-cainjector --timeout=180s
   
-  # Apply Cloudflare API token secret
+  # Create the Secret the ClusterIssuer's dns01 solver references. The intake file
+  # envs/shared/secrets.plain/cloudflare.yaml is a flat `cloudflare-api-token: <value>` file
+  # (every provisioning script parses it with provision::cloudflare_read_token), NOT a
+  # Kubernetes Secret manifest -- piping it through sops/apply.sh fails kubectl validation.
   log "Applying Cloudflare API token secret..."
-  "$REPO_ROOT/tools/sops/apply.sh" shared cloudflare.yaml
+  if [[ -z "${CF_API_TOKEN:-}" ]] && ! provision::cloudflare_read_token; then
+    echo "[identity] ERROR: Cloudflare API token not found in envs/shared/secrets.plain/cloudflare.yaml" >&2
+    exit 1
+  fi
+  kubectl -n "$NAMESPACE_CERT_MANAGER" create secret generic cloudflare-api-token \
+    --from-literal=api-token="$CF_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f -
   
   # Create ClusterIssuer
   log "Creating Let's Encrypt ClusterIssuer..."

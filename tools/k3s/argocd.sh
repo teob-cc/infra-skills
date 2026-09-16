@@ -460,6 +460,16 @@ spec:
         - ${ARGOCD_HOST}
       secretName: argocd-pomerium-tls
 YAML
+
+  # Register the matching Pomerium route. The ingress above only terminates TLS and hands the
+  # host to Pomerium; without a route Pomerium answers 404 for argocd.<HOSTNAME>. Same helper
+  # the database scripts use: it edits envs/<env>/pomerium-routes.yaml and reloads Pomerium.
+  if provision::pomerium_routes_add "https://${ARGOCD_HOST}" \
+       "http://argocd-server.${NAMESPACE_ARGOCD}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true; then
+    info "Pomerium route ensured: https://${ARGOCD_HOST} -> argocd-server"
+  else
+    warn "Failed to ensure Pomerium route for https://${ARGOCD_HOST}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
+  fi
   # Remove a leftover direct argocd-server ingress from older installs (now disabled in Helm values).
   kubectl -n "$NAMESPACE_ARGOCD" delete ingress argocd-server --ignore-not-found
 

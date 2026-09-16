@@ -64,8 +64,10 @@ configures UFW (only 443/tcp from the Internet).
 ```bash
 tools/provision-hetzner-baremetal.sh <env> --wipe
 ```
-**WARNING:** `--wipe` is destructive — it reinstalls the OS. Confirm the target IP with the user
-before running.
+**WARNING:** `--wipe` is destructive — it reinstalls the OS. `tools/validate-keys.sh` prints the
+server's Robot name, product and datacenter: read them back to the user and get an explicit yes
+before running. A server whose Robot name is another environment's hostname is a red flag, not
+a formality.
 
 #### Option B: Hetzner Cloud VM
 Creates a Cloud VM via the Hetzner Cloud API, attaches it to a Cloud Network, sets up Tailscale
@@ -131,7 +133,10 @@ tools/k3s/registry-credentials.sh <env> <envs-repo-name>
 tools/k3s/github-action-runner.sh <env> --bootstrap
 
 # 5c. Build the custom runner image from the envs repo, then upgrade:
-gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env>
+gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env> -f base_domain=<base-domain>
+# (both inputs are required; the caller workflow in the envs repo must grant packages/id-token
+#  write — the example in docs/examples/envs-repo/ does. Playwright's Chrome download inside the
+#  build can time out: a retry is the fix, not a config change.)
 # Wait for it to complete (~5 minutes), then:
 tools/k3s/github-action-runner.sh <env>
 ```
@@ -228,6 +233,10 @@ curl -sS -o /dev/null -w "%{http_code}" https://grafana.<HOSTNAME>/api/health
 ## Troubleshooting
 
 - **Helm repo errors** (stale repos): `helm repo remove <name>` and retry.
+- **A step died mid-Helm** (wait timeout, `http2: client connection lost` over Tailscale): check
+  `helm -n <ns> status <release>`. A first install left in `failed` state must be
+  `helm -n <ns> uninstall <release>` before `up.sh` can resume that step; a transient API loss
+  needs nothing but a re-run (`up.sh` resumes from the checkpoint).
 - **kubectl context mismatch**: all scripts validate the context matches the target env. Check
   `envs/<env>/kubeconfig.yaml` and `~/.kube/config`.
 - **Secrets**: plaintext lives in `secrets.plain/` (gitignored, never committed); encrypted
@@ -237,8 +246,18 @@ curl -sS -o /dev/null -w "%{http_code}" https://grafana.<HOSTNAME>/api/health
   in Harbor yet, trigger the app's CI workflow first. If a pod waits on a Secret, Step 3 was
   skipped or the secret was never encrypted (`apply.sh --dry-run` reports it).
 - **Tailscale/SSH issues after a wipe**: the script cleans stale Tailscale devices; if SSH hangs,
-  check for duplicate devices in the Tailscale admin console. A worker that will not rejoin after
+  check for duplicate devices in the Tailscale admin console. If "Waiting for SSH on <tailscale-ip>"
+  never returns, the tailnet SSH policy is in `check` mode (browser re-auth per session): change the
+  rule's action to `accept` in Access controls; the script detects this and fails fast, and
+  `validate-keys.sh` reports it before a wipe.
+- **installimage "Image not found"**: Hetzner renames rescue images (`.tar.gz` → `.tar.zst` in
+  2026); the script resolves the Ubuntu 24.04 image at run time and lists what is available on failure. A worker that will not rejoin after
   a reprovision needs `join-worker.sh` again — the old node token is invalid.
+- **Image builds on the runners stall on large downloads** (`Connection reset by peer`, CDN
+  timeouts, while small requests work): MTU. Pods sit at flannel's MTU (1230 over Tailscale) and
+  dockerd inside the runner pod defaults to 1500. The runner script sets ARC `dockerMTU` from a
+  probe; for an existing deployment: `kubectl -n actions-runner-system patch runnerdeployment
+  <env>-runners --type merge -p '{"spec":{"template":{"spec":{"dockerMTU":1230}}}}'`.
 - **Runner image not detected**: the script checks Harbor via API; if the image exists but isn't
   found, check Harbor API connectivity and the robot account credentials.
 

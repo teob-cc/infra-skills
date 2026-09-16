@@ -18,7 +18,7 @@ checked out as a sibling of infra-skills, containing:
 ```
 infra-envs/
   .sops.yaml          # copy from infra-skills/.sops.yaml, replace the age recipient (Step 4)
-  .gitignore          # must contain: **/secrets.plain/
+  .gitignore          # must contain: **/secrets.plain/  and  **/kubeconfig.yaml
   envs/
     shared/secrets.plain/
     <env>/...
@@ -67,7 +67,8 @@ PRIVATE_IP=10.0.0.2/16
 ```
 
 `envs/<env>/pomerium-routes.yaml` — minimal starter (the identity script provisions a test app
-that verifies SSO end-to-end):
+that verifies SSO end-to-end). The platform scripts append their own routes here as they run
+(argocd, pgweb, adminer, console, cassandra) — commit the file again after provisioning:
 
 ```yaml
 config:
@@ -100,6 +101,11 @@ age-keygen -y ~/.config/sops/age/keys.txt   # prints the public key (recipient)
 Put the **public** key into `.sops.yaml` at the envs repo root (both `age:` lists), replacing any
 recipient already there. The private key never leaves `~/.config/sops/age/keys.txt`.
 
+On macOS a bare `sops -d` does **not** look in `~/.config/sops/age/` (it uses
+`~/Library/Application Support/sops/age/keys.txt`). The `tools/sops/*.sh` wrappers set
+`SOPS_AGE_KEY_FILE` for you; for manual sops calls export it:
+`export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt`.
+
 ## Step 5 — Secret templates
 
 Write these into place with placeholder values, then walk the user through filling them in. Never
@@ -130,6 +136,8 @@ cloudflare-api-token: "<token>"
 `envs/shared/secrets.plain/github-app-credentials.yaml` — a GitHub **App** (separate from the
 OAuth App) for CI automation. Repository permissions: Contents R/W, Secrets R/W, Environments
 R/W, Metadata Read; organization permissions: Self-hosted runners R/W.
+(Creating a repository *environment* additionally needs Administration R/W, which the App does
+not get; `registry-credentials.sh` falls back to the operator's own `gh` login for that one call.)
 
 Prefer the **manifest flow** over manual creation (two clicks instead of six steps):
 `docs/examples/github-app-manifest.html` is a self-submitting form -- fill in `<org>`, `<name>`
@@ -160,19 +168,59 @@ stringData:
     -----BEGIN RSA PRIVATE KEY-----
     ...
     -----END RSA PRIVATE KEY-----
-```|
-    -----BEGIN RSA PRIVATE KEY-----
-    ...
-    -----END RSA PRIVATE KEY-----
 ```
+
+When carrying the `pem` from the conversion response into the file, keep its line breaks —
+e.g. `PEM="$pem" yq -i '.stringData.githubAppPrivateKey = strenv(PEM)' <file>`. A flattened
+key makes every GitHub-dependent step fail with an openssl "Could not find private key" error.
 
 Cloud VMs only — `envs/shared/secrets.plain/hetzner-cloud-token.txt`: the Hetzner Cloud API
 token, as a bare single-line file.
 
+Bare-metal only — `envs/shared/secrets.plain/hetzner-webservice-user.txt`: the Hetzner **Robot**
+webservice user (Robot → Settings → *Webservice and app settings*; a separate credential from the
+account login), as `user:password` on one line (or user on line 1, password on line 2). It drives
+rescue mode, SSH-key registration and `installimage`, so it is highly privileged. It is a password:
+have the user write the file themselves rather than driving the browser for it.
+
 `envs/shared/secrets.plain/tailscale-api-key.txt` — a Tailscale **API key** (admin console →
 Settings → Keys), as a bare single-line file. Admin SSH runs over Tailscale (only 443 is open
 to the Internet); the provisioning scripts mint per-node auth keys from this API key
-automatically.
+automatically. The tailnet's SSH policy needs an `accept` rule (the default `check` rule makes
+Tailscale SSH demand a browser re-auth per session, which hangs unattended runs) — admin console
+→ Access controls → `"ssh"` → `"action": "accept"`; `tools/validate-keys.sh` checks it.
+
+Optional, alert routing (Alertmanager). Without them `observability.sh` installs labelled
+placeholder Secrets so Alertmanager starts, and no alert is delivered anywhere — record that in
+the architecture doc's day-2 section. Fill in when the org has an SMTP relay / Telegram bot:
+
+`envs/<env>/secrets.plain/resend-api-key.yaml` (namespace `default`; mirrored into
+`observability` by the script; any SMTP relay works, `ALERTMANAGER_SMTP_HOST` in env.properties):
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: resend-api-key
+  namespace: default
+type: Opaque
+stringData:
+  api_key: "<smtp-api-key>"
+```
+
+`envs/<env>/secrets.plain/alertmanager-telegram.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-telegram
+  namespace: observability
+type: Opaque
+stringData:
+  bot_token: "<telegram-bot-token>"
+  chat_id: "<telegram-chat-id>"
+```
 
 Also confirm the operator has: an SSH key (`~/.ssh/id_ed25519`) and the CLIs
 `kubectl helm sops age yq jq curl`.

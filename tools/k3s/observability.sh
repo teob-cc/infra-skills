@@ -1202,12 +1202,19 @@ EOF
         | sed -E 's/^(  namespace:).*/\1 '"$NAMESPACE_OBSERVABILITY"'/; /(resourceVersion|uid|creationTimestamp):/d' \
         | kubectl -n "$NAMESPACE_OBSERVABILITY" apply -f - >/dev/null
     fi
-  else
-    warn "resend-api-key Secret not found in 'default' namespace."
-    warn "Alertmanager pod will stay in CreateContainerConfigError until you apply it:"
+  elif ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret resend-api-key >/dev/null 2>&1; then
+    # Alertmanager mounts this Secret unconditionally; without it the pod never starts and
+    # `helm --wait` below times out, failing the whole step. A fresh self-service environment
+    # legitimately has no SMTP relay yet, so install a labelled placeholder: Alertmanager
+    # starts, email delivery fails (visibly, in its log) until the real key is applied.
+    warn "resend-api-key Secret not found in 'default' namespace -- creating a PLACEHOLDER."
+    warn "Email alert delivery is NOT configured. To enable it, apply the real Secret:"
     warn "  sops -d \$INFRA_ENVS_ROOT/${ENV_NAME}/secrets.sops/resend-api-key.yaml | kubectl apply -f -"
-    warn "Then re-run this script (or kubectl -n default get secret resend-api-key -o yaml | "
-    warn "  kubectl -n ${NAMESPACE_OBSERVABILITY} apply -f -)."
+    warn "then re-run this script (it mirrors the key into ${NAMESPACE_OBSERVABILITY})."
+    kubectl -n "$NAMESPACE_OBSERVABILITY" create secret generic resend-api-key \
+      --from-literal=api_key=unconfigured --dry-run=client -o yaml \
+      | kubectl label --local -f - -o yaml infra-skills/placeholder=true \
+      | kubectl apply -f - >/dev/null
   fi
 
   # Alertmanager also mounts the alertmanager-telegram secret unconditionally, so a
@@ -1215,10 +1222,13 @@ EOF
   # provisioned without either has no Alertmanager at all — and nothing pages when
   # a public site goes down, which is exactly how such a gap gets discovered.
   if ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-telegram >/dev/null 2>&1; then
-    warn "alertmanager-telegram Secret not found in '${NAMESPACE_OBSERVABILITY}' namespace."
-    warn "Alertmanager will not start, so NO alert of any severity will be delivered."
-    warn "Apply it before relying on alerting:"
+    warn "alertmanager-telegram Secret not found in '${NAMESPACE_OBSERVABILITY}' namespace -- creating a PLACEHOLDER."
+    warn "Telegram alert delivery is NOT configured. Apply the real Secret before relying on alerting:"
     warn "  sops -d \$INFRA_ENVS_ROOT/${ENV_NAME}/secrets.sops/alertmanager-telegram.yaml | kubectl apply -f -"
+    kubectl -n "$NAMESPACE_OBSERVABILITY" create secret generic alertmanager-telegram \
+      --from-literal=bot_token=unconfigured --from-literal=chat_id=0 --dry-run=client -o yaml \
+      | kubectl label --local -f - -o yaml infra-skills/placeholder=true \
+      | kubectl apply -f - >/dev/null
   fi
 
   # Merge env-provided alert groups (fragments with a top-level 'groups:' list)

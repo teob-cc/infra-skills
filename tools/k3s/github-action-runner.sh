@@ -782,10 +782,15 @@ detect_custom_runner_image() {
   harbor_pass=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.password}' | base64 -d)
   
   # Check if the image exists via Harbor API (works from any machine, unlike docker pull)
-  local api_check
-  api_check=$(curl -sS -o /dev/null -w "%{http_code}" -u "${harbor_user}:${harbor_pass}" \
+  # Harbor returns HTTP 200 with an empty JSON array for a repository that does not exist
+  # (observed on a fresh registry), so the status code alone is a false positive: require at
+  # least one artifact in the response body.
+  local api_body api_check artifact_count
+  api_body=$(curl -sS -w '\n%{http_code}' -u "${harbor_user}:${harbor_pass}" \
     "https://${harbor_host}/api/v2.0/projects/library/repositories/github-runner/artifacts?page_size=1" 2>/dev/null || echo "000")
-  if [[ "$api_check" == "200" ]]; then
+  api_check=${api_body##*$'\n'}
+  artifact_count=$(printf '%s' "${api_body%$'\n'*}" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)
+  if [[ "$api_check" == "200" && "${artifact_count:-0}" -gt 0 ]]; then
     info "  ✓ Custom runner image found in Harbor: ${custom_runner_image}"
     
     # Check if runner deployment exists
@@ -1009,6 +1014,22 @@ create_runner_deployment() {
     info "  Using vanilla runner image: ${runner_image}"
   fi
 
+  # Pods inherit flannel's MTU (1230 when the node's internal IP is its Tailscale address, as
+  # the bare-metal script configures), but dockerd inside the runner pod defaults its bridge to
+  # 1500. Larger packets from build containers are then silently dropped, so every big download
+  # in an image build stalls or is reset ("Connection reset by peer" from get.helm.sh, Playwright
+  # CDN timeouts). Hand the pod MTU to dockerd via ARC's dockerMTU. Probe it from a throwaway
+  # pod; fall back to the Tailscale-derived value if the probe fails.
+  local pod_mtu probe="mtu-probe-$$"
+  kubectl -n "$NAMESPACE_RUNNER" run "$probe" --restart=Never --image=busybox:1.36 \
+    --command -- cat /sys/class/net/eth0/mtu >/dev/null 2>&1 || true
+  kubectl -n "$NAMESPACE_RUNNER" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/${probe}" \
+    --timeout=90s >/dev/null 2>&1 || true
+  pod_mtu=$(kubectl -n "$NAMESPACE_RUNNER" logs "$probe" 2>/dev/null | tr -dc '0-9' || true)
+  kubectl -n "$NAMESPACE_RUNNER" delete pod "$probe" --ignore-not-found >/dev/null 2>&1 || true
+  [[ "$pod_mtu" =~ ^[0-9]{3,4}$ ]] || pod_mtu=1230
+  info "  dockerd MTU inside runner pods: ${pod_mtu} (probed pod interface MTU)"
+
   kubectl apply -f - <<EOF
 apiVersion: actions.summerwind.dev/v1alpha1
 kind: RunnerDeployment
@@ -1022,6 +1043,7 @@ spec:
       organization: ${github_org}
       labels:${labels_yaml}
       dockerEnabled: true
+      dockerMTU: ${pod_mtu}
       image: ${runner_image}$(if [[ -n "$image_pull_policy" ]]; then echo "
       imagePullPolicy: ${image_pull_policy}"; fi)
       # Entries here are merged by name into the containers ARC generates, so
@@ -1160,7 +1182,11 @@ validate_deployment() {
       
       # Show pod readiness status
       local ready_count
-      ready_count=$(kubectl -n "$NAMESPACE_RUNNER" get pods -l runner-deployment-name="${runner_name}" -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o "True" | wc -l | tr -d ' ')
+      # `|| true`: under `set -o pipefail` grep exits 1 when no pod is Ready yet, which would
+      # abort the whole script here (observed as a silent "Step FAILED" right after
+      # "runner pod(s) created").
+      ready_count=$(kubectl -n "$NAMESPACE_RUNNER" get pods -l runner-deployment-name="${runner_name}" -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -o "True" | wc -l | tr -d ' ' || true)
+      ready_count=${ready_count:-0}
       if [[ "$ready_count" -gt 0 ]]; then
         info "  ✓ ${ready_count}/${runner_count} runner pod(s) ready"
       else

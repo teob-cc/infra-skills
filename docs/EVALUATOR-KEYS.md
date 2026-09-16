@@ -174,10 +174,11 @@ stringData:
 ```
 
 > ⚠️ **Field names must be camelCase.** The scripts read `githubAppID` /
-> `githubAppInstallationID` / `githubAppPrivateKey`. (The `new-env` skill's example currently
-> shows snake_case `github_app_id` etc.; that snake_case form is only how the runner script
-> *emits* the in-cluster Secret — the intake file you write here must use the camelCase keys the
-> readers expect, or every GitHub-dependent step gets empty values.)
+> `githubAppInstallationID` / `githubAppPrivateKey`. The snake_case `github_app_id` form is only
+> how the runner script *emits* the in-cluster Secret (older copies of the `new-env` skill showed
+> it as the intake template — update the plugin if yours does). The intake file must use the
+> camelCase keys, or every GitHub-dependent step gets empty values and JWT minting fails with
+> "Could not find private key".
 
 **Encrypt** (this file has a `stringData` block, so SOPS encrypts only those values):
 ```bash

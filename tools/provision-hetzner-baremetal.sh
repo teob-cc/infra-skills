@@ -1801,18 +1801,56 @@ reboot
 POSTINSTALL_EOF
 }
 
+# Run a command with a hard wall-clock deadline (seconds). ssh's ConnectTimeout only bounds
+# the TCP connect; a server that accepts the connection and then never finishes authentication
+# (e.g. Tailscale SSH waiting for a browser "check") would otherwise hang a wait loop forever.
+# macOS has no coreutils `timeout`, so fall back to gtimeout or perl's alarm.
+function with_deadline(){
+  local secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else "$@"; fi
+}
+
+# Detect Tailscale SSH in "check" mode on host:port. Tailscale SSH answers on port 22 of the
+# tailnet address (banner "SSH-2.0-Tailscale"); with an SSH policy rule of action "check" it
+# demands a browser re-auth over keyboard-interactive, which a BatchMode/publickey-only client
+# never sees, so the session hangs. Returns 0 (and prints the remedy) when that is the case.
+function detect_tailscale_ssh_check(){
+  local host=$1 port=${2:-22} user=${3:-root}
+  local probe_opts=() o out
+  for o in "${SSH_OPTS[@]}"; do [[ "$o" == BatchMode=* ]] && o="BatchMode=no"; probe_opts+=("$o"); done
+  out=$(with_deadline 20 ssh -p "$port" "${probe_opts[@]}" \
+        -o PreferredAuthentications=keyboard-interactive,publickey -o NumberOfPasswordPrompts=1 \
+        "${user}@${host}" 'true' 2>&1 </dev/null || true)
+  if grep -q 'Tailscale SSH requires an additional check' <<<"$out"; then
+    err "Tailscale SSH on ${host} is in 'check' mode: every session needs a browser re-auth, so unattended provisioning cannot proceed."
+    err "Remedy: in the tailnet policy (admin console -> Access controls, or 'tailscale' API /tailnet/-/acl) change the ssh rule's"
+    err "        \"action\": \"check\" to \"accept\" for the provisioning user (root/autogroup:nonroot, dst autogroup:self), then re-run."
+    err "        tools/validate-keys.sh <env> now reports this before any wipe."
+    return 0
+  fi
+  return 1
+}
+
 function wait_for_ssh(){
   local ip=$1 port=$2 tries=${3:-120}
   info "Waiting for SSH on ${ip}:${port} ..."
   for ((i=1; i<=tries; i++)); do
     set +e
     local out
-    out=$(ssh -p "$port" "${SSH_OPTS[@]}" -o PreferredAuthentications=publickey -o NumberOfPasswordPrompts=0 root@"$ip" 'true' 2>&1)
+    out=$(with_deadline 30 ssh -p "$port" "${SSH_OPTS[@]}" -o PreferredAuthentications=publickey -o NumberOfPasswordPrompts=0 root@"$ip" 'true' 2>&1)
     local ec=$?
     set -e
     if [[ $ec -eq 0 ]] || grep -qiE 'permission denied|authentication failed' <<<"$out"; then
       ok "SSH is available on ${ip}:${port}"
       return 0
+    fi
+    # Deadline hit (124 from timeout, 142 from perl alarm): the server accepted TCP but never
+    # finished auth. Check once for Tailscale SSH "check" mode and fail fast instead of looping.
+    if [[ $ec -eq 124 || $ec -eq 142 ]] && detect_tailscale_ssh_check "$ip" "$port" root; then
+      return 2
     fi
     sleep 5
   done
@@ -1904,9 +1942,16 @@ function wait_for_ssh_user(){
   local host=$1 port=$2 user=$3 tries=${4:-120}
   info "Waiting for SSH on ${user}@${host}:${port} ..."
   for ((i=1; i<=tries; i++)); do
-    if ssh -p "$port" "${SSH_OPTS[@]}" "${user}@${host}" 'true' >/dev/null 2>&1; then
+    set +e
+    with_deadline 30 ssh -p "$port" "${SSH_OPTS[@]}" "${user}@${host}" 'true' >/dev/null 2>&1
+    local ec=$?
+    set -e
+    if [[ $ec -eq 0 ]]; then
       ok "SSH is available on ${user}@${host}:${port}"
       return 0
+    fi
+    if [[ $ec -eq 124 || $ec -eq 142 ]] && detect_tailscale_ssh_check "$host" "$port" "$user"; then
+      return 2
     fi
     sleep 5
   done
@@ -2454,6 +2499,20 @@ export TERM=${TERM:-dumb}
 # Compute data LV size based on nvme0n1 size
 TOTAL_SIZE=$(( $(blockdev --getsize64 /dev/nvme0n1) / (1024*1024*1024) ))
 DATA_SIZE=$(( TOTAL_SIZE - 102 )) # 100GB root + 2GB boot (approx overhead)
+# Hetzner renames/recompresses rescue images over time (.tar.gz -> .tar.zst in 2026);
+# resolve the Ubuntu 24.04 image at run time instead of hardcoding one filename.
+IMAGE_FILE=""
+for c in /root/images/Ubuntu-2404-noble-amd64-base.tar.zst \
+         /root/images/Ubuntu-2404-noble-amd64-base.tar.gz \
+         /root/images/Ubuntu-noble-latest-amd64-base.tar.zst; do
+  if [[ -f "$c" ]]; then IMAGE_FILE="$c"; break; fi
+done
+if [[ -z "$IMAGE_FILE" ]]; then
+  echo "[ERROR] No Ubuntu 24.04 (noble) amd64 image in /root/images. Available Ubuntu images:" >&2
+  ls /root/images/ | grep -i ubuntu >&2 || true
+  exit 1
+fi
+echo "Using image: ${IMAGE_FILE}"
 cat <<EOT > setup
 DRIVE1 /dev/nvme0n1
 DRIVE2 /dev/nvme1n1
@@ -2472,7 +2531,7 @@ PART lvm vg0 all
 LV vg0 root /      ext4  100G
 LV vg0 data /data  ext4  ${DATA_SIZE}G
 
-IMAGE /root/images/Ubuntu-2404-noble-amd64-base.tar.gz
+IMAGE ${IMAGE_FILE}
 EOT
 echo "Preparing setup:"
 cat setup

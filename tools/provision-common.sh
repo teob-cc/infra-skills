@@ -64,7 +64,8 @@ provision::yaml_get() {
   if [[ ! -f "$file" ]]; then
     return 1
   fi
-  yq eval "$key" "$file" 2>/dev/null || true
+  # yq prints the literal string "null" for a missing key; callers test with -n, so map it to "".
+  yq eval "$key // \"\"" "$file" 2>/dev/null || true
 }
 
 # Parse JSON value using jq
@@ -546,7 +547,11 @@ provision::github_read_credentials() {
     fi
   fi
 
-  [[ -n "$GITHUB_APP_ID" && -n "$GITHUB_APP_INSTALLATION_ID" && -n "$GITHUB_APP_PRIVATE_KEY" ]]
+  if [[ -z "$GITHUB_APP_ID" || -z "$GITHUB_APP_INSTALLATION_ID" || -z "$GITHUB_APP_PRIVATE_KEY" ]]; then
+    provision::warn "GitHub App credentials incomplete in $app_file: need stringData.githubAppID, .githubAppInstallationID, .githubAppPrivateKey (camelCase)"
+    return 1
+  fi
+  return 0
 }
 
 # Create a short-lived GitHub App JWT using openssl

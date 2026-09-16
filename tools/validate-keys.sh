@@ -110,14 +110,20 @@ check_hetzner_robot() {
   fi
 
   # READ-ONLY GET of the specific leased server (robot-ws base URL from baremetal script).
-  local http
-  http=$(curl -sS -u "${ruser}:${rpass}" -H 'Accept: application/json' \
-    -o /dev/null -w '%{http_code}' \
+  local http body ident
+  body=$(curl -sS -u "${ruser}:${rpass}" -H 'Accept: application/json' \
+    -w '\n%{http_code}' \
     "https://robot-ws.your-server.de/server/${EXTERNAL_IP}" 2>/dev/null || echo "000")
+  http=${body##*$'\n'}
 
   case "$http" in
     2*)
-      check_ok "${name}: authenticated; leased server ${EXTERNAL_IP} is visible"
+      # Say WHICH box this is. A --wipe reimages it, and the only thing standing between the
+      # operator and wiping a server that still carries another environment is reading the
+      # Robot name/product/datacenter back before confirming.
+      ident=$(printf '%s' "${body%$'\n'*}" | jq -r '.server | "\(.server_name // "?") / \(.product // "?") / \(.dc // "?")"' 2>/dev/null || echo "?")
+      check_ok "${name}: authenticated; leased server ${EXTERNAL_IP} is visible: ${ident}"
+      check_ok "       ^ confirm this is the box to (re)provision -- a --wipe reinstalls it"
       record "$name" 0 ;;
     401|403)
       check_fail "${name}: authentication rejected (HTTP ${http}). Check the webservice user/password in ${file} (Robot > Settings > Webservice/app settings)."
@@ -262,7 +268,27 @@ check_tailscale() {
   case "$http" in
     2*)
       check_ok "${name}: API key valid; tailnet is accessible (full API validation)"
-      record "$name" 0 ;;
+      # The bare-metal script runs `tailscale up --ssh`, so admin SSH after provisioning goes
+      # through Tailscale SSH. A policy rule with action "check" demands a browser re-auth per
+      # session and hangs unattended runs (see detect_tailscale_ssh_check in the bare-metal
+      # script). READ-ONLY: GET the policy and inspect the ssh rules.
+      local acl_json ssh_rules n_accept n_check
+      acl_json=$(curl -sS -u "${key}:" -H 'Accept: application/json' \
+        "https://api.tailscale.com/api/v2/tailnet/-/acl" 2>/dev/null || echo '{}')
+      ssh_rules=$(jq -c '.ssh // []' <<<"$acl_json" 2>/dev/null || echo '[]')
+      n_accept=$(jq '[.[] | select(.action=="accept")] | length' <<<"$ssh_rules" 2>/dev/null || echo 0)
+      n_check=$(jq '[.[] | select(.action=="check")] | length' <<<"$ssh_rules" 2>/dev/null || echo 0)
+      if [[ "$n_accept" -gt 0 ]]; then
+        check_ok "${name}: SSH policy has an 'accept' rule (unattended SSH over the tailnet will work)"
+        record "$name" 0
+      elif [[ "$n_check" -gt 0 ]]; then
+        check_fail "${name}: tailnet SSH policy only has 'check' rules (browser re-auth per session). Unattended provisioning will hang waiting for SSH."
+        check_fail "       Remedy: admin console -> Access controls -> ssh rule: \"action\": \"accept\" (src autogroup:member, dst autogroup:self, users root + autogroup:nonroot)."
+        record "$name" 1
+      else
+        check_fail "${name}: tailnet policy has no SSH rules; Tailscale SSH will refuse every session. Add an 'accept' rule (see remedy above)."
+        record "$name" 1
+      fi ;;
     401|403)
       check_fail "${name}: API key rejected (HTTP ${http}). Regenerate an API key in the Tailscale admin console and update ${file}."
       record "$name" 1 ;;

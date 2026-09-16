@@ -353,11 +353,25 @@ log "=== Step 5: Configure GitHub Environment Secrets ==="
 # Authenticate gh CLI with the installation token
 export GH_TOKEN="${gh_token}"
 
-# Create environment first
+# Create environment first. Creating one needs the repository "Administration: write"
+# permission, which the CI App deliberately does not have (Environments/Secrets write is
+# enough to *use* one). Try the App token, then fall back to the operator's own `gh` login
+# (an org owner per the onboarding flow), and fail clearly instead of reporting "ready" and
+# dying on the next call with a confusing "public key 404".
 info "Creating environment '${ENV_NAME}' in repository..."
-gh api --method PUT "/repos/${github_org}/${GITHUB_REPO}/environments/${ENV_NAME}" \
-  --input - <<< '{}' 2>&1 | grep -v "already exists" || true
-
+env_url="/repos/${github_org}/${GITHUB_REPO}/environments/${ENV_NAME}"
+if ! gh api "$env_url" >/dev/null 2>&1; then
+  if ! gh api --method PUT "$env_url" --input - <<< '{}' >/dev/null 2>&1; then
+    info "  App token cannot create environments (needs repo Administration:write); trying your own gh login..."
+    if ! env -u GH_TOKEN gh api --method PUT "$env_url" --input - <<< '{}' >/dev/null 2>&1; then
+      err "  Could not create environment '${ENV_NAME}' in ${github_org}/${GITHUB_REPO}."
+      err "  Create it once (repo Settings -> Environments) or with an org-owner login:"
+      err "    gh api -X PUT ${env_url} --input - <<< '{}'"
+      unset GH_TOKEN
+      exit 1
+    fi
+  fi
+fi
 info "  ✓ Environment '${ENV_NAME}' ready"
 
 # Set environment secrets using gh CLI
