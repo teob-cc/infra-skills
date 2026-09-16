@@ -423,6 +423,33 @@ workflows in the envs repo (`docs/examples/envs-repo/`). Rebuild with
 
 ## Adding a New Application
 
+### The platform recipe (Helm chart on Harbor, SSO via Pomerium)
+
+The pattern every service built on this platform follows (reference: `teob-showcase`):
+
+1. **The app repo** builds an image `FROM harbor.<base_domain>/library/teob-base` and pushes
+   image + Helm chart to Harbor (`library/<app>` and `oci://harbor.<base_domain>/library/charts`),
+   then bumps the chart version in the envs repo. Runner-injected `GITHUB_APP_ID` /
+   `GITHUB_APP_PRIVATE_KEY` / `RUNNER_ORG` mint the token for that push.
+   `tools/k3s/registry-credentials.sh <env> <app-repo>` gives the repo its Harbor secrets.
+2. **The envs repo** holds, under `envs/<env>/apps/<app>/`:
+   - `Chart.yaml` — an umbrella chart whose single dependency is the app chart from Harbor
+     (`repository: oci://harbor.<base_domain>/library/charts`, `version:` bumped by CI);
+   - `values.yaml` — per-environment overrides under the dependency's key;
+   - `pomerium-ingress.yaml` — a Traefik ingress for `<app>.<base_domain>` in namespace `sso`
+     pointing at `pomerium-proxy:80` with a cert-manager annotation;
+   plus `envs/<env>/apps/<app>-app.yaml`, the ArgoCD `Application` (project `<env>`, path above,
+   automated sync). Commit the Application only after the first chart version exists, so ArgoCD
+   never tries to resolve a placeholder.
+3. **The Pomerium route** `https://<app>.<base_domain>` → `http://<app>.<ns>.svc.cluster.local:<port>`
+   is registered with `provision::pomerium_routes_add` (any `tools/k3s/*.sh` can call it) or
+   by editing `envs/<env>/pomerium-routes.yaml` and running `tools/k3s/apply-pomerium-routes.sh`.
+
+Harbor's `library` project is public, so neither ArgoCD (chart pull) nor the kubelet (image pull)
+needs credentials. A workflow that both auto-runs after CI and is dispatched by hand should key its
+concurrency group on the event too, or the dispatch gets cancelled when CI finishes.
+
+
 ### Step 1: Create Application Manifest
 
 Create `envs/<env-name>/apps/myapp-app.yaml`:
