@@ -114,6 +114,18 @@ ARG YQ_VERSION=v4.44.6
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
+# Install the buildx CLI plugin. The dind base ships the docker CLI without it,
+# so anything asking for BuildKit -- `docker build --secret`, which is how a
+# build gets a registry credential that lands in no layer -- died with
+# "BuildKit is enabled but the buildx component is missing or broken".
+# Classic `docker build` keeps working exactly as before; this only adds the
+# capability.
+ARG BUILDX_VERSION=v0.36.1
+RUN mkdir -p /usr/libexec/docker/cli-plugins \
+    && curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64" \
+       -o /usr/libexec/docker/cli-plugins/docker-buildx \
+    && chmod +x /usr/libexec/docker/cli-plugins/docker-buildx
+
 # Verify installations
 RUN java -version \
     && scala -version \
@@ -125,7 +137,8 @@ RUN java -version \
     && rustc --version \
     && cargo --version \
     && helm version \
-    && yq --version
+    && yq --version \
+    && docker buildx version
 
 # Ensure PATH is available for runner user in all contexts
 RUN echo 'export PATH="/usr/local/sbt/bin:${PATH}"' >> /etc/profile.d/sbt.sh \

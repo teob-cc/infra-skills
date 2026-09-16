@@ -131,6 +131,11 @@ ALERTMANAGER_STORAGE_CLASS="${ALERTMANAGER_STORAGE_CLASS:-local-path}"
 # provider, or delivery fails silently.
 ALERTMANAGER_NOTIFY_EMAIL="${ALERTMANAGER_NOTIFY_EMAIL:-ops@example.com}"
 ALERTMANAGER_FROM_EMAIL="${ALERTMANAGER_FROM_EMAIL:-alerts@example.com}"
+# Databases the generic 40 GiB PostgresDatabaseSizeHigh alert must skip, as a
+# Prometheus label regex (e.g. "journal|archive"). An event journal that grows by
+# design is not an anomaly at 40 GiB; give it its own horizon alert in
+# envs/<env>/alerts/ instead. Set in env.properties; empty = alert on every database.
+POSTGRES_SIZE_ALERT_EXCLUDE="${POSTGRES_SIZE_ALERT_EXCLUDE:-}"
 # SMTP relay used by Alertmanager — Resend by default, but any SMTP relay works.
 # The `resend-api-key` Secret in $NAMESPACE_OBSERVABILITY (applied via SOPS) is
 # mounted at /etc/alertmanager/resend-key/api_key and read via
@@ -1003,7 +1008,7 @@ serverFiles:
           # envs/shared/alerts/postgres-exporter.yml. NodeFilesystemSpaceLow on vg0-data
           # remains the backstop for the underlying volume.
           - alert: PostgresDatabaseSizeHigh
-            expr: pg_database_size_bytes > 40 * 1024 * 1024 * 1024
+            expr: pg_database_size_bytes{datname!~"${POSTGRES_SIZE_ALERT_EXCLUDE}"} > 40 * 1024 * 1024 * 1024
             for: 1h
             labels: { severity: p3, app: infra }
             annotations:

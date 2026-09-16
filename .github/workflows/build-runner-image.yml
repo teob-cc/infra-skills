@@ -1,8 +1,42 @@
 name: Build Custom GitHub Actions Runner Image
 
-# Push-triggered runs have no inputs: set the repository (or organization) variables
-# RUNNER_ENVIRONMENT and BASE_DOMAIN so those builds know where to run and push.
+# Three ways to run it:
+#  - workflow_call from a thin caller in YOUR envs repo (the normal path: the job
+#    then runs on your org's self-hosted runners and reads your Harbor secrets):
+#      jobs:
+#        build:
+#          uses: teob-cc/infra-skills/.github/workflows/build-runner-image.yml@main
+#          with: { environment: prod, base_domain: prod.example.com }
+#          secrets: inherit
+#  - workflow_dispatch here (only useful in a fork that has its own runners);
+#  - push here; those runs have no inputs, so set the repository (or organization)
+#    variables RUNNER_ENVIRONMENT and BASE_DOMAIN so they know where to run and push.
 on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (e.g. prod); also the runner label"
+        required: true
+        type: string
+      base_domain:
+        description: "Base domain of the environment, e.g. prod.example.com -- registry is harbor.<base_domain>"
+        required: true
+        type: string
+      harbor_registry:
+        description: "Harbor registry hostname (defaults to harbor.<base_domain>)"
+        required: false
+        type: string
+        default: ""
+      skills_ref:
+        description: "infra-skills git ref to build the image from"
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      HARBOR_USERNAME:
+        required: true
+      HARBOR_PASSWORD:
+        required: true
   workflow_dispatch:
     inputs:
       environment:
@@ -18,6 +52,11 @@ on:
         required: false
         type: string
         default: ""
+      skills_ref:
+        description: "infra-skills git ref to build the image from"
+        required: false
+        type: string
+        default: "main"
   push:
     branches: [ main, master ]
     paths:
@@ -47,8 +86,13 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout
+      # Always check out infra-skills itself: when called from another repo the
+      # default checkout would be the caller, which has no runner Dockerfile.
+      - name: Checkout infra-skills
         uses: actions/checkout@v4
+        with:
+          repository: teob-cc/infra-skills
+          ref: ${{ inputs.skills_ref || 'main' }}
 
       - name: Set Harbor registry URL
         id: harbor

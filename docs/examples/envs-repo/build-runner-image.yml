@@ -1,0 +1,26 @@
+# Thin caller: builds the custom GitHub Actions runner image for one environment on
+# YOUR self-hosted runners and pushes it to YOUR Harbor. Copy this file to
+# .github/workflows/build-runner-image.yml in your envs repo. It needs the
+# HARBOR_USERNAME / HARBOR_PASSWORD environment secrets that
+# tools/k3s/registry-credentials.sh <env> <envs-repo-name> installs.
+name: Build Custom GitHub Actions Runner Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (its name is also the runner label)"
+        required: true
+        type: string
+      base_domain:
+        description: "Base domain of the environment, e.g. prod.example.com (registry is harbor.<base_domain>)"
+        required: true
+        type: string
+
+jobs:
+  build:
+    uses: teob-cc/infra-skills/.github/workflows/build-runner-image.yml@main
+    with:
+      environment: ${{ inputs.environment }}
+      base_domain: ${{ inputs.base_domain }}
+    secrets: inherit

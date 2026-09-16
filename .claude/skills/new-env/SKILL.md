@@ -79,6 +79,16 @@ config:
 
 `envs/<env>/apps/` — empty directory (ArgoCD Application manifests land here later).
 
+`.github/workflows/build-runner-image.yml` in the envs repo — the thin caller that builds the
+custom CI runner image on the org's own runners (copy `docs/examples/envs-repo/build-runner-image.yml`
+from infra-skills verbatim). `/provision` Step 4 dispatches it; it needs the Harbor secrets that
+`tools/k3s/registry-credentials.sh <env> <envs-repo-name>` installs.
+
+`.github/workflows/build-runner-image.yml` in the envs repo — the thin caller that builds the
+custom CI runner image on the org's own runners (copy `docs/examples/envs-repo/build-runner-image.yml`
+from infra-skills verbatim). `/provision` Step 4 dispatches it; it needs the Harbor secrets that
+`tools/k3s/registry-credentials.sh <env> <envs-repo-name>` installs.
+
 ## Step 4 — SOPS / age setup
 
 If the user has no age key:

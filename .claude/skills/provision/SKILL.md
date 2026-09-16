@@ -85,18 +85,20 @@ Harbor with Dex SSO and a Docker Hub proxy cache, at `harbor.<HOSTNAME>`. Create
 for CI/CD.
 
 ### Step 4 — Harbor Credentials + GitHub Actions Runners
-Push Harbor credentials **before** bootstrapping runners, so the runner image build workflow can
-push to Harbor.
+The custom runner image is built by **your envs repo**, through a thin caller workflow that
+runs the public reusable `build-runner-image.yml` on your own runners (`/new-env` scaffolds it;
+template in `docs/examples/envs-repo/build-runner-image.yml`). Push Harbor credentials to that
+repo **before** bootstrapping runners, so the build can push to Harbor.
 
 ```bash
-# 4a. Push Harbor credentials to the repo that builds the runner image
-tools/k3s/registry-credentials.sh <env> <infra-repo-name>
+# 4a. Push Harbor credentials to the envs repo (it builds the runner image)
+tools/k3s/registry-credentials.sh <env> <envs-repo-name>
 
 # 4b. Bootstrap with the vanilla runner image
 tools/k3s/github-action-runner.sh <env> --bootstrap
 
-# 4c. Build the custom runner image (build-runner-image.yml workflow), then upgrade:
-gh workflow run build-runner-image.yml -R <org>/<infra-repo-name> -f environment=<env>
+# 4c. Build the custom runner image from the envs repo, then upgrade:
+gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env>
 # Wait for it to complete (~5 minutes), then:
 tools/k3s/github-action-runner.sh <env>
 ```
@@ -189,10 +191,10 @@ To run an environment under a different GitHub org than your main one:
 - The new org needs its **own envs repo** (may bundle infra-skills as a Git submodule, with
   `INFRA_ENVS_ROOT` set via direnv), its **own GitHub App** (same permissions as in `/new-env`),
   and its **own OAuth App** for Dex.
-- CI runners in the new org can't pull private images or reusable workflows from the original
-  org: copy the runner Dockerfile + `build-runner-image.yml` workflow into the new envs repo, and
-  inline CI workflows into app repos (set the env name, GitOps repo, runner labels, and derive
-  `HARBOR_REGISTRY`/`NEXUS_REGISTRY` from the environment).
+- infra-skills is public, so the new org needs nothing private from the original one: its envs
+  repo carries the same thin `build-runner-image.yml` caller (Step 4), and its app repos call the
+  public reusable workflows with `base_domain` set to that environment's domain. Only `gitops_repo`
+  needs passing when the envs repo is not `<org>/infra-envs`.
 - If builds must resolve artifacts from another environment's Nexus, create an authenticated
   proxy repository in the local Nexus pointing at the source Nexus `maven-public` group, add it
   to the local `maven-public` group, and whitelist the new server's outbound IPs (IPv4 **and**

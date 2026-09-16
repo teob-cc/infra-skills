@@ -1,3 +1,23 @@
+      HARBOR_PASSWORD:
+        required: true
+      # Optional: pass both when the image's own build installs packages from
+      # the environment's Nexus (npm-private). They reach the build as a
+      # BuildKit secret, never a build-arg -- a build-arg is readable in the
+      # image history for anyone who can pull it. Callers that don't need a
+      # private registry pass neither and nothing changes for them.
+      NEXUS_USERNAME:
+        required: false
+      NEXUS_PASSWORD:
+        required: false
+
+env:
+  HARBOR_REGISTRY: ${{ inputs.harbor_registry || format('harbor.{0}', inputs.base_domain) }}
+  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+  HARBOR_PROJECT: library
+  NEXUS_REGISTRY: ${{ inputs.nexus_host || format('nexus-api.{0}', inputs.base_domain) }}
+  NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+  NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
 name: Reusable Docker Build and Deploy (plain Dockerfile)
 
 # Like static-build-and-deploy.yml but with no host-side build step: the Dockerfile
@@ -35,6 +55,11 @@ on:
         default: ""
       harbor_registry:
         description: "Harbor registry hostname (defaults to harbor.<base_domain>)"
+        required: false
+        type: string
+        default: ""
+      nexus_host:
+        description: "Nexus API hostname (defaults to nexus-api.<base_domain>); only used when NEXUS_* secrets are passed"
         required: false
         type: string
         default: ""
@@ -143,7 +168,25 @@ jobs:
 
           echo "Building ${FIRST_TAG} from $CONTEXT using $DOCKERFILE"
 
-          docker build \
+          # Nexus credentials, when the caller passed them, reach the build as
+          # a BuildKit secret the Dockerfile mounts for its install step:
+          #   RUN --mount=type=secret,id=npmrc,target=/root/.npmrc pnpm install
+          # The file exists only for that layer, so the credentials are in no
+          # layer and in no image history.
+          SECRET_ARGS=()
+          if [ -n "${NEXUS_USERNAME:-}" ] && [ -n "${NEXUS_PASSWORD:-}" ]; then
+            NPMRC="$(mktemp)"
+            trap 'rm -f "$NPMRC"' EXIT
+            chmod 600 "$NPMRC"
+            AUTH=$(printf '%s:%s' "$NEXUS_USERNAME" "$NEXUS_PASSWORD" | base64 -w0)
+            printf '//%s/repository/npm-private/:_auth=%s\nalways-auth=true\n' \
+              "$NEXUS_REGISTRY" "$AUTH" > "$NPMRC"
+            SECRET_ARGS=(--secret "id=npmrc,src=$NPMRC")
+            echo "Nexus credentials supplied: mounting npmrc secret for the build"
+          fi
+
+          DOCKER_BUILDKIT=1 docker build \
+            "${SECRET_ARGS[@]}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             --label "org.opencontainers.image.created=${{ steps.meta.outputs.date }}" \
             --label "org.opencontainers.image.version=${{ steps.meta.outputs.image_tag }}" \
