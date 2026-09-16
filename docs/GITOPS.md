@@ -446,7 +446,15 @@ The pattern every service built on this platform follows (reference: `teob-showc
    by editing `envs/<env>/pomerium-routes.yaml` and running `tools/k3s/apply-pomerium-routes.sh`.
 
 Harbor's `library` project is public, so neither ArgoCD (chart pull) nor the kubelet (image pull)
-needs credentials. A workflow that both auto-runs after CI and is dispatched by hand should key its
+needs credentials.
+
+**Private library artifacts** (a forked Maven/sbt dependency, for instance) go through the optional
+Nexus step (`UP_OPTIONAL_STEPS` gains `nexus`): the library repo publishes with its own
+`publish-to-nexus.yml` using the `NEXUS_*` environment secrets that `registry-credentials.sh`
+pushes, consumers add a resolver on `https://$NEXUS_REGISTRY/repository/maven-releases/` (the
+runners get `NEXUS_REGISTRY` / `NEXUS_USERNAME` / `NEXUS_PASSWORD` injected after the next
+`github-action-runner.sh` run), and `maven-public` proxies Central for everything else. Reference:
+`teob-cc/kafka-journal-pekko` → `cc.teob:kafka-journal-*` consumed by `teob-cc/teob`. A workflow that both auto-runs after CI and is dispatched by hand should key its
 concurrency group on the event too, or the dispatch gets cancelled when CI finishes.
 
 
