@@ -14,15 +14,23 @@ set -uo pipefail
 #
 # The order is derived from the provision skill (.claude/skills/provision):
 #   1. identity              cert-manager + Dex + Pomerium (base for everything)
-#   2. harbor                registry (runners push images here → before runners)
-#   3. github-action-runner  CI runners (need Harbor)
-#   4. argocd                GitOps (syncs envs/<env>/apps/)
-#   5. observability         Prometheus + Loki + Grafana
-#   6. postgres  (optional)  CloudNativePG + pgweb
-#   7. nexus     (optional)  artifact repository
+#   2. secrets               the env's committed secrets (tools/sops/apply.sh) -- apps need them
+#   3. harbor                registry (runners push images here -> before runners)
+#   4. github-action-runner  CI runners (need Harbor)
+#   5. argocd                GitOps (syncs envs/<env>/apps/)
+#   6. observability         Prometheus + Loki + Grafana
+#   7. postgres  (optional)  CloudNativePG + pgweb
+#   8. mysql     (optional)  Percona MySQL operator + Adminer
+#   9. redpanda  (optional)  Redpanda operator + broker (kafka-journal stack)
+#  10. scylla    (optional)  Scylla operator + node (kafka-journal stack)
+#  11. nexus     (optional)  artifact repository
+#  12. wireguard (optional)  wg-portal VPN
+#  13. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
 #
-# Optional steps are skipped by default; include them with --with-optional, or
-# target one directly with --only/--from.
+# Optional steps are skipped by default. An environment declares the ones it needs in
+# env.properties:  UP_OPTIONAL_STEPS="postgres nexus redpanda scylla backup"  -- those run
+# in the default flow. --with-optional includes ALL optional steps; --only/--from target
+# one directly. After redpanda/scylla, rerun observability to load their scrape jobs.
 #
 # Usage:
 #   tools/up.sh <env-name> [options]
@@ -52,8 +60,18 @@ PROG="$(basename "$0")"
 
 # --- Ordered step definitions (parallel arrays; bash 3.2 compatible) ---------
 # STEP_NAMES[i] is both the step id and the tools/k3s/<name>.sh basename.
-STEP_NAMES=(identity harbor github-action-runner argocd observability postgres nexus)
-STEP_TIERS=(core     core   core                 core   core          optional optional)
+STEP_NAMES=(identity secrets harbor github-action-runner argocd observability postgres mysql redpanda scylla nexus wireguard backup)
+STEP_TIERS=(core     core    core   core                 core   core          optional optional optional optional optional optional optional)
+# Script each step delegates to, relative to the repo root.
+STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/wireguard.sh tools/backup.sh)
+
+# Optional steps the environment opted into (env.properties UP_OPTIONAL_STEPS, space or
+# comma separated). Read after load_env, see env_wants().
+env_wants() {
+  local want="$1" s
+  for s in ${UP_OPTIONAL_STEPS//,/ }; do [[ "$s" == "$want" ]] && return 0; done
+  return 1
+}
 
 # --- Usage ------------------------------------------------------------------
 print_usage() {
@@ -67,7 +85,8 @@ Options:
   --force             rerun every selected step, ignoring checkpoints
   --from <step>       rerun from <step> to the end
   --only <step>       run exactly one step
-  --with-optional     include optional steps (postgres, nexus) in the flow
+  --with-optional     include ALL optional steps (an env lists the ones it needs in
+                      env.properties UP_OPTIONAL_STEPS; those always run)
   --list              print ordered steps with completion state and exit
   --yes, -y           do not prompt before each step
   --help, -h          show this help
@@ -171,7 +190,8 @@ if [[ "$DO_LIST" -eq 1 ]]; then
   for i in "${!STEP_NAMES[@]}"; do
     local_mark="[ ]"
     is_done "${STEP_NAMES[$i]}" && local_mark="[x]"
-    printf '  %s %d. %-22s (%s)\n' "$local_mark" "$((i + 1))" "${STEP_NAMES[$i]}" "${STEP_TIERS[$i]}"
+    tier="${STEP_TIERS[$i]}"; [[ "$tier" == optional ]] && env_wants "${STEP_NAMES[$i]}" && tier="optional, selected by env"
+    printf '  %s %2d. %-22s (%s)\n' "$local_mark" "$((i + 1))" "${STEP_NAMES[$i]}" "$tier"
   done
   exit 0
 fi
@@ -192,7 +212,7 @@ elif [[ -n "$FROM_STEP" ]]; then
   RESPECT_STATE=0
   for i in "${!STEP_NAMES[@]}"; do
     (( i < from_idx )) && continue
-    if [[ "${STEP_TIERS[$i]}" == "optional" && "$WITH_OPTIONAL" -ne 1 && "$i" -ne "$from_idx" ]]; then
+    if [[ "${STEP_TIERS[$i]}" == "optional" && "$WITH_OPTIONAL" -ne 1 && "$i" -ne "$from_idx" ]] && ! env_wants "${STEP_NAMES[$i]}"; then
       continue
     fi
     ACTIVE+=("$i")
@@ -201,7 +221,7 @@ else
   # resume / force over the default flow (core + optional-if-requested)
   [[ "$MODE" == "force" ]] && RESPECT_STATE=0
   for i in "${!STEP_NAMES[@]}"; do
-    if [[ "${STEP_TIERS[$i]}" == "optional" && "$WITH_OPTIONAL" -ne 1 ]]; then
+    if [[ "${STEP_TIERS[$i]}" == "optional" && "$WITH_OPTIONAL" -ne 1 ]] && ! env_wants "${STEP_NAMES[$i]}"; then
       continue
     fi
     ACTIVE+=("$i")
@@ -250,7 +270,7 @@ skipped=0
 for idx in "${ACTIVE[@]}"; do
   name="${STEP_NAMES[$idx]}"
   tier="${STEP_TIERS[$idx]}"
-  script="${REPO_ROOT}/tools/k3s/${name}.sh"
+  script="${REPO_ROOT}/${STEP_CMDS[$idx]}"
 
   if [[ "$RESPECT_STATE" -eq 1 ]] && is_done "$name"; then
     provision::info "skip  ${name} (already completed)"
@@ -264,7 +284,7 @@ for idx in "${ACTIVE[@]}"; do
   fi
 
   echo
-  provision::info "step  ${name} (${tier})  →  tools/k3s/${name}.sh ${ENV_NAME}"
+  provision::info "step  ${name} (${tier})  →  ${STEP_CMDS[$idx]} ${ENV_NAME}"
   if ! confirm_step "$name"; then
     provision::warn "declined '${name}'. Stopping to preserve step order."
     provision::warn "Resume with: ${PROG} ${ENV_NAME} --from ${name}"

@@ -52,6 +52,10 @@ VLAN_IP=192.168.100.1
 ACME_EMAIL=<acme-email>
 # Optional — only if the envs repo is not https://github.com/<github-org>/infra-envs.git:
 # GITOPS_REPO_URL=<git-url-of-your-envs-repo>
+# Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
+UP_OPTIONAL_STEPS="postgres"
+# Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
+UP_OPTIONAL_STEPS="postgres"
 ```
 
 For a Cloud VM, add (and omit EXTERNAL_IP — the script fills it in after creation):

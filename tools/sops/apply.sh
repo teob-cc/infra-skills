@@ -124,6 +124,17 @@ else
 fi
 
 echo "kubectl context: $(kubectl config current-context 2>/dev/null || echo '?')"
+# Secrets land in namespaces that later steps (observability, minecraft, wireguard...)
+# create; on a fresh cluster those do not exist yet, and kubectl apply would fail on
+# them. Create any missing namespace up front -- Helm and ArgoCD adopt existing ones.
+if [[ -d "$apply_target" ]]; then ns_files=("$apply_target"/*.y*ml); else ns_files=("$apply_target"); fi
+for ns in $(for f in "${ns_files[@]}"; do
+              yq -r 'select(.kind == "Secret") | .metadata.namespace // "default"' "$f" 2>/dev/null; done | sort -u); do
+  if ! kubectl get namespace "$ns" >/dev/null 2>&1; then
+    if [[ -n "$DRY_RUN" ]]; then echo "would create namespace $ns"; else
+      kubectl create namespace "$ns" && echo "created namespace $ns"; fi
+  fi
+done
 # shellcheck disable=SC2086
 kubectl apply $DRY_RUN -f "$apply_target" || exit 1
 echo "Secrets applied from: $apply_target"

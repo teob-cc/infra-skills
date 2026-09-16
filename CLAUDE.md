@@ -49,13 +49,17 @@ service hostname is derived from it: `dex.<HOSTNAME>`, `harbor.<HOSTNAME>`, `arg
 
 ## Provisioning order (summary — the `/provision` skill has the full sequence)
 
-1. Server: `tools/provision-hetzner-baremetal.sh` or `tools/provision-hetzner-cloud.sh`
+1. Server: `tools/provision-hetzner-baremetal.sh` or `tools/provision-hetzner-cloud.sh`; workers via `tools/k3s/join-worker.sh`
 2. `tools/k3s/identity.sh` — cert-manager + Dex (GitHub OAuth) + Pomerium. Always first.
-3. `tools/k3s/harbor.sh` — container registry (before runners; runners push to it)
-4. `tools/k3s/registry-credentials.sh` + `tools/k3s/github-action-runner.sh --bootstrap`
-5. `tools/k3s/argocd.sh` — GitOps; deploys everything in `envs/<env>/apps/`
-6. `tools/k3s/observability.sh`, `tools/k3s/mysql.sh` — independent, any order
-7. Optional: `postgres.sh`, `redpanda.sh`, `scylla.sh`, `nexus.sh` — per environment needs
+3. `tools/sops/apply.sh <env>` — the environment's committed secrets (apps reference them)
+4. `tools/k3s/harbor.sh` — container registry (before runners; runners push to it)
+5. `tools/k3s/registry-credentials.sh` + `tools/k3s/github-action-runner.sh --bootstrap`
+6. `tools/k3s/argocd.sh` — GitOps; deploys everything in `envs/<env>/apps/`
+7. `tools/k3s/observability.sh`, `tools/k3s/mysql.sh` — independent, any order
+8. Optional: `postgres.sh`, `redpanda.sh`, `scylla.sh`, `nexus.sh`, `wireguard.sh`, `tools/backup.sh` —
+   an environment lists the ones it needs in `env.properties` `UP_OPTIONAL_STEPS`; `tools/up.sh <env>`
+   runs steps 2–8 in order, resumable. Env-specific leftovers live in `envs/<env>/CLAUDE.md`
+   under "Post-provision checklist".
 
 ## Conventions all scripts follow
 

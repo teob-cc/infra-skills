@@ -221,37 +221,64 @@ check_drift() {
 }
 
 # --- Check: backups & restore-test evidence --------------------------------
-# CNPG is the reference persistence backend. A backup that has never been
-# restore-tested is not a backup. We look for a restore-test marker ConfigMap
-# ('doctor-restore-test' with data.lastTested) that a restore drill writes.
+# Two backup mechanisms count: CNPG ScheduledBackup objects, and CronJobs whose
+# name contains "backup" (the pg_dump / volume-snapshot charts many envs ship).
+# Counting only ScheduledBackups reported CRIT on an env whose Postgres was dumped
+# hourly by a CronJob. A backup that has never been restore-tested is not a
+# backup: a restore drill writes a marker ConfigMap (doctor-restore-test,
+# data.lastTested) and its age is reported.
 check_backups() {
   require_api "backups" || return
-  if ! have_crd clusters.postgresql.cnpg.io; then
-    record "backups" "SKIP" "no CNPG Postgres detected" ""
+  local scheduled cron_total cron_stale stale_names="" now marker tested_epoch age_days
+  now="$(date +%s)"
+  scheduled=0
+  have_crd scheduledbackups.postgresql.cnpg.io && \
+    scheduled="$(kc get scheduledbackups.postgresql.cnpg.io -A --no-headers | wc -l | tr -d ' ')"
+  # Active (not suspended) backup CronJobs, and how many have not succeeded in 48h.
+  local cron_json
+  cron_json="$(kc get cronjobs -A -o json | jq -c '[.items[] | select((.metadata.name | test("backup")) and (.spec.suspend != true))
+      | {n: (.metadata.namespace + "/" + .metadata.name), last: (.status.lastSuccessfulTime // "")}]' 2>/dev/null)"
+  cron_total="$(jq -r 'length' <<<"${cron_json:-[]}")"
+  cron_stale=0
+  if [[ "${cron_total:-0}" -gt 0 ]]; then
+    while IFS=$'\t' read -r n last; do
+      local last_epoch=0
+      if [[ -n "$last" ]]; then
+        last_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$last" +%s 2>/dev/null || date -u -d "$last" +%s 2>/dev/null || echo 0)"
+      fi
+      if (( now - last_epoch > 172800 )); then cron_stale=$((cron_stale + 1)); stale_names="${stale_names} ${n}"; fi
+    done < <(jq -r '.[] | [.n, .last] | @tsv' <<<"$cron_json")
+  fi
+
+  if [[ "${scheduled:-0}" -eq 0 && "${cron_total:-0}" -eq 0 ]]; then
+    if have_crd clusters.postgresql.cnpg.io; then
+      record "backups" "CRIT" "CNPG present but NO scheduled backups (no ScheduledBackup, no backup CronJob)" \
+        "add a ScheduledBackup or a pg_dump CronJob for every database"
+    else
+      record "backups" "SKIP" "no CNPG Postgres and no backup CronJobs detected" ""
+    fi
     return
   fi
-  local scheduled last_backup marker tested_epoch now age_days
-  scheduled="$(kc get scheduledbackups.postgresql.cnpg.io -A --no-headers | wc -l | tr -d ' ')"
-  if [[ "${scheduled:-0}" -eq 0 ]]; then
-    record "backups" "CRIT" "CNPG present but NO scheduled backups" \
-      "configure a ScheduledBackup for every cluster"
+  local summary="${scheduled} ScheduledBackup(s), ${cron_total} backup CronJob(s)"
+  if [[ "$cron_stale" -gt 0 ]]; then
+    record "backups" "WARN" "${summary}; ${cron_stale} CronJob(s) with no success in 48h:${stale_names}" \
+      "kubectl -n <ns> get jobs -l ... ; check the last job's logs"
     return
   fi
   # Restore-test marker (written by a restore drill; absence = never tested).
   marker="$(kc get configmap doctor-restore-test -A -o jsonpath='{.items[0].data.lastTested}')"
-  now="$(date +%s)"
   if [[ -z "$marker" ]]; then
-    record "backups" "WARN" "$scheduled scheduled backup(s), but NEVER restore-tested" \
+    record "backups" "WARN" "${summary}, all fresh, but NEVER restore-tested" \
       "run a restore drill and record it (a backup you can't restore isn't a backup)"
     return
   fi
   tested_epoch="$(date -j -f '%Y-%m-%d' "$marker" +%s 2>/dev/null || date -d "$marker" +%s 2>/dev/null)"
   age_days=$(((now - ${tested_epoch:-now}) / 86400))
   if [[ "$age_days" -gt 90 ]]; then
-    record "backups" "WARN" "$scheduled backup(s); last restore-test ${age_days}d ago (stale)" \
+    record "backups" "WARN" "${summary}; last restore-test ${age_days}d ago (stale)" \
       "re-run a restore drill (recommended quarterly)"
   else
-    record "backups" "OK" "$scheduled backup(s); restore-tested ${age_days}d ago" ""
+    record "backups" "OK" "${summary}; restore-tested ${age_days}d ago" ""
   fi
 }
 
