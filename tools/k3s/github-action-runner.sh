@@ -886,26 +886,26 @@ create_runner_deployment() {
   
   if kubectl -n "$NAMESPACE_RUNNER" get secret nexus-credentials >/dev/null 2>&1; then
     nexus_env_vars="
-        - name: NEXUS_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: nexus-credentials
-              key: username
-        - name: NEXUS_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: nexus-credentials
-              key: password
-        - name: NEXUS_URL
-          valueFrom:
-            secretKeyRef:
-              name: nexus-credentials
-              key: url
-        - name: NEXUS_REGISTRY
-          valueFrom:
-            secretKeyRef:
-              name: nexus-credentials
-              key: registry"
+            - name: NEXUS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-credentials
+                  key: username
+            - name: NEXUS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-credentials
+                  key: password
+            - name: NEXUS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-credentials
+                  key: url
+            - name: NEXUS_REGISTRY
+              valueFrom:
+                secretKeyRef:
+                  name: nexus-credentials
+                  key: registry"
     info "  Will inject NEXUS_USERNAME, NEXUS_PASSWORD, NEXUS_URL, NEXUS_REGISTRY into runner pods"
     
     # Check if Maven settings ConfigMap exists
@@ -926,36 +926,36 @@ create_runner_deployment() {
   local postgres_env_vars=""
   if kubectl -n "$NAMESPACE_RUNNER" get secret postgres-credentials >/dev/null 2>&1; then
     postgres_env_vars="
-        - name: POSTGRES_HOST
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: host
-        - name: POSTGRES_PORT
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: port
-        - name: POSTGRES_USERNAME
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: username
-        - name: POSTGRES_PASSWORD
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: password
-        - name: POSTGRES_DATABASE
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: database
-        - name: POSTGRES_URL
-          valueFrom:
-            secretKeyRef:
-              name: postgres-credentials
-              key: url"
+            - name: POSTGRES_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: host
+            - name: POSTGRES_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: port
+            - name: POSTGRES_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+            - name: POSTGRES_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: database
+            - name: POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: url"
     info "  Will inject POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USERNAME, POSTGRES_PASSWORD, POSTGRES_DATABASE, POSTGRES_URL into runner pods"
   fi
 
@@ -1021,24 +1021,21 @@ spec:
     spec:
       organization: ${github_org}
       labels:${labels_yaml}
-      env:
-        - name: GITHUB_APP_ID
-          valueFrom:
-            secretKeyRef:
-              name: github-app-credentials
-              key: githubAppID
-        - name: GITHUB_APP_PRIVATE_KEY
-          valueFrom:
-            secretKeyRef:
-              name: github-app-credentials
-              key: githubAppPrivateKey
-        - name: JAVA_TOOL_OPTIONS
-          value: "-XX:MaxRAMPercentage=85.0 -Dcats.effect.tracing.mode=none -XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -XX:+UseStringDeduplication"${nexus_env_vars}${postgres_env_vars}
       dockerEnabled: true
       image: ${runner_image}$(if [[ -n "$image_pull_policy" ]]; then echo "
       imagePullPolicy: ${image_pull_policy}"; fi)
       # Entries here are merged by name into the containers ARC generates, so
       # this adds to the injected dind sidecar without redefining it.
+      #
+      # The env block MUST live on the \`runner\` entry, not on the top-level
+      # \`env:\`. ARC v0.27.x only applies the top-level env when \`containers\`
+      # is empty; the moment the docker sidecar below was added (2026-09-03) the
+      # top-level env was silently dropped from every runner pod, and each
+      # Deploy job died on
+      #   [@octokit/auth-app] appId option is required
+      # for twelve days before anyone looked at the pod's env instead of the
+      # RunnerDeployment's. Image, mounts and RUNNER_* still come from ARC —
+      # the merge is by container name, so this entry only contributes env.
       #
       # The probe is load-bearing. Without it a dind whose containerd has
       # stopped answering still reports 2/2 Running, so the runner keeps
@@ -1052,6 +1049,20 @@ spec:
       # The image is pinned because ARC's default is the floating \`docker:dind\`,
       # which silently rolls major versions under a long-lived deployment.
       containers:
+        - name: runner
+          env:
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: githubAppID
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: github-app-credentials
+                  key: githubAppPrivateKey
+            - name: JAVA_TOOL_OPTIONS
+              value: "-XX:MaxRAMPercentage=85.0 -Dcats.effect.tracing.mode=none -XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -XX:+UseStringDeduplication"${nexus_env_vars}${postgres_env_vars}
         - name: docker
           image: docker:29.3-dind
           livenessProbe:
