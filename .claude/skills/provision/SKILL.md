@@ -142,6 +142,14 @@ tools/k3s/github-action-runner.sh <env>
 tools/k3s/runner-image.sh <env>            # --rebuild to force a new build, --skip-build to only switch
 ```
 
+```bash
+# 5c. Runtime base image for JVM services: library/teob-base (Temurin 25 JRE + Node 22 +
+#     Claude Code CLI, images/teob-base). Applications set dockerBaseImage / FROM to
+#     harbor.<base_domain>/library/teob-base:latest. Same mechanics as 5b via the caller
+#     workflow build-teob-base-image.yml in the envs repo.
+tools/k3s/base-image.sh <env>              # --rebuild to force a new build
+```
+
 By hand, 5b is: `tools/k3s/registry-credentials.sh <env> <envs-repo-name>`, then
 `gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env>
 -f base_domain=<base-domain>` (both inputs required), wait (10–15 min), then

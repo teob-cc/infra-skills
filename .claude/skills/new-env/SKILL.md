@@ -237,6 +237,6 @@ tools/sops/encrypt.sh <env>        # secrets.plain -> secrets.sops (committable)
 ```
 
 Commit everything except `secrets.plain/` (verify with `git status` that nothing plaintext is
-staged). Also copy `docs/examples/envs-repo/build-runner-image.yml` to
-`.github/workflows/build-runner-image.yml` in the envs repo now — `up.sh`'s runner-image step
-needs it there. Then run `/provision <env>`.
+staged). Also copy `docs/examples/envs-repo/build-runner-image.yml` and
+`build-teob-base-image.yml` to `.github/workflows/` in the envs repo now — `up.sh`'s
+runner-image and base-image steps need them there. Then run `/provision <env>`.

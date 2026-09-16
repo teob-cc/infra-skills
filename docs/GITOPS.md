@@ -408,6 +408,19 @@ User → GitHub OAuth
 3. Services configured with Dex as OIDC provider
 4. Users authenticate via GitHub, get OIDC tokens from Dex
 
+## Base images
+
+Two images are built per environment on its own runners and live in its Harbor `library`:
+
+| Image | Built from | Used for |
+|---|---|---|
+| `library/github-runner` | `images/github-runner` | the CI build environment (sbt, node, docker buildx, helm) — the self-hosted runners run it |
+| `library/teob-base` | `images/teob-base` | the runtime base of JVM services: Temurin 25 JRE + Node 22 + Claude Code CLI. Applications set `dockerBaseImage := "harbor.<base_domain>/library/teob-base:latest"` (sbt-native-packager) or `FROM` it |
+
+Both are dispatched by `tools/up.sh` (steps `runner-image`, `base-image`) through thin caller
+workflows in the envs repo (`docs/examples/envs-repo/`). Rebuild with
+`tools/k3s/harbor-image.sh <env> <image> --rebuild`.
+
 ## Adding a New Application
 
 ### Step 1: Create Application Manifest

@@ -98,12 +98,13 @@ back to the user and get an explicit yes. Then, in this order (from the infra-sk
 2. Stack: `tools/up.sh <env> --yes`. It first runs `tools/preflight-cluster.sh <env>`
    (node, DNS, 443, pod MTU, Tailscale), then identity → secrets → harbor → runners → argocd →
    observability → **runner-image** (Harbor creds to the envs repo, custom image build on the
-   vanilla runners, switch) → the env's `UP_OPTIONAL_STEPS`, re-applies observability if
+   vanilla runners, switch) → **base-image** (`library/teob-base`, the runtime base every JVM
+   service starts FROM) → the env's `UP_OPTIONAL_STEPS`, re-applies observability if
    redpanda/scylla ran, and ends with `tools/doctor.sh <env>`. It checkpoints and retries a
    transient failure once; on a real failure fix the cause and re-run — it resumes.
-   Prerequisite for the runner-image step: the envs repo must contain
-   `.github/workflows/build-runner-image.yml` (copied from `docs/examples/envs-repo/` in
-   Step 2) — commit and push it before `up.sh` reaches that step.
+   Prerequisite for the two image steps: the envs repo must contain
+   `.github/workflows/build-runner-image.yml` and `build-teob-base-image.yml` (copied from
+   `docs/examples/envs-repo/` in Step 2) — commit and push them before `up.sh` gets there.
 
 Details and troubleshooting live in the `provision` skill. Finish with the validation checks
 (dex, harbor, argocd, grafana all serving) and `tools/doctor.sh <env>` — the read-only health

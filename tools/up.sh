@@ -21,13 +21,15 @@ set -uo pipefail
 #   6. observability         Prometheus + Loki + Grafana
 #   7. runner-image          Harbor creds -> envs repo, build the custom runner image on the
 #                            vanilla runners, switch the RunnerDeployment to it
-#   8. postgres  (optional)  CloudNativePG + pgweb
-#   9. mysql     (optional)  Percona MySQL operator + Adminer
-#  10. redpanda  (optional)  Redpanda operator + broker (kafka-journal stack)
-#  11. scylla    (optional)  Scylla operator + node (kafka-journal stack)
-#  12. nexus     (optional)  artifact repository
-#  13. wireguard (optional)  wg-portal VPN
-#  14. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
+#   8. base-image            library/teob-base: the runtime base image (Temurin JRE + Node +
+#                            Claude Code CLI) that JVM services on the platform start FROM
+#   9. postgres  (optional)  CloudNativePG + pgweb
+#  10. mysql     (optional)  Percona MySQL operator + Adminer
+#  11. redpanda  (optional)  Redpanda operator + broker (kafka-journal stack)
+#  12. scylla    (optional)  Scylla operator + node (kafka-journal stack)
+#  13. nexus     (optional)  artifact repository
+#  14. wireguard (optional)  wg-portal VPN
+#  15. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
 #
 # After redpanda/scylla ran, observability is re-applied automatically so their scrape jobs
 # and alert groups load. A step whose output shows a transient error (API connection lost,
@@ -66,10 +68,10 @@ PROG="$(basename "$0")"
 
 # --- Ordered step definitions (parallel arrays; bash 3.2 compatible) ---------
 # STEP_NAMES[i] is both the step id and the tools/k3s/<name>.sh basename.
-STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image postgres mysql redpanda scylla nexus wireguard backup)
-STEP_TIERS=(core     core    core   core                 core   core          core         optional optional optional optional optional optional optional)
+STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image base-image postgres mysql redpanda scylla nexus wireguard backup)
+STEP_TIERS=(core     core    core   core                 core   core          core         core       optional optional optional optional optional optional optional)
 # Script each step delegates to, relative to the repo root.
-STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/wireguard.sh tools/backup.sh)
+STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/base-image.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/wireguard.sh tools/backup.sh)
 
 # Optional steps the environment opted into (env.properties UP_OPTIONAL_STEPS, space or
 # comma separated). Read after load_env, see env_wants().

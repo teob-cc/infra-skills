@@ -1,0 +1,31 @@
+# Thin caller: builds the teob-base runtime image (Temurin JRE + Node + Claude Code CLI) for one
+# environment on YOUR self-hosted runners and pushes it to YOUR Harbor as library/teob-base. Copy this file to
+# .github/workflows/build-teob-base-image.yml in your envs repo. It needs the
+# HARBOR_USERNAME / HARBOR_PASSWORD environment secrets that
+# tools/k3s/registry-credentials.sh <env> <envs-repo-name> installs.
+name: Build teob-base Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (its name is also the runner label)"
+        required: true
+        type: string
+      base_domain:
+        description: "Base domain of the environment, e.g. prod.example.com (registry is harbor.<base_domain>)"
+        required: true
+        type: string
+
+# Least privilege: the reusable job only reads the infra-skills checkout and pushes to Harbor
+# with the HARBOR_* environment secrets.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: teob-cc/infra-skills/.github/workflows/build-teob-base-image.yml@main
+    with:
+      environment: ${{ inputs.environment }}
+      base_domain: ${{ inputs.base_domain }}
+    secrets: inherit

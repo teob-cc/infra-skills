@@ -19,14 +19,14 @@ set -euo pipefail
 #
 # Workflow (Option A - Custom Runner Image, Recommended):
 #   1. Bootstrap:        tools/k3s/github-action-runner.sh dev --bootstrap
-#   2. Build base image: gh workflow run build-builder-image.yml -f environment=dev
+#   2. Base images: tools/k3s/runner-image.sh <env> and tools/k3s/base-image.sh <env>
 #   3. Build runner:     gh workflow run build-runner-image.yml -f environment=dev
 #   4. Deploy runners:   tools/k3s/github-action-runner.sh dev --custom-runner
 #   5. Remove container: directive from workflows
 #
 # Workflow (Option B - Job Container, Simpler):
 #   1. Bootstrap:        tools/k3s/github-action-runner.sh dev --bootstrap
-#   2. Build base image: gh workflow run build-builder-image.yml -f environment=dev
+#   2. Base images: tools/k3s/runner-image.sh <env> and tools/k3s/base-image.sh <env>
 #   3. Deploy runners:   tools/k3s/github-action-runner.sh dev
 #   4. Keep container: directive (image pulled on each run)
 
@@ -623,123 +623,14 @@ configure_maven_settings
 # ============================================================================
 
 build_base_image() {
-  log "=== Phase 2c: Build Base Builder Image ==="
-  
-  local harbor_host="harbor.${HOSTNAME}"
-  local image_name="library/base:latest"
-  local full_image="${harbor_host}/${image_name}"
-  
-  # Check if base image already exists in Harbor
-  info "Checking if base image exists in Harbor..."
-  if kubectl -n harbor get secret harbor-robot-runner >/dev/null 2>&1; then
-    local harbor_user harbor_pass
-    harbor_user=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.username}' | base64 -d)
-    harbor_pass=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.password}' | base64 -d)
-    
-    # Try to pull the image to check if it exists
-    if docker login "${harbor_host}" -u "${harbor_user}" -p "${harbor_pass}" >/dev/null 2>&1 && \
-       docker pull "${full_image}" >/dev/null 2>&1; then
-      info "  ✓ Base image already exists in Harbor: ${full_image}"
-      info "  Skipping build. To rebuild, delete the image from Harbor or run:"
-      info "    gh workflow run build-builder-image.yml -f environment=${ENV_NAME}"
-      return 0
-    fi
-  fi
-  
-  warn "Base image not found in Harbor: ${full_image}"
-  warn ""
-  warn "The base image must be built for linux/amd64 architecture."
-  warn "Building from arm64 Macs will create incompatible images."
-  warn ""
-  warn "Options:"
-  warn "  1. Build via GitHub Actions workflow (recommended):"
-  warn "     gh workflow run build-builder-image.yml -f environment=${ENV_NAME}"
-  warn ""
-  warn "  2. Build locally if on amd64 Linux:"
-  warn "     docker buildx build --platform linux/amd64 \\"
-  warn "       --build-arg HARBOR_REGISTRY=${harbor_host} \\"
-  warn "       -t ${full_image} images/builder"
-  warn "     docker push ${full_image}"
-  warn ""
-  warn "Skipping base image build. Runners will fail until image is available."
+  # The builder base image of earlier iterations (images/builder -> library/base) is gone:
+  # the custom runner image IS the build environment now (sbt, node, docker buildx, helm),
+  # and applications start FROM library/teob-base, built by tools/k3s/base-image.sh
+  # (up.sh step "base-image") from images/teob-base. Nothing to do here.
+  log "=== Phase 2c: Base images ==="
+  info "  build environment: the runner image (tools/k3s/runner-image.sh)"
+  info "  application runtime base: harbor.${HOSTNAME}/library/teob-base (tools/k3s/base-image.sh)"
   return 0
-  
-  # Old auto-build code (commented out due to architecture issues)
-  # info "Base image not found in Harbor. Building and pushing..."
-  
-  # Check if we have the builder Dockerfile
-  if [[ ! -f "$REPO_ROOT/images/builder/Dockerfile" ]]; then
-    err "Builder Dockerfile not found at: $REPO_ROOT/images/builder/Dockerfile"
-    err "Cannot build base image. Please create the Dockerfile or push the image manually."
-    return 1
-  fi
-  
-  # Check if helm.tgz exists (required by Dockerfile)
-  if [[ ! -f "$REPO_ROOT/images/builder/helm.tgz" ]]; then
-    warn "helm.tgz not found. Downloading Helm v3.19.0..."
-    local helm_version="v3.19.0"
-    wget -q "https://get.helm.sh/helm-${helm_version}-linux-amd64.tar.gz" \
-      -O "$REPO_ROOT/images/builder/helm.tgz" || {
-      err "Failed to download Helm. Please download manually to images/builder/helm.tgz"
-      return 1
-    }
-  fi
-  
-  info "Building base image..."
-  info "  Context: $REPO_ROOT/images/builder"
-  info "  Image: ${full_image}"
-  info "  Platform: linux/amd64"
-  
-  # Ensure buildx is available for cross-platform builds
-  if ! docker buildx version >/dev/null 2>&1; then
-    warn "docker buildx not available. Trying regular docker build..."
-    docker build \
-      --platform linux/amd64 \
-      --build-arg HARBOR_REGISTRY="${harbor_host}" \
-      -t "${full_image}" \
-      "$REPO_ROOT/images/builder" || {
-      err "Failed to build base image"
-      return 1
-    }
-  else
-    # Use buildx for better cross-platform support
-    info "Using docker buildx for cross-platform build"
-    docker buildx build \
-      --platform linux/amd64 \
-      --build-arg HARBOR_REGISTRY="${harbor_host}" \
-      --load \
-      -t "${full_image}" \
-      "$REPO_ROOT/images/builder" || {
-      err "Failed to build base image"
-      return 1
-    }
-  fi
-  
-  info "✓ Base image built successfully"
-  
-  # Login to Harbor and push
-  info "Pushing base image to Harbor..."
-  if kubectl -n harbor get secret harbor-robot-runner >/dev/null 2>&1; then
-    local harbor_user harbor_pass
-    harbor_user=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.username}' | base64 -d)
-    harbor_pass=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.password}' | base64 -d)
-    
-    docker login "${harbor_host}" -u "${harbor_user}" -p "${harbor_pass}" || {
-      err "Failed to login to Harbor"
-      return 1
-    }
-    
-    docker push "${full_image}" || {
-      err "Failed to push base image to Harbor"
-      return 1
-    }
-    
-    info "✓ Base image pushed to Harbor: ${full_image}"
-  else
-    err "Harbor robot account credentials not found"
-    err "Cannot push base image. Please push manually or provision Harbor first."
-    return 1
-  fi
 }
 
 # Skip base image build in bootstrap mode
