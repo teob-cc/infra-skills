@@ -272,6 +272,10 @@ curl -sS -o /dev/null -w "%{http_code}" https://grafana.<HOSTNAME>/api/health
 - **installimage "Image not found"**: Hetzner renames rescue images (`.tar.gz` → `.tar.zst` in
   2026); the script resolves the Ubuntu 24.04 image at run time and lists what is available on failure. A worker that will not rejoin after
   a reprovision needs `join-worker.sh` again — the old node token is invalid.
+- **A CI job dies mid-step with no log on GitHub** (job shows the step still "in progress",
+  `gh api .../logs` returns BlobNotFound): the runner container was OOM-killed — `dmesg -T | grep
+  oom` on the node names the process. JVM builds need more than the heap: raise
+  `RUNNER_MEMORY_LIMIT` (default 16Gi) in env.properties and re-run `tools/k3s/github-action-runner.sh`.
 - **Image builds on the runners stall on large downloads** (`Connection reset by peer`, CDN
   timeouts, while small requests work): MTU. Pods sit at flannel's MTU (1230 over Tailscale) and
   dockerd inside the runner pod defaults to 1500. The runner script sets ARC `dockerMTU` from a

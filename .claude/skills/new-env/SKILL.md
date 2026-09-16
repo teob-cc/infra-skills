@@ -57,6 +57,9 @@ ACME_EMAIL=<acme-email>
 # ACME_STAGING=true
 # Optional — Hetzner image name prefix for bare-metal (default Ubuntu-2404-noble):
 # BASE_OS_IMAGE=Ubuntu-2604-resolute
+# Optional — CI runner pod sizing (defaults fit JVM builds on a 64 GiB node; two runners):
+# RUNNER_MEMORY_LIMIT=16Gi
+# DOCKERD_MEMORY_LIMIT=8Gi
 # Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
 ```

@@ -988,18 +988,22 @@ spec:
       # Increase termination grace period to allow dockerd to shut down gracefully
       # This helps prevent PreStopHook failures when pod is being terminated
       terminationGracePeriodSeconds: 300
+      # Sized for JVM builds: a Scala 3 monorepo compile runs the sbt JVM past 6 GiB resident
+      # (heap is capped by MaxRAMPercentage, but compiler, Zinc and metaspace are not), and the
+      # cgroup then kills the runner mid-job with no log left on GitHub. Override per env in
+      # env.properties: RUNNER_MEMORY_LIMIT / RUNNER_MEMORY_REQUEST / DOCKERD_MEMORY_LIMIT.
       dockerdContainerResources:
         limits:
-          memory: "6Gi"
+          memory: "${DOCKERD_MEMORY_LIMIT:-8Gi}"
         requests:
           cpu: "500m"
           memory: "2Gi"
       resources:
         limits:
-          memory: "6Gi"
+          memory: "${RUNNER_MEMORY_LIMIT:-16Gi}"
         requests:
           cpu: "500m"
-          memory: "2Gi"
+          memory: "${RUNNER_MEMORY_REQUEST:-2Gi}"
       volumeMounts:${cache_volume_mounts}
       volumes:${cache_volumes}
 EOF
