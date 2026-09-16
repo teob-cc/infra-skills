@@ -54,8 +54,6 @@ ACME_EMAIL=<acme-email>
 # GITOPS_REPO_URL=<git-url-of-your-envs-repo>
 # Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
-# Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
-UP_OPTIONAL_STEPS="postgres"
 ```
 
 For a Cloud VM, add (and omit EXTERNAL_IP — the script fills it in after creation):
@@ -88,10 +86,6 @@ custom CI runner image on the org's own runners (copy `docs/examples/envs-repo/b
 from infra-skills verbatim). `/provision` Step 4 dispatches it; it needs the Harbor secrets that
 `tools/k3s/registry-credentials.sh <env> <envs-repo-name>` installs.
 
-`.github/workflows/build-runner-image.yml` in the envs repo — the thin caller that builds the
-custom CI runner image on the org's own runners (copy `docs/examples/envs-repo/build-runner-image.yml`
-from infra-skills verbatim). `/provision` Step 4 dispatches it; it needs the Harbor secrets that
-`tools/k3s/registry-credentials.sh <env> <envs-repo-name>` installs.
 
 ## Step 4 — SOPS / age setup
 
@@ -137,12 +131,10 @@ cloudflare-api-token: "<token>"
 OAuth App) for CI automation. Repository permissions: Contents R/W, Secrets R/W, Environments
 R/W, Metadata Read; organization permissions: Self-hosted runners R/W.
 
-Prefer the **manifest flow** over manual creation (two clicks instead of six steps): build a
-manifest JSON with the name (e.g. `<org>-ci`), the permissions above, `"public": false`, and no
-webhook (`"hook_attributes"` omitted, `"redirect_url"` optional); have the user open
-`https://github.com/organizations/<org>/settings/apps/new` with the manifest POSTed (an HTML
-form with a `manifest` field, or walk them through pasting it), click **Create**; GitHub
-redirects with a one-time `code`; then exchange it —
+Prefer the **manifest flow** over manual creation (two clicks instead of six steps):
+`docs/examples/github-app-manifest.html` is a self-submitting form -- fill in `<org>`, `<name>`
+and the environment domain, open it in the browser (a `file://` URL works), click **Create**;
+GitHub redirects to `redirect_url` with a one-time `code`; then exchange it --
 
 ```bash
 gh api -X POST /app-manifests/<code>/conversions
@@ -154,16 +146,21 @@ JWT, or simply from the installation page URL. Write all three into the credenti
 Install it on the org:
 
 ```yaml
+# Key names are what the scripts read (provision::github_read_credentials); no namespace --
+# each consumer (ArgoCD, the runner controller) copies it into its own namespace.
 apiVersion: v1
 kind: Secret
 metadata:
-  name: github-app-credentials
-  namespace: actions-runner-system
+  name: github-credentials
 type: Opaque
 stringData:
-  github_app_id: "<app-id>"
-  github_app_installation_id: "<installation-id>"
-  github_app_private_key: |
+  githubAppID: "<app-id>"
+  githubAppInstallationID: "<installation-id>"
+  githubAppPrivateKey: |
+    -----BEGIN RSA PRIVATE KEY-----
+    ...
+    -----END RSA PRIVATE KEY-----
+```|
     -----BEGIN RSA PRIVATE KEY-----
     ...
     -----END RSA PRIVATE KEY-----

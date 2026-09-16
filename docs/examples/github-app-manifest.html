@@ -1,0 +1,38 @@
+<!doctype html>
+<!-- GitHub App manifest flow (new-env skill, Step 5).
+     Edit ORG, NAME and BASE_DOMAIN below, open this file in a browser, click Create.
+     GitHub creates the App and redirects to redirect_url?code=...; exchange the code:
+       gh api -X POST /app-manifests/<code>/conversions
+     The response carries id (app id) and pem (private key). Then install the App on the
+     org (one click); the installation id is the number at the end of that page's URL. -->
+<html><body>
+<form id="f" method="post"></form>
+<script>
+  const ORG = "ORG";                       // GitHub organisation that owns the platform
+  const NAME = "ORG-ci";                   // App name (must be unique on GitHub)
+  const BASE_DOMAIN = "env.example.com";   // used only for the App's homepage URL
+  const manifest = {
+    name: NAME,
+    url: "https://" + BASE_DOMAIN,
+    description: "CI runners, GitOps repo access and repository secrets for the platform",
+    public: false,
+    redirect_url: "https://github.com/organizations/" + ORG + "/settings/apps",
+    default_permissions: {
+      contents: "write",        // GitOps version bumps; ArgoCD reads the envs repo
+      secrets: "write",         // registry credentials into app repos
+      environments: "write",    // per-environment secrets in app repos
+      metadata: "read",
+      organization_self_hosted_runners: "write"   // runner registration (ARC)
+    },
+    default_events: []
+  };
+  const f = document.getElementById("f");
+  f.action = "https://github.com/organizations/" + ORG + "/settings/apps/new";
+  const i = document.createElement("input");
+  i.type = "hidden"; i.name = "manifest"; i.value = JSON.stringify(manifest);
+  f.appendChild(i);
+  document.body.insertAdjacentHTML("beforeend",
+    "<p>Submitting the GitHub App manifest for <b>" + NAME + "</b> in org <b>" + ORG + "</b>…</p>");
+  f.submit();
+</script>
+</body></html>
