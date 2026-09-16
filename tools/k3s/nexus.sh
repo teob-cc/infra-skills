@@ -946,7 +946,7 @@ write_local_env_file() {
   # Written next to the other plaintext secrets of the environment (gitignored), not into
   # $HOME: it holds the deployment password. Source it (or feed it to launchctl on macOS) when a
   # local sbt/IDE needs to resolve from this Nexus.
-  local outfile="${ENV_ROOT}/${ENV_NAME}/secrets.plain/nexus-env.sh"
+  local outfile="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/nexus-env.sh"
   mkdir -p "$(dirname "$outfile")"
   local tmpfile
   tmpfile="$(mktemp)"
