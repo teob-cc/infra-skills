@@ -6,14 +6,15 @@ set -euo pipefail
 # - Non-YAML files: encrypted with sops binary mode (--input-type binary --output-type binary)
 # Optional: pass a specific FILE (basename like mysecret.yaml or any other file) to encrypt only that file.
 # Requires: sops (https://github.com/getsops/sops)
-# Keys: AGE recipients via $AGE_RECIPIENTS (comma-separated), or use rules from .sops.yaml if present
+# Keys: AGE recipients via $AGE_RECIPIENTS (comma-separated), otherwise the creation rules of the
+#       nearest .sops.yaml at or above the envs root (i.e. the one in YOUR envs repo).
 # Usage:
-#   tools/encrypt.sh [ENV] [FILE]
+#   tools/sops/encrypt.sh [ENV] [FILE]
 # Examples:
-#   tools/encrypt.sh                        # lists environments
-#   tools/encrypt.sh hetzner06              # encrypt all secrets in env
-#   tools/encrypt.sh shared cloudflare.yaml # encrypt only cloudflare.yaml
-#   AGE_RECIPIENTS="age1..." tools/encrypt.sh hetzner06
+#   tools/sops/encrypt.sh                        # lists environments
+#   tools/sops/encrypt.sh prod                   # encrypt all secrets in env
+#   tools/sops/encrypt.sh shared cloudflare.yaml # encrypt only cloudflare.yaml
+#   AGE_RECIPIENTS="age1..." tools/sops/encrypt.sh prod
 
 list_environments() {
   local envs_dir="$1"
@@ -22,6 +23,7 @@ list_environments() {
 }
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
+# shellcheck disable=SC1091
 source "$REPO_ROOT/tools/provision-common.sh"
 ENVS_ROOT=$(provision::envs_root)
 
@@ -51,16 +53,57 @@ if [[ ! -d "$PLAINTEXT_DIR" ]]; then
   exit 1
 fi
 
-mkdir -p "$ENCRYPTED_DIR"
-
-# If AGE_RECIPIENTS is not set and .sops.yaml is absent, warn the user.
-if [[ -z "${AGE_RECIPIENTS:-}" ]] && [[ ! -f "$REPO_ROOT/.sops.yaml" ]]; then
-  cat >&2 <<EOF
-Warning: Neither AGE_RECIPIENTS env var nor .sops.yaml found.
-SOPS will attempt to use its defaults, which may fail for new files.
-Set AGE_RECIPIENTS or create a .sops.yaml with creation rules.
-EOF
+# The creation rules (age recipients) live in the ENVS repo: the nearest .sops.yaml at or
+# above the envs root. sops itself searches for the config from the current working
+# directory, so running this script from anywhere else -- or from infra-skills, whose
+# .sops.yaml is a placeholder template -- either fails or encrypts to the wrong recipient.
+# Resolve it here and pass it explicitly.
+SOPS_CONFIG=""
+if [[ -z "${AGE_RECIPIENTS:-}" ]]; then
+  d="$ENVS_ROOT"
+  while [[ "$d" != "/" ]]; do
+    if [[ -f "$d/.sops.yaml" ]]; then SOPS_CONFIG="$d/.sops.yaml"; break; fi
+    d="$(dirname "$d")"
+  done
+  if [[ -z "$SOPS_CONFIG" ]]; then
+    echo "Error: no .sops.yaml found at or above $ENVS_ROOT and AGE_RECIPIENTS is unset." >&2
+    echo "       Create one in the envs repo root (see the new-env skill, Step 4) or export AGE_RECIPIENTS." >&2
+    exit 1
+  fi
+  if grep -qE 'REPLACE|PLACEHOLDER' "$SOPS_CONFIG"; then
+    echo "Error: $SOPS_CONFIG still carries the placeholder recipient; put your own age public key in it." >&2
+    exit 1
+  fi
 fi
+
+# Encrypt into a temp file and replace the destination only once sops succeeded AND the
+# output carries encryption metadata. A failed run used to truncate the destination
+# first, leaving an empty file under secrets.sops that then got committed.
+encrypt_one() {  # <src> <dst> <yaml|binary>
+  local src="$1" dst="$2" mode="$3" tmp
+  tmp="$(mktemp "${dst}.XXXXXX")"
+  local -a args=(--encrypt)
+  [[ "$mode" == binary ]] && args+=(--input-type binary --output-type binary)
+  if [[ -n "${AGE_RECIPIENTS:-}" ]]; then
+    # shellcheck disable=SC2086
+    args+=(--age ${AGE_RECIPIENTS//,/ --age })
+  else
+    args+=(--config "$SOPS_CONFIG")
+  fi
+  if ! sops "${args[@]}" "$src" > "$tmp"; then
+    rm -f "$tmp"
+    echo "Error: sops failed on $(basename "$src"); $dst left untouched." >&2
+    return 1
+  fi
+  if ! grep -qE '^sops:|ENC\[' "$tmp"; then
+    rm -f "$tmp"
+    echo "Error: sops produced no encrypted output for $(basename "$src"); $dst left untouched." >&2
+    return 1
+  fi
+  mv "$tmp" "$dst"
+}
+
+mkdir -p "$ENCRYPTED_DIR"
 
 shopt -s nullglob
 files=( )
@@ -80,32 +123,24 @@ if (( ${#files[@]} == 0 )); then
   exit 0
 fi
 
+failed=0
 for src in "${files[@]}"; do
   [[ -f "$src" ]] || continue
   rel_name="$(basename "$src")"
   dst="$ENCRYPTED_DIR/$rel_name"
-
-  # Choose mode based on extension
   case "$rel_name" in
-    *.yml|*.yaml)
-      if [[ -n "${AGE_RECIPIENTS:-}" ]]; then
-        # shellcheck disable=SC2086
-        sops --encrypt --age ${AGE_RECIPIENTS//,/ --age } "$src" > "$dst"
-      else
-        sops --encrypt "$src" > "$dst"
-      fi
-      ;;
-    *)
-      if [[ -n "${AGE_RECIPIENTS:-}" ]]; then
-        # shellcheck disable=SC2086
-        sops --encrypt --input-type binary --output-type binary --age ${AGE_RECIPIENTS//,/ --age } "$src" > "$dst"
-      else
-        sops --encrypt --input-type binary --output-type binary "$src" > "$dst"
-      fi
-      ;;
+    *.yml|*.yaml) mode=yaml ;;
+    *)            mode=binary ;;
   esac
-
-  echo "Encrypted: $rel_name -> envs/$ENV_NAME/secrets.sops/$rel_name"
+  if encrypt_one "$src" "$dst" "$mode"; then
+    echo "Encrypted: $rel_name -> envs/$ENV_NAME/secrets.sops/$rel_name"
+  else
+    failed=1
+  fi
 done
 
+if (( failed )); then
+  echo "Done with errors; see above." >&2
+  exit 1
+fi
 echo "Done. Encrypted files are in: envs/$ENV_NAME/secrets.sops"
