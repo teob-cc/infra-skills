@@ -80,10 +80,10 @@ jobs:
     environment:
       name: ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
 
+    # The image goes to Harbor with HARBOR_* secrets; no GitHub package or OIDC token is
+    # needed. Requesting only what is used keeps callers free of a permissions block.
     permissions:
       contents: read
-      packages: write
-      id-token: write
 
     steps:
       # Always check out infra-skills itself: when called from another repo the

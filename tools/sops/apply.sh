@@ -135,6 +135,19 @@ for ns in $(for f in "${ns_files[@]}"; do
       kubectl create namespace "$ns" && echo "created namespace $ns"; fi
   fi
 done
+# The shared directory mixes Kubernetes manifests with flat credential files that the
+# provisioning scripts parse themselves (cloudflare.yaml, *.txt). kubectl rejects those
+# ("apiVersion not set"), so in directory mode apply only files that declare a kind.
+if [[ -d "$apply_target" ]]; then
+  manifest_dir="$(mktemp -d)"
+  skipped=()
+  for f in "$apply_target"/*.y*ml; do
+    [[ -f "$f" ]] || continue
+    if yq -e '.kind' "$f" >/dev/null 2>&1; then cp "$f" "$manifest_dir/"; else skipped+=("$(basename "$f")"); fi
+  done
+  (( ${#skipped[@]} )) && echo "Skipping non-manifest file(s) (no 'kind:'; read directly by the scripts): ${skipped[*]}"
+  apply_target="$manifest_dir"
+fi
 # shellcheck disable=SC2086
 kubectl apply $DRY_RUN -f "$apply_target" || exit 1
 echo "Secrets applied from: $apply_target"

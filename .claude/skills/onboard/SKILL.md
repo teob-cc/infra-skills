@@ -51,14 +51,19 @@ environment (interview, `env.properties`, routes, SOPS/age setup, secret templat
 
 ## Step 3 — Credentials
 
-Collect via the `new-env` templates. Offer two assisted modes, user's choice per credential:
+Collect via the `new-env` templates. Offer three assisted modes, user's choice per credential:
 
-- **Browser-assisted (preferred when available):** if you have browser-control tools (e.g.
-  Claude in Chrome) and the user consents, drive their browser to the exact token-creation
-  page, pre-fill names and scopes, and let the **user click the final Create button** while
-  they watch. With their consent you may carry the created value from the page straight into
-  the local secrets file — never echo a secret value into the conversation, logs, or any
-  remote destination; the secrets files are gitignored and encrypted before commit.
+- **Browser-assisted with clipboard hand-off (preferred when available):** if you have
+  browser-control tools (e.g. Claude in Chrome) and the user consents, drive their browser to
+  the exact token-creation page, pre-fill names and scopes, and let the **user click the final
+  Create button** while they watch. Then have the user click the page's **Copy** button and run
+  `! pbpaste > envs/<...>/secrets.plain/<file>` (macOS; `xclip -o` / `wl-paste` on Linux) so the
+  value goes clipboard → file and never enters the conversation. Verify the file with a
+  length/prefix check, never by printing it.
+- **Browser-assisted, agent-carried:** same, but with explicit consent you read the value off
+  the page and write it to the file yourself. Faster, but the value then exists in the session
+  transcript — say so before doing it, and never echo it into the conversation, logs, or any
+  remote destination. Passwords (Hetzner Robot) are never carried this way.
 - **Instructed:** give the exact click path (page URL → menu → scopes to tick → expiry) and
   have the user paste the value into the named file themselves.
 
@@ -90,24 +95,27 @@ back to the user and get an explicit yes. Then, in this order (from the infra-sk
 1. Server: `tools/provision-hetzner-baremetal.sh <env> --wipe` (or `provision-hetzner-cloud.sh`).
    `up.sh` does **not** do this step. Expect rescue → installimage → reboot → K3s/Tailscale →
    reboot → kubeconfig written and merged as context `<env>`.
-2. Stack: `tools/up.sh <env> --yes` (identity → secrets → harbor → runners → argocd →
-   observability → the env's `UP_OPTIONAL_STEPS`). It checkpoints; on a failure fix the cause
-   and re-run — it resumes. It ends with `tools/doctor.sh <env>`.
-3. Runner image: `tools/k3s/registry-credentials.sh <env> <envs-repo>`, copy
-   `docs/examples/envs-repo/build-runner-image.yml` into the envs repo, dispatch it with
-   `environment` + `base_domain`, then `tools/k3s/github-action-runner.sh <env>` to switch
-   from the vanilla to the custom image. If redpanda/scylla were installed, re-run
-   `tools/k3s/observability.sh <env>` once for their scrape jobs.
+2. Stack: `tools/up.sh <env> --yes`. It first runs `tools/preflight-cluster.sh <env>`
+   (node, DNS, 443, pod MTU, Tailscale), then identity → secrets → harbor → runners → argocd →
+   observability → **runner-image** (Harbor creds to the envs repo, custom image build on the
+   vanilla runners, switch) → the env's `UP_OPTIONAL_STEPS`, re-applies observability if
+   redpanda/scylla ran, and ends with `tools/doctor.sh <env>`. It checkpoints and retries a
+   transient failure once; on a real failure fix the cause and re-run — it resumes.
+   Prerequisite for the runner-image step: the envs repo must contain
+   `.github/workflows/build-runner-image.yml` (copied from `docs/examples/envs-repo/` in
+   Step 2) — commit and push it before `up.sh` reaches that step.
 
 Details and troubleshooting live in the `provision` skill. Finish with the validation checks
 (dex, harbor, argocd, grafana all serving) and `tools/doctor.sh <env>` — the read-only health
-check that becomes their routine smoke test. Read its CRIT/WARN lines into Step 5's day-2 table.
+check that becomes their routine smoke test. Its CRIT/WARN lines (backups, alert delivery,
+image scanning, Tailscale key expiry) become Step 5's day-2 table.
 
 ## Step 5 — Publish their architecture docs
 
 Close the loop: generate `docs/ARCHITECTURE.md` **in their envs repo**, describing what now
-exists — from live state, not assumptions. Gather with `kubectl get nodes -o wide`,
-`helm list -A`, `kubectl get pods -A`, and the env config, then write:
+exists — from live state, not assumptions. `tools/architecture-doc.sh <env>` writes it from
+`kubectl`, `helm list -A`, the env config, the Hetzner Robot record and `doctor.sh`; review the
+result and add what only a human knows (cost, who is on call). It contains:
 
 1. **Overview** — org, environment name, base domain, server (type, IPs, location), date
    provisioned, monthly cost.

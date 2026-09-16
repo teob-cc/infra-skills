@@ -81,7 +81,10 @@ have_crd() { kc get crd "$1" >/dev/null 2>&1; }
 API_OK=true
 probe_api() { kubectl --request-timeout="$KC_TIMEOUT" get --raw='/livez' >/dev/null 2>&1 \
   || kubectl --request-timeout="$KC_TIMEOUT" get --raw='/healthz' >/dev/null 2>&1; }
-if ! probe_api; then API_OK=false; fi
+if ! probe_api; then
+  API_OK=false
+  provision::warn "cluster API unreachable ($(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)) — over Tailscale, check that your own client is connected (tailscale status). Cluster checks report UNKN."
+fi
 # Guard for cluster-dependent checks: emit a truthful UNKN and skip when the API
 # is unreachable, rather than reporting the capability as absent.
 require_api() {
@@ -341,12 +344,53 @@ check_scanning() {
   fi
 }
 
+# --- Check: alert delivery -------------------------------------------------
+# observability.sh installs labelled placeholder Secrets when an environment has no SMTP
+# relay / Telegram bot yet, so Alertmanager starts. That environment evaluates every rule
+# and delivers nothing — which looks exactly like "no alerts firing".
+check_alerting() {
+  require_api "alerting" || return
+  local placeholders
+  placeholders="$(kc get secrets -A -l infra-skills/placeholder=true -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{end}')"
+  if [[ -n "${placeholders// /}" ]]; then
+    record "alerting" "WARN" "Alertmanager delivery unconfigured (placeholder secrets:${placeholders% })" \
+      "apply the real resend-api-key / alertmanager-telegram Secrets (templates in the new-env skill), re-run tools/k3s/observability.sh"
+  elif kc get secret -n observability resend-api-key >/dev/null 2>&1; then
+    record "alerting" "OK" "Alertmanager delivery secrets present" ""
+  else
+    record "alerting" "SKIP" "no Alertmanager delivery secrets found" ""
+  fi
+}
+
+# --- Check: Tailscale API key expiry ---------------------------------------
+# Only needed to (re)provision or join nodes, but an expired key turns the next rebuild
+# into a mystery. Tailscale caps API keys at 90 days. READ-ONLY GET of the key's own record.
+check_tailscale_key() {
+  local f key id exp exp_epoch now days
+  f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
+  [[ -f "$f" ]] || { record "tailscale-key" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check expiry)" ""; return; }
+  key="$(head -1 "$f" | tr -d '[:space:]')"
+  id="$(cut -d- -f3 <<<"$key")"
+  exp="$(curl -sS -m 10 -u "${key}:" "https://api.tailscale.com/api/v2/tailnet/-/keys/${id}" 2>/dev/null | jq -r '.expires // empty' 2>/dev/null)"
+  [[ -n "$exp" ]] || { record "tailscale-key" "UNKN" "could not read the key's expiry from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"; return; }
+  exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${exp%%.*}Z" +%s 2>/dev/null || date -u -d "$exp" +%s 2>/dev/null || echo 0)"
+  now="$(date +%s)"; days=$(( (exp_epoch - now) / 86400 ))
+  if (( days < 14 )); then
+    record "tailscale-key" "WARN" "Tailscale API key expires in ${days} day(s) (${exp%%T*})" \
+      "mint a new API key in the Tailscale admin console, update envs/shared/secrets.plain/tailscale-api-key.txt, re-encrypt"
+  else
+    record "tailscale-key" "OK" "Tailscale API key valid for ${days} more day(s)" ""
+  fi
+}
+
 # --- Run all checks --------------------------------------------------------
 check_cluster
 check_pods
 check_certs
 check_drift
 check_backups
+check_alerting
+check_tailscale_key
 check_releases
 check_scanning
 

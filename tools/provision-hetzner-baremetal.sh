@@ -1181,8 +1181,9 @@ if skip_if_done "01-tailscale-repo" "Tailscale APT repository"; then
   :
 else
   echo "[postinstall] Adding Tailscale APT repository ..."
-  curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-  curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+  OS_CODENAME=$(. /etc/os-release && echo "${VERSION_CODENAME:-noble}")
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${OS_CODENAME}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${OS_CODENAME}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list
   echo "[postinstall] Tailscale APT repository configured"
   mark_step "01-tailscale-repo"
 fi
@@ -1195,7 +1196,8 @@ else
   apt update &&  apt -y dist-upgrade && apt -y autoremove
   
   echo "[postinstall] Installing base packages (kernel, locales, tools) ..."
-  apt install -y --install-recommends linux-generic-hwe-24.04 \
+  OS_RELEASE=$(. /etc/os-release && echo "${VERSION_ID:-24.04}")
+  apt install -y --install-recommends "linux-generic-hwe-${OS_RELEASE}" \
     locales ufw git vlan binutils make \
     libcurl4-openssl-dev libsqlite3-dev curl \
     apt-transport-https gnupg2 sudo kubetail tailscale
@@ -2501,14 +2503,16 @@ TOTAL_SIZE=$(( $(blockdev --getsize64 /dev/nvme0n1) / (1024*1024*1024) ))
 DATA_SIZE=$(( TOTAL_SIZE - 102 )) # 100GB root + 2GB boot (approx overhead)
 # Hetzner renames/recompresses rescue images over time (.tar.gz -> .tar.zst in 2026);
 # resolve the Ubuntu 24.04 image at run time instead of hardcoding one filename.
+# BASE_OS_IMAGE (env.properties, default Ubuntu-2404-noble) is the image name prefix as
+# Hetzner spells it, e.g. Ubuntu-2604-resolute. The postinstall derives the codename and
+# release from /etc/os-release, so it follows whatever was installed.
 IMAGE_FILE=""
-for c in /root/images/Ubuntu-2404-noble-amd64-base.tar.zst \
-         /root/images/Ubuntu-2404-noble-amd64-base.tar.gz \
-         /root/images/Ubuntu-noble-latest-amd64-base.tar.zst; do
+for c in /root/images/@BASE_OS_IMAGE@-amd64-base.tar.zst \
+         /root/images/@BASE_OS_IMAGE@-amd64-base.tar.gz; do
   if [[ -f "$c" ]]; then IMAGE_FILE="$c"; break; fi
 done
 if [[ -z "$IMAGE_FILE" ]]; then
-  echo "[ERROR] No Ubuntu 24.04 (noble) amd64 image in /root/images. Available Ubuntu images:" >&2
+  echo "[ERROR] No @BASE_OS_IMAGE@ amd64 image in /root/images. Available Ubuntu images:" >&2
   ls /root/images/ | grep -i ubuntu >&2 || true
   exit 1
 fi
@@ -2564,6 +2568,8 @@ exit 0
 REMOTE_BOOTSTRAP
   )
   # Upload and execute the bootstrap on the remote
+  BOOTSTRAP_CONTENT=${BOOTSTRAP_CONTENT//@BASE_OS_IMAGE@/${BASE_OS_IMAGE:-Ubuntu-2404-noble}}
+  info "Base OS image: ${BASE_OS_IMAGE:-Ubuntu-2404-noble} (BASE_OS_IMAGE in env.properties)"
   ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "cat >/root/installimage-bootstrap.sh && chmod +x /root/installimage-bootstrap.sh" <<< "$BOOTSTRAP_CONTENT"
   ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export HOSTNAME_ENV='${HOSTNAME}'; export TERM=dumb; /root/installimage-bootstrap.sh"
   ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export TERM=dumb; ./run-installimage.sh && reboot"

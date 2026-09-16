@@ -17,12 +17,10 @@ on:
         required: true
         type: string
 
-# The reusable job requests packages:write and id-token:write; a caller that declares no
-# permissions only grants read, and GitHub rejects the run at startup.
+# Least privilege: the reusable job only reads the infra-skills checkout and pushes to Harbor
+# with the HARBOR_* environment secrets.
 permissions:
   contents: read
-  packages: write
-  id-token: write
 
 jobs:
   build:

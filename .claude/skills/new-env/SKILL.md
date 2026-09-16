@@ -52,6 +52,11 @@ VLAN_IP=192.168.100.1
 ACME_EMAIL=<acme-email>
 # Optional — only if the envs repo is not https://github.com/<github-org>/infra-envs.git:
 # GITOPS_REPO_URL=<git-url-of-your-envs-repo>
+# Optional — Let's Encrypt staging (untrusted certs, no rate limits) for throwaway envs that
+# get wiped and rebuilt often; leave unset for anything people will use in a browser:
+# ACME_STAGING=true
+# Optional — Hetzner image name prefix for bare-metal (default Ubuntu-2404-noble):
+# BASE_OS_IMAGE=Ubuntu-2604-resolute
 # Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
 ```
@@ -232,4 +237,6 @@ tools/sops/encrypt.sh <env>        # secrets.plain -> secrets.sops (committable)
 ```
 
 Commit everything except `secrets.plain/` (verify with `git status` that nothing plaintext is
-staged). Then run `/provision <env>`.
+staged). Also copy `docs/examples/envs-repo/build-runner-image.yml` to
+`.github/workflows/build-runner-image.yml` in the envs repo now — `up.sh`'s runner-image step
+needs it there. Then run `/provision <env>`.

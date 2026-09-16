@@ -46,7 +46,10 @@ Throughout this document `<HOSTNAME>` means the base domain from the environment
 All commands run from the `infra-skills/` directory. Run them **in order** — each step depends on
 the previous ones. Always confirm with the user before executing destructive or remote commands.
 
-> **Orchestrated alternative:** `tools/up.sh <env>` runs Steps 2–9 in order, resumable — it
+> **Orchestrated alternative:** `tools/up.sh <env>` runs Steps 2–9 in order (including the
+> runner-image step and a final observability re-apply after redpanda/scylla), resumable — it
+> starts with `tools/preflight-cluster.sh <env>` (read-only: node, DNS, 443, pod MTU vs runner
+> dockerMTU, Tailscale freshness) and retries a transient step failure once. It
 > records completed steps under `~/.local/state/infra-skills/` and continues from the first
 > incomplete one on re-run. Optional steps run when the environment lists them in
 > `UP_OPTIONAL_STEPS` (or with `--with-optional`). Use the per-script path below when you need to
@@ -64,6 +67,11 @@ configures UFW (only 443/tcp from the Internet).
 ```bash
 tools/provision-hetzner-baremetal.sh <env> --wipe
 ```
+`BASE_OS_IMAGE` in env.properties picks the Hetzner image (default `Ubuntu-2404-noble`; e.g.
+`Ubuntu-2604-resolute` for 26.04 LTS — the postinstall follows the installed release). For an
+environment that will be wiped and rebuilt often, set `ACME_STAGING=true` so certificate
+re-issuance does not hit Let's Encrypt's duplicate limit (5 per week per name set).
+
 **WARNING:** `--wipe` is destructive — it reinstalls the OS. `tools/validate-keys.sh` prints the
 server's Robot name, product and datacenter: read them back to the user and get an explicit yes
 before running. A server whose Robot name is another environment's hostname is a red flag, not
@@ -126,20 +134,19 @@ template in `docs/examples/envs-repo/build-runner-image.yml`). Push Harbor crede
 repo **before** bootstrapping runners, so the build can push to Harbor.
 
 ```bash
-# 5a. Push Harbor credentials to the envs repo (it builds the runner image)
-tools/k3s/registry-credentials.sh <env> <envs-repo-name>
-
-# 5b. Bootstrap with the vanilla runner image
-tools/k3s/github-action-runner.sh <env> --bootstrap
-
-# 5c. Build the custom runner image from the envs repo, then upgrade:
-gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env> -f base_domain=<base-domain>
-# (both inputs are required; the caller workflow in the envs repo must grant packages/id-token
-#  write — the example in docs/examples/envs-repo/ does. Playwright's Chrome download inside the
-#  build can time out: a retry is the fix, not a config change.)
-# Wait for it to complete (~5 minutes), then:
+# 5a. Runners on the vanilla image (the script falls back to it while Harbor has no custom image)
 tools/k3s/github-action-runner.sh <env>
+
+# 5b. Everything else in one step: Harbor creds -> envs repo, dispatch the caller workflow with
+#     environment + base_domain, wait for the push, switch the RunnerDeployment to the image.
+tools/k3s/runner-image.sh <env>            # --rebuild to force a new build, --skip-build to only switch
 ```
+
+By hand, 5b is: `tools/k3s/registry-credentials.sh <env> <envs-repo-name>`, then
+`gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env>
+-f base_domain=<base-domain>` (both inputs required), wait (10–15 min), then
+`tools/k3s/github-action-runner.sh <env>` again. A build whose large downloads stall or reset
+is an MTU problem (see Troubleshooting), not a CDN problem.
 
 The script auto-detects the custom image in Harbor and switches runners from vanilla to custom,
 deleting the bootstrap deployment so GitHub can't schedule jobs on the vanilla runner. Runner
@@ -233,6 +240,10 @@ curl -sS -o /dev/null -w "%{http_code}" https://grafana.<HOSTNAME>/api/health
 ## Troubleshooting
 
 - **Helm repo errors** (stale repos): `helm repo remove <name>` and retry.
+- **Let's Encrypt rate limits** after repeated rebuilds (`too many certificates already issued`):
+  set `ACME_STAGING=true` for the throwaway environment, or wait for the weekly window.
+- **doctor.sh WARN alerting**: placeholder Alertmanager secrets are in place; nothing is
+  delivered until the real ones are applied (templates in `new-env`).
 - **A step died mid-Helm** (wait timeout, `http2: client connection lost` over Tailscale): check
   `helm -n <ns> status <release>`. A first install left in `failed` state must be
   `helm -n <ns> uninstall <release>` before `up.sh` can resume that step; a transient API loss

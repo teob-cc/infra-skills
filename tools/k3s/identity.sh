@@ -239,7 +239,16 @@ provision_cert_manager() {
   
   # Create ClusterIssuer
   log "Creating Let's Encrypt ClusterIssuer..."
-  cat <<YAML | ACME_EMAIL="$ACME_EMAIL" envsubst | kubectl apply -f -
+  # ACME_STAGING=true in env.properties uses Let's Encrypt staging: untrusted certificates,
+  # but no rate limits. Use it for throwaway environments that get wiped and rebuilt often --
+  # a rebuild issues ~20 certificates for the same hostnames, and production Let's Encrypt
+  # allows 5 duplicates per week.
+  local acme_server="https://acme-v02.api.letsencrypt.org/directory"
+  if [[ "${ACME_STAGING:-false}" == "true" ]]; then
+    acme_server="https://acme-staging-v02.api.letsencrypt.org/directory"
+    warn "ACME_STAGING=true: certificates will be UNTRUSTED (Let's Encrypt staging, no rate limits)"
+  fi
+  cat <<YAML | ACME_EMAIL="$ACME_EMAIL" ACME_SERVER="$acme_server" envsubst | kubectl apply -f -
 ---
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -249,7 +258,7 @@ metadata:
 spec:
   acme:
     email: \${ACME_EMAIL}
-    server: https://acme-v02.api.letsencrypt.org/directory
+    server: ${ACME_SERVER}
     privateKeySecretRef:
       name: cluster-issuer-account-key
     solvers:
