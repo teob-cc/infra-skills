@@ -453,7 +453,11 @@ Nexus step (`UP_OPTIONAL_STEPS` gains `nexus`): the library repo publishes with 
 `publish-to-nexus.yml` using the `NEXUS_*` environment secrets that `registry-credentials.sh`
 pushes, consumers add a resolver on `https://$NEXUS_REGISTRY/repository/maven-releases/` (the
 runners get `NEXUS_REGISTRY` / `NEXUS_USERNAME` / `NEXUS_PASSWORD` injected after the next
-`github-action-runner.sh` run), and `maven-public` proxies Central for everything else. Reference:
+`github-action-runner.sh` run), and `maven-public` proxies Central for everything else. Private npm
+packages work the same way with the same credentials: publish to
+`https://$NEXUS_REGISTRY/repository/npm-private/` (that is
+`https://nexus-api.<base_domain>/repository/npm-private/`), install through the `npm-public` group,
+which also proxies registry.npmjs.org. Reference:
 `teob-cc/kafka-journal-pekko` → `cc.teob:kafka-journal-*` consumed by `teob-cc/teob`. A workflow that both auto-runs after CI and is dispatched by hand should key its
 concurrency group on the event too, or the dispatch gets cancelled when CI finishes.
 

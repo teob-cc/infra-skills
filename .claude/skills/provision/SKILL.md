@@ -208,8 +208,12 @@ tools/k3s/wireguard.sh <env>
 ```bash
 tools/k3s/nexus.sh <env>
 ```
-Maven `maven-releases` / `maven-snapshots` / `maven-public` (Central proxy group) at
-`nexus-api.<HOSTNAME>`, UI at `nexus.<HOSTNAME>` behind Pomerium. The deployment user's
+Maven `maven-releases` / `maven-snapshots` / `maven-public` (Central proxy group) and npm
+`npm-private` (hosted, publish target) / `npm-proxy` (registry.npmjs.org) / `npm-public` (group of
+both) at `nexus-api.<HOSTNAME>`, UI at `nexus.<HOSTNAME>` behind Pomerium. Repository URLs have the
+shape `https://nexus-api.<HOSTNAME>/repository/<name>/` — publish npm packages to
+`https://nexus-api.<HOSTNAME>/repository/npm-private/`, install through `.../repository/npm-public/`.
+The script also activates the npm Bearer Token Realm so `npm login` works. The deployment user's
 credentials land in the cluster (`nexus/nexus-deployment-credentials`), are pushed to app repos
 by `registry-credentials.sh`, are injected into the runners on the next
 `github-action-runner.sh` run (`NEXUS_REGISTRY` / `NEXUS_USERNAME` / `NEXUS_PASSWORD`), and are
