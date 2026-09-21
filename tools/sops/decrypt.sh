@@ -93,6 +93,14 @@ fi
 if [[ -z "$OUT_DIR" ]]; then
   OUT_DIR="$ENVS_ROOT/$ENV_NAME/secrets.plain"
 fi
+
+# Everything below writes decrypted secrets to disk. The skills have always said the
+# plaintext directory must be gitignored before a secret is written there; saying it is
+# not the same as knowing it, so ask git rather than the instructions.
+if ! provision::assert_plaintext_ignored "$OUT_DIR"; then
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 
 # ---- Collect files ----

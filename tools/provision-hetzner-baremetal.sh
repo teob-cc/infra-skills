@@ -13,7 +13,7 @@
 #    - Kernel/network tuning and k3s installation
 #
 # Usage:
-#   tools/provision-hetzner-baremetal.sh <env-name> [--ssh-key PATH] [--run-installimage] [--run-followup] [--skip-diagnose] [--wipe] [--debug] [--list-robot-keys]
+#   tools/provision-hetzner-baremetal.sh <env-name> [--ssh-key PATH] [--run-installimage] [--run-followup] [--skip-diagnose] [--wipe [--confirm-server-name NAME]] [--debug] [--list-robot-keys]
 #
 # Notes:
 # - By default the script will run both installimage and follow-up steps.
@@ -73,6 +73,7 @@ RUN_INSTALLIMAGE=true
 RUN_FOLLOWUP=true
 SKIP_DIAGNOSE=false
 WIPE=false
+CONFIRM_SERVER_NAME=""
 DEBUG=false
 LIST_ROBOT_KEYS=false
 REMOVE_FROM_CLUSTER=false
@@ -92,6 +93,8 @@ while [[ $# -gt 0 ]]; do
       SKIP_DIAGNOSE=false ; shift;;
     --wipe)
       WIPE=true; shift;;
+    --confirm-server-name)
+      CONFIRM_SERVER_NAME="$2"; shift 2;;
     --debug)
       DEBUG=true; shift;;
     --list-robot-keys)
@@ -151,6 +154,46 @@ function ok(){ echo -e "${GREEN}[OK]${NC} $*" >&2; }
 function warn(){ echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 function err(){ echo -e "${RED}[ERROR]${NC} $*" >&2; }
 function dbg(){ if $DEBUG; then echo -e "${YELLOW}[DEBUG]${NC} $*" >&2; fi }
+
+# --- The wipe gate ---
+#
+# --wipe activates the Hetzner Rescue System and reruns installimage: the disks are
+# reimaged and anything not already copied off the machine is gone. There is no undo
+# and no later step that can put it back.
+#
+# This gate is code rather than a line in a skill file on purpose. The agent driving
+# this script is the thing running the command, so an instruction telling it to confirm
+# first is a request, not a guarantee -- it holds only while the model chooses to honour
+# it. The cloud path has asked for a typed server name since it was written; this one
+# had the warning and not the gate.
+#
+# It also has to hold with nobody at the terminal, which is the normal case here
+# (`up.sh --yes`, an unattended run). Hence two ways through and no third: name the
+# machine on the command line, or type it at a prompt. No terminal and no flag is a
+# refusal, not a default.
+if $WIPE; then
+  if [[ -n "${CONFIRM_SERVER_NAME}" ]]; then
+    if [[ "${CONFIRM_SERVER_NAME}" != "${HOSTNAME}" ]]; then
+      err "--confirm-server-name '${CONFIRM_SERVER_NAME}' does not match '${HOSTNAME}' (env '${ENV_NAME}')."
+      err "Refusing to wipe: the named machine and the target machine are not the same."
+      exit 1
+    fi
+    warn "--wipe confirmed for '${HOSTNAME}' (${EXTERNAL_IP}) by --confirm-server-name."
+  elif [[ -t 0 ]]; then
+    err "--wipe will reinstall the OS on '${HOSTNAME}' (${EXTERNAL_IP}), env '${ENV_NAME}'."
+    err "Every disk on it is reimaged. Anything not backed up off the machine is lost."
+    read -rp "Type the hostname to confirm [${HOSTNAME}]: " wipe_confirm
+    if [[ "${wipe_confirm}" != "${HOSTNAME}" ]]; then
+      err "Confirmation failed. Aborting."
+      exit 1
+    fi
+  else
+    err "--wipe refused: no terminal to confirm on, and --confirm-server-name was not given."
+    err "If '${HOSTNAME}' (${EXTERNAL_IP}) is really the machine to reimage, re-run with:"
+    err "    --wipe --confirm-server-name ${HOSTNAME}"
+    exit 1
+  fi
+fi
 
 # --- Hetzner Robot API helpers and Cloudflare checks (pre-provision) ---
 
