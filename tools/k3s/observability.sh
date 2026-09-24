@@ -580,7 +580,7 @@ config:
   snippets:
     pipelineStages:
       - cri: {}
-      # NOTE: there used to be a `match { selector: '{app="uce"}' }` stage here that
+      # NOTE: there used to be a \`match { selector: '{app="uce"}' }\` stage here that
       # regex-extracted the shop UUID and promoted it to a \`shop_id\` stream label.
       # It is deliberately gone:
       #
@@ -1684,7 +1684,7 @@ dashboards:
     # NOTE: no "Kubernetes Pods" entry. It used to be gnetId 6417, but 6417 is
     # "Kubernetes Cluster (Prometheus)" (uid 4XuMd2Iiz) -- the same dashboard already
     # registered below as kubernetes-cluster-prometheus. The duplicate uid gave the
-    # whole `kubernetes` provider "no database write permissions because of
+    # whole \`kubernetes\` provider "no database write permissions because of
     # duplicates", freezing all 17 of its dashboards. The pods dashboard was never
     # actually installed; re-add one only with a gnetId whose uid does not collide.
     
@@ -1772,7 +1772,7 @@ dashboards:
       revision: 18
       datasource: Prometheus
   
-  # NOTE: the `postgresql` provider is intentionally empty. It used to pull four
+  # NOTE: the \`postgresql\` provider is intentionally empty. It used to pull four
   # dashboards straight from grafana.com by gnetId, and every one of them was
   # broken here:
   #
