@@ -1,0 +1,34 @@
+# gitleaks: reviewed false positives. Every entry is either a shell variable in a curl -u argument
+# (the credential is read from the operator's secrets file at run time, never written here) or the
+# private-key block in docs/EVALUATOR-KEYS.md, a placeholder with '...paste the full downloaded .pem here...'
+# between BEGIN and END. Fingerprints are exact, so a new finding is still reported.
+#
+# history (git mode):
+6622f44ad97d240a269535beaa2d2795669391f0:tools/doctor.sh:curl-auth-user:374
+6622f44ad97d240a269535beaa2d2795669391f0:tools/preflight-cluster.sh:curl-auth-user:82
+34307900c5d28f0df4dd9824e0fe58d5b76a735f:tools/validate-keys.sh:curl-auth-user:276
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:docs/EVALUATOR-KEYS.md:private-key:171
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/k3s/harbor.sh:curl-auth-user:441
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-gpu-host.sh:curl-auth-user:285
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-gpu-host.sh:curl-auth-user:290
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-gpu-host.sh:curl-auth-user:298
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/validate-keys.sh:curl-auth-user:252
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-hetzner-cloud.sh:curl-auth-user:522
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-hetzner-cloud.sh:curl-auth-user:593
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-hetzner-baremetal.sh:curl-auth-user:441
+2bc9ed0ee80c90fa6ad3c60bc5d7b543de795721:tools/provision-hetzner-baremetal.sh:curl-auth-user:542
+#
+# working tree (--no-git):
+tools/doctor.sh:curl-auth-user:374
+tools/preflight-cluster.sh:curl-auth-user:82
+tools/k3s/harbor.sh:curl-auth-user:441
+tools/validate-keys.sh:curl-auth-user:258
+tools/validate-keys.sh:curl-auth-user:276
+tools/provision-gpu-host.sh:curl-auth-user:285
+tools/provision-gpu-host.sh:curl-auth-user:290
+tools/provision-gpu-host.sh:curl-auth-user:298
+docs/EVALUATOR-KEYS.md:private-key:171
+tools/provision-hetzner-cloud.sh:curl-auth-user:522
+tools/provision-hetzner-cloud.sh:curl-auth-user:593
+tools/provision-hetzner-baremetal.sh:curl-auth-user:441
+tools/provision-hetzner-baremetal.sh:curl-auth-user:542
