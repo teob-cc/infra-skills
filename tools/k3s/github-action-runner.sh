@@ -692,7 +692,7 @@ detect_custom_runner_image() {
       current_image=$(kubectl -n "$NAMESPACE_RUNNER" get runnerdeployment "${runner_name}" -o jsonpath='{.spec.template.spec.image}' 2>/dev/null || echo "")
       
       if [[ -n "$current_image" ]]; then
-        if [[ "$current_image" == "summerwind/actions-runner-dind:latest" ]]; then
+        if [[ "$current_image" == summerwind/actions-runner* ]]; then
           warn "  ⚠ Runner deployment exists but is using vanilla image"
           warn "  Current image: ${current_image}"
           warn "  Custom image available: ${custom_runner_image}"
@@ -725,7 +725,7 @@ detect_custom_runner_image() {
       warn "  ⚠ --custom-runner flag was set but custom image not found in Harbor"
       warn "  Will attempt to use custom image anyway (may fail if image doesn't exist)"
     else
-      info "  Will use vanilla runner image (summerwind/actions-runner-dind:latest)"
+      info "  Will use vanilla runner image (summerwind/actions-runner:v2.336.0-ubuntu-24.04)"
       info "  To build custom runner image, run:"
       info "    gh workflow run build-runner-image.yml -f environment=${ENV_NAME}"
     fi
@@ -901,7 +901,9 @@ create_runner_deployment() {
     image_pull_policy="Always"
     info "  Using custom runner image: ${runner_image}"
   else
-    runner_image="summerwind/actions-runner-dind:latest"
+    # NOT -dind: its entrypoint starts a second dockerd in the runner container that unlinks the
+    # sidecar's containerd.sock at boot (see the probe comment in the manifest below).
+    runner_image="summerwind/actions-runner:v2.336.0-ubuntu-24.04"
     info "  Using vanilla runner image: ${runner_image}"
   fi
 
@@ -950,14 +952,27 @@ spec:
       # RunnerDeployment's. Image, mounts and RUNNER_* still come from ARC —
       # the merge is by container name, so this entry only contributes env.
       #
-      # The probe is load-bearing. Without it a dind whose containerd has
-      # stopped answering still reports 2/2 Running, so the runner keeps
-      # accepting jobs it cannot build; every one of them dies on
+      # The probes are load-bearing. Without them a pod whose containerd socket
+      # is gone still reports 2/2 Running, so the runner keeps accepting jobs it
+      # cannot build; every one of them dies on
       #   failed to solve: dial /var/run/docker/containerd/containerd.sock: timeout
-      # after exactly dockerd's 60s client timeout, which reads like a broken
-      # commit rather than a broken node. Observed on two repos at once,
-      # 2026-09-03, on runner pods that had idled ~33h. \`docker info\` reaches
-      # through dockerd to containerd, so it fails when containerd is wedged.
+      # which reads like a broken commit rather than a broken node.
+      #
+      # Root cause (prod, 2026-10-09): the runner image was built FROM
+      # actions-runner-dind, whose entrypoint starts its OWN dockerd in the runner
+      # container next to this sidecar. Both share the pod's /run emptyDir; the
+      # runner's dockerd dies on iptables ~1s after boot and its cleanup unlinks
+      # /run/docker/containerd/containerd.sock -- the sidecar's live socket.
+      # dockerd and buildkit keep working on the connections they already hold,
+      # so builds pass until buildkit re-dials (~30 min idle), then fail forever.
+      # The image is now the non-dind base (images/github-runner/Dockerfile).
+      #
+      # \`docker info\` does NOT catch this: it rides dockerd's long-lived
+      # connection to containerd. Both probes therefore check the socket FILE and
+      # open a fresh connection. The runner-container probe is the one that heals:
+      # runner pods are restartPolicy Never, so a failed runner container
+      # completes the pod and ARC replaces it; a killed sidecar alone would just
+      # stay Terminated next to a runner that keeps taking jobs.
       #
       # The image is pinned because ARC's default is the floating \`docker:dind\`,
       # which silently rolls major versions under a long-lived deployment.
@@ -976,14 +991,30 @@ spec:
                   key: githubAppPrivateKey
             - name: JAVA_TOOL_OPTIONS
               value: "-XX:MaxRAMPercentage=85.0 -Dcats.effect.tracing.mode=none -XX:+UseParallelGC -XX:GCTimeRatio=4 -XX:AdaptiveSizePolicyWeight=90 -XX:+UseStringDeduplication"${nexus_env_vars}${postgres_env_vars}
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - sudo -n test -S /run/docker/containerd/containerd.sock && timeout 15 docker info >/dev/null
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 20
+            failureThreshold: 3
         - name: docker
           image: docker:29.3-dind
           livenessProbe:
             exec:
-              command: ["docker", "info"]
+              command:
+                - sh
+                - -c
+                - >-
+                  test -S /run/docker/containerd/containerd.sock &&
+                  timeout 8 ctr --address /run/docker/containerd/containerd.sock version >/dev/null &&
+                  timeout 8 docker info >/dev/null
             initialDelaySeconds: 30
             periodSeconds: 30
-            timeoutSeconds: 10
+            timeoutSeconds: 20
             failureThreshold: 3
       # Increase termination grace period to allow dockerd to shut down gracefully
       # This helps prevent PreStopHook failures when pod is being terminated
@@ -1147,7 +1178,7 @@ fi
 if [[ "$CUSTOM_RUNNER_IMAGE" == "true" ]]; then
   info "  Runner image: harbor.${HOSTNAME}/library/github-runner:latest (custom)"
 else
-  info "  Runner image: summerwind/actions-runner-dind:latest (vanilla)"
+  info "  Runner image: summerwind/actions-runner:v2.336.0-ubuntu-24.04 (vanilla)"
 fi
 info ""
 info "Runners will appear in GitHub:"

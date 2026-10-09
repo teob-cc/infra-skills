@@ -1,5 +1,5 @@
 # Custom GitHub Actions Runner with Build Tools
-# Based on summerwind/actions-runner-dind with all tools from library/base
+# Based on summerwind/actions-runner (NOT -dind) with all tools from library/base
 
 # PIN THE BASE. This was `:latest`, which meant the runner binary baked into our image was
 # whatever the base happened to ship on the day someone last rebuilt — invisible from the
@@ -12,9 +12,18 @@
 #
 # Keep this pinned to an explicit version+OS. Bumping it is then a one-line, reviewable change with
 # a visible blast radius, and the OS can't shift under the toolchain layers below (which assume
-# Ubuntu 24.04 / apt + lsb_release). Check https://hub.docker.com/r/summerwind/actions-runner-dind/tags
+# Ubuntu 24.04 / apt + lsb_release). Check https://hub.docker.com/r/summerwind/actions-runner/tags
 # when GitHub starts requiring a newer runner; the tell is "Runner update in progress" in pod logs.
-FROM summerwind/actions-runner-dind:v2.336.0-ubuntu-24.04
+#
+# NOT the -dind variant. ARC runs the Docker daemon in the `docker` sidecar it injects
+# (RunnerDeployment `dockerEnabled: true`); the runner container only needs the docker CLI. The
+# -dind image's entrypoint ALSO starts `sudo dockerd` in the runner container. Both containers
+# share the pod's /run emptyDir; the runner's copy dies on iptables ~1s after boot and its cleanup
+# unlinks /run/docker/containerd/containerd.sock -- the sidecar's LIVE socket. Builds then work
+# only while buildkit reuses an already-open connection; the first re-dial (~30 min idle) fails
+# forever with "dial unix:///var/run/docker/containerd/containerd.sock: timeout" and `docker info`
+# (riding dockerd's old connection) keeps the liveness probe green. Found on prod 2026-10-09.
+FROM summerwind/actions-runner:v2.336.0-ubuntu-24.04
 
 USER root
 
@@ -114,7 +123,7 @@ ARG YQ_VERSION=v4.44.6
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
-# Install the buildx CLI plugin. The dind base ships the docker CLI without it,
+# Install the buildx CLI plugin. The base ships the docker CLI without it,
 # so anything asking for BuildKit -- `docker build --secret`, which is how a
 # build gets a registry credential that lands in no layer -- died with
 # "BuildKit is enabled but the buildx component is missing or broken".
