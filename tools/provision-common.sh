@@ -187,6 +187,44 @@ provision::envs_root() {
   echo "${rr}/envs"
 }
 
+# Refuse to write plaintext credentials anywhere git would carry them.
+#
+# Two questions, not one. `git check-ignore` reports nothing for a path that is
+# already TRACKED, so a secret committed once keeps passing an ignore check for
+# ever -- the ignore rule is consulted only for untracked paths. Ask both: is it
+# ignored, and is it already in the index.
+#
+# Outside a git work tree there is nothing to leak into, so that is a pass. A
+# non-existent target is fine too: we walk up to the nearest directory that does
+# exist, because the caller is about to create the rest.
+#
+# Usage: provision::assert_plaintext_ignored PATH   (returns non-zero to refuse)
+provision::assert_plaintext_ignored() {
+  local target="$1" base repo rel
+  base="$target"
+  while [[ ! -d "$base" && "$base" != "/" && "$base" != "." ]]; do
+    base="$(dirname "$base")"
+  done
+  repo=$(git -C "$base" rev-parse --show-toplevel 2>/dev/null) || return 0
+  rel="${target#"${repo}"/}"
+
+  if git -C "$repo" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+    provision::error "Refusing to write plaintext credentials: '${rel}' is already tracked by git."
+    provision::error "It is in the history of ${repo} and an ignore rule will not retract it."
+    provision::error "Take it out of the index, rotate whatever it held, then retry:"
+    provision::error "    git -C ${repo} rm --cached -r -- '${rel}'"
+    return 1
+  fi
+
+  if ! git -C "$repo" check-ignore -q -- "$target" 2>/dev/null; then
+    provision::error "Refusing to write plaintext credentials: '${rel}' is not git-ignored in ${repo}."
+    provision::error "Add the rule before anything is written there:"
+    provision::error "    echo '**/secrets.plain/' >> ${repo}/.gitignore"
+    return 1
+  fi
+  return 0
+}
+
 # Resolve a Helm chart directory, allowing an envs-repo override.
 # Usage: provision::chart_path NAME  -> echoes the chart directory
 # Precedence: envs/shared/apps/<NAME> (per-installation customization override)

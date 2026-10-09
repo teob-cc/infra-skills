@@ -871,17 +871,23 @@ create_runner_deployment() {
   # dockerd requires exclusive access to it. Use a registry-backed cache
   # instead (`--cache-from/--cache-to type=registry`), as the Rust workflow
   # does.
-  info "  Will mount hostPath volume for the buildx cache"
+  info "  Will mount hostPath volumes for the buildx and coursier caches"
   info "  Cache will persist on node filesystem at /var/lib/github-runner-cache/${ENV_NAME}/"
 
   local cache_volume_mounts="
         - name: buildx-cache
-          mountPath: /tmp/.buildx-cache${maven_volume_mount}"
+          mountPath: /tmp/.buildx-cache
+        - name: coursier-cache
+          mountPath: /home/runner/.cache/coursier${maven_volume_mount}"
 
   local cache_volumes="
         - name: buildx-cache
           hostPath:
             path: /var/lib/github-runner-cache/${ENV_NAME}/buildx
+            type: DirectoryOrCreate
+        - name: coursier-cache
+          hostPath:
+            path: /var/lib/github-runner-cache/${ENV_NAME}/coursier
             type: DirectoryOrCreate${maven_volume}"
 
   # Convert comma-separated labels to YAML array
@@ -1035,6 +1041,19 @@ spec:
         requests:
           cpu: "500m"
           memory: "${RUNNER_MEMORY_REQUEST:-2Gi}"
+      # kubelet creates a DirectoryOrCreate hostPath as root:root 0755, and the runner is
+      # uid 1001. Without this the mount is unwritable and coursier silently falls back to
+      # re-downloading everything on every job -- the failure mode looks like no cache at all.
+      # Only the mountpoint is chowned; entries below it are written by the runner already.
+      initContainers:
+        - name: coursier-cache-perms
+          image: busybox:1.37
+          command: ["sh", "-c", "chown 1001:1001 /cache || true"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: coursier-cache
+              mountPath: /cache
       volumeMounts:${cache_volume_mounts}
       volumes:${cache_volumes}
 EOF

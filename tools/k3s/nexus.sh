@@ -844,6 +844,26 @@ EOF
     fi
   fi
 
+  # 4. Activate the npm Bearer Token Realm (needed for `npm login` / token auth against npm-private)
+  # Reads the active realm list and appends NpmToken only when missing; existing realms and their order are kept.
+  info "Ensuring npm Bearer Token Realm (NpmToken) is active..."
+  local active_realms
+  active_realms=$(kubectl -n "$NAMESPACE_NEXUS" exec "$pod" -- curl -sS -u "admin:${admin_password}" --max-time 10 -H "Content-Type: application/json" "${base_url}/service/rest/v1/security/realms/active" 2>/dev/null || true)
+  if ! jq -e 'type == "array" and length > 0' <<<"$active_realms" >/dev/null 2>&1; then
+    warn "  Could not read active security realms; skipping NpmToken realm activation"
+  elif jq -e 'index("NpmToken") != null' <<<"$active_realms" >/dev/null 2>&1; then
+    info "  ✓ NpmToken realm already active"
+  else
+    local payload_realms realm_code
+    payload_realms=$(jq -c '. + ["NpmToken"]' <<<"$active_realms")
+    realm_code=$(kubectl -n "$NAMESPACE_NEXUS" exec "$pod" -- curl -o /dev/null -w "%{http_code}" -sS -u "admin:${admin_password}" --max-time 10 -H "Content-Type: application/json" -X PUT -d "$payload_realms" "${base_url}/service/rest/v1/security/realms/active" 2>/dev/null || echo 000)
+    if [[ "$realm_code" == "204" || "$realm_code" == "200" ]]; then
+      info "  ✓ NpmToken realm activated"
+    else
+      warn "  Failed to activate NpmToken realm (HTTP ${realm_code})"
+    fi
+  fi
+
   info "✓ npm repositories configured"
   info "  Available repositories:"
   info "    - npm-private (hosted, for publishing)"
@@ -947,6 +967,11 @@ write_local_env_file() {
   # $HOME: it holds the deployment password. Source it (or feed it to launchctl on macOS) when a
   # local sbt/IDE needs to resolve from this Nexus.
   local outfile="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/nexus-env.sh"
+  # Holds the deployment password, and the user never typed it -- this file is written
+  # for them. Confirm git will not carry it before it exists.
+  if ! provision::assert_plaintext_ignored "$outfile"; then
+    return 1
+  fi
   mkdir -p "$(dirname "$outfile")"
   local tmpfile
   tmpfile="$(mktemp)"
