@@ -56,7 +56,7 @@ service hostname is derived from it: `dex.<HOSTNAME>`, `harbor.<HOSTNAME>`, `arg
 5. `tools/k3s/registry-credentials.sh` + `tools/k3s/github-action-runner.sh --bootstrap`
 6. `tools/k3s/argocd.sh` — GitOps; deploys everything in `envs/<env>/apps/`
 7. `tools/k3s/observability.sh`, `tools/k3s/mysql.sh` — independent, any order
-8. Optional: `postgres.sh`, `redpanda.sh`, `scylla.sh`, `nexus.sh`, `wireguard.sh`, `tools/backup.sh` —
+8. Optional: `postgres.sh`, `redpanda.sh`, `scylla.sh`, `nexus.sh`, `minio.sh`, `wireguard.sh`, `tools/backup.sh` —
    an environment lists the ones it needs in `env.properties` `UP_OPTIONAL_STEPS`; `tools/up.sh <env>`
    runs steps 2–8 in order, resumable. Env-specific leftovers live in `envs/<env>/CLAUDE.md`
    under "Post-provision checklist".
