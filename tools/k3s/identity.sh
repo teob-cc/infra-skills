@@ -572,7 +572,7 @@ provision_pomerium() {
   #
   # Note: To update routes after initial provisioning, use:
   #   tools/k3s/apply-pomerium-routes.sh <env-name>
-  local routes_values_arg=()
+  local routes_values_arg=() live_routes_values=""
   local env_routes_file="${ENVS_ROOT}/${ENV_NAME}/pomerium-routes.yaml"
   if [[ -f "$env_routes_file" ]]; then
     info "Loading Pomerium routes from: ${env_routes_file}"
@@ -581,7 +581,22 @@ provision_pomerium() {
     info "pomerium-config not found and no env routes file - bootstrapping default identity routes"
     routes_values_arg+=(--set-json 'config.routes=[{"from":"https://'"${IDENTITY_HOST}"'","to":"http://identity-app.sso.svc.cluster.local","prefix":"/protected","preserve_host_header":true,"pass_identity_headers":true,"allow_any_authenticated_user":true},{"from":"https://'"${IDENTITY_HOST}"'","to":"http://identity-app.sso.svc.cluster.local","prefix":"/public","preserve_host_header":true,"allow_public_unauthenticated_access":true,"pass_identity_headers":true},{"from":"https://'"${IDENTITY_HOST}"'","to":"http://identity-app.sso.svc.cluster.local","preserve_host_header":true,"allow_public_unauthenticated_access":true,"pass_identity_headers":true}]')
   else
-    info "Existing pomerium-config secret detected - preserving routes"
+    # This upgrade passes values and no --reuse-values, so Helm renders the chart's
+    # defaults plus the --set flags below: the image follows the chart (unlike the
+    # old --reuse-values in apply-pomerium-routes.sh), but anything not passed
+    # is dropped. Without a routes file that used to include the routes themselves
+    # (rendered as `routes: []`) and the MCP settings, despite the message. Carry
+    # the live release's route-level values over; they hold no secrets.
+    info "Existing pomerium-config secret detected - preserving the live routes"
+    live_routes_values=$(mktemp -t pomerium-live-routes-XXXX.json)
+    if helm get values pomerium -n "$NAMESPACE_SSO" -o json 2>/dev/null | \
+         jq '{config: (.config // {} | {routes, runtimeFlags, mcpAllowedClientIdDomains} | with_entries(select(.value != null)))}' \
+         > "$live_routes_values" && [[ "$(jq '.config | length' "$live_routes_values")" -gt 0 ]]; then
+      routes_values_arg+=(--values "$live_routes_values")
+    else
+      warn "Could not read the live Pomerium routes from the Helm release; the rendered config keeps none."
+      warn "Restore them with: tools/k3s/apply-pomerium-routes.sh ${ENV_NAME} (after adding ${env_routes_file})"
+    fi
   fi
 
   # Build Helm args to avoid unbound array expansion on older bash
@@ -609,7 +624,10 @@ provision_pomerium() {
   if (( ${#middleware_override_arg[@]:-0} > 0 )); then
     helm_args+=("${middleware_override_arg[@]}")
   fi
-  helm "${helm_args[@]}"
+  local helm_rc=0
+  helm "${helm_args[@]}" || helm_rc=$?
+  [[ -n "${live_routes_values:-}" ]] && rm -f "$live_routes_values"
+  (( helm_rc == 0 )) || return "$helm_rc"
 
   # Force restart to pick up config changes (Pomerium doesn't auto-reload)
   info "Restarting Pomerium to apply configuration changes..."
