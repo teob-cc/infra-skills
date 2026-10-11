@@ -24,6 +24,11 @@ set -euo pipefail
 #   --dump-table <table>     Dump a specific table (use --database to specify database, --output to specify file)
 #   --database <dbname>      Database name for dump-table (default: app)
 #   --output <file>          Output file for dump-table (default: stdout)
+#
+# env.properties (optional):
+#   PG_READONLY_ROLE=claude_ro   A read-only login (pg_read_all_data, read-only sessions,
+#                                3 connections) as a CNPG managed role; see
+#                                "Read-only login" below
 # ============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
@@ -165,6 +170,26 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 # Chart 0.22.0 = Operator 1.24.0, Chart 0.26.1 = Operator 1.27.1
 CNPG_NAMESPACE="${CNPG_NAMESPACE:-cnpg-system}"
 CNPG_VERSION="${CNPG_VERSION:-0.22.0}"
+
+# Optional read-only login on postgres-cluster (e.g. for an operator's or an
+# agent's Postgres MCP server): set PG_READONLY_ROLE (e.g. claude_ro) in
+# env.properties. Unset = nothing of it is created, patched or applied.
+#   PG_READONLY_SECRET     its kubernetes.io/basic-auth password Secret in
+#                          $NAMESPACE_POSTGRES (default: the role with - for _, plus -pg,
+#                          e.g. claude-ro-pg)
+#   PG_READONLY_SOPS_FILE  the file name of its SOPS copy in envs/<env>/secrets.sops when
+#                          this script generates the password (default:
+#                          <secret>-postgres-cluster.yaml; an existing copy is found by
+#                          content, whatever its name)
+PG_READONLY_ROLE="${PG_READONLY_ROLE:-}"
+if [[ -n "$PG_READONLY_ROLE" ]]; then
+  if [[ ! "$PG_READONLY_ROLE" =~ ^[a-z_][a-z0-9_]*$ ]]; then
+    err "PG_READONLY_ROLE='${PG_READONLY_ROLE}' is not a plain lower-case Postgres role name"
+    exit 1
+  fi
+  PG_READONLY_SECRET="${PG_READONLY_SECRET:-${PG_READONLY_ROLE//_/-}-pg}"
+  PG_READONLY_SOPS_FILE="${PG_READONLY_SOPS_FILE:-${PG_READONLY_SECRET}-postgres-cluster.yaml}"
+fi
 
 # Derive hosts from HOSTNAME if not provided
 if [[ -n "${HOSTNAME:-}" ]]; then
@@ -889,6 +914,167 @@ enable_pgvector_extension() {
 }
 
 # ============================================================================
+# Read-only login (PG_READONLY_ROLE, optional)
+# ============================================================================
+# A CNPG managed role: login, member of pg_read_all_data (reads every table of every
+# database of the cluster), at most 3 connections, its password in a Secret CNPG
+# watches (cnpg.io/reload). The session settings CNPG cannot declare are set once as
+# postgres: read-only transactions, a 30 s statement timeout, 60 s idle in a
+# transaction. This reproduces the hand procedure of the envs repos'
+# envs/<env>/postgres/postgres-cluster-claude-ro.patch.yaml and is a no-op on a
+# cluster that already has it.
+
+# The managed-role entry, as one line of JSON (also valid YAML flow style).
+pg_readonly_role_json() {
+  jq -cn --arg name "$PG_READONLY_ROLE" --arg secret "$PG_READONLY_SECRET" '{
+    name: $name, ensure: "present", comment: "read-only login (pg_read_all_data)",
+    login: true, inherit: true, connectionLimit: 3,
+    inRoles: ["pg_read_all_data"], passwordSecret: {name: $secret}
+  }'
+}
+
+# The password Secret. Kept when the cluster has it; applied from the envs repo's
+# SOPS copy when there is one; otherwise generated, applied, and encrypted into
+# envs/<env>/secrets.sops (the plaintext is removed). The value is never printed.
+ensure_pg_readonly_secret() {
+  local ns="$NAMESPACE_POSTGRES" secret="$PG_READONLY_SECRET" f sops_copy=""
+  if kubectl -n "$ns" get secret "$secret" >/dev/null 2>&1; then
+    info "Read-only login: keeping the existing secret ${ns}/${secret}"
+    return 0
+  fi
+  for f in "${ENVS_ROOT}/${ENV_NAME}/secrets.sops/"*.yaml; do
+    [[ -f "$f" ]] || continue
+    if [[ -n "$(NS="$ns" NAME="$secret" yq eval 'select(.kind == "Secret" and .metadata.name == strenv(NAME) and .metadata.namespace == strenv(NS)) | .metadata.name' "$f" 2>/dev/null)" ]]; then
+      sops_copy="$f"
+      break
+    fi
+  done
+  if [[ -n "$sops_copy" ]]; then
+    info "Read-only login: applying ${secret} from ${sops_copy#"${ENVS_ROOT}/"}"
+    if ! command -v sops >/dev/null 2>&1 || ! sops -d "$sops_copy" | kubectl apply -f - >/dev/null; then
+      err "Could not decrypt ${sops_copy#"${ENVS_ROOT}/"} (sops and the age key are needed);"
+      err "apply the env's secrets first: tools/sops/apply.sh ${ENV_NAME}"
+      return 1
+    fi
+    return 0
+  fi
+
+  local plain="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/${PG_READONLY_SOPS_FILE}" pw
+  provision::assert_plaintext_ignored "$plain" || return 1
+  pw="$(openssl rand -base64 36 | tr -d '/+=\n' | cut -c1-40)"
+  ( umask 077
+    mkdir -p "$(dirname "$plain")"
+    cat > "$plain" <<YAML
+# The password of the read-only Postgres role ${PG_READONLY_ROLE} (pg_read_all_data) of the CNPG cluster
+# postgres-cluster in ${ns}, read by CNPG (spec.managed.roles passwordSecret).
+# Written by infra-skills tools/k3s/postgres.sh; never commit.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret}
+  namespace: ${ns}
+  labels:
+    cnpg.io/reload: "true"
+type: kubernetes.io/basic-auth
+stringData:
+  username: ${PG_READONLY_ROLE}
+  password: "${pw}"
+YAML
+  )
+  unset pw
+  kubectl apply -f "$plain" >/dev/null
+  info "Read-only login: generated a password into secret ${ns}/${secret}"
+  if command -v sops >/dev/null 2>&1 && \
+     "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$PG_READONLY_SOPS_FILE" >/dev/null && \
+     grep -q 'password: ENC\[' "${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${PG_READONLY_SOPS_FILE}"; then
+    rm -f "$plain"
+    info "  encrypted to ${ENV_NAME}/secrets.sops/${PG_READONLY_SOPS_FILE} - commit it in the envs repo"
+  else
+    warn "  could not SOPS-encrypt it; the plaintext stays (git-ignored) at ${plain#"${ENVS_ROOT}/"}:"
+    warn "  tools/sops/encrypt.sh ${ENV_NAME} ${PG_READONLY_SOPS_FILE}, then delete the plaintext"
+  fi
+}
+
+# The managed role on an existing cluster (a new cluster gets it from its manifest),
+# then the session settings once CNPG reports the role.
+ensure_pg_readonly_role() {
+  [[ -n "$PG_READONLY_ROLE" ]] || return 0
+  log "=== Read-only login: ${PG_READONLY_ROLE} ==="
+  local ns="$NAMESPACE_POSTGRES" role="$PG_READONLY_ROLE" cluster_json patch role_json
+
+  ensure_pg_readonly_secret || { warn "Read-only login skipped (no password secret)"; return 0; }
+
+  if ! cluster_json=$(kubectl -n "$ns" get cluster postgres-cluster -o json 2>/dev/null); then
+    warn "No CNPG cluster postgres-cluster in ${ns} - read-only login skipped"
+    return 0
+  fi
+  if jq -e --arg n "$role" '.spec.managed.roles[]? | select(.name == $n)' <<< "$cluster_json" >/dev/null; then
+    info "Managed role ${role} already declared on postgres-cluster - leaving its spec as it is"
+  else
+    role_json=$(pg_readonly_role_json)
+    # A JSON patch that appends: a merge patch would replace spec.managed.roles
+    # wholesale and drop any other managed role.
+    if jq -e '.spec.managed.roles' <<< "$cluster_json" >/dev/null; then
+      patch="[{\"op\":\"add\",\"path\":\"/spec/managed/roles/-\",\"value\":${role_json}}]"
+    elif jq -e '.spec.managed' <<< "$cluster_json" >/dev/null; then
+      patch="[{\"op\":\"add\",\"path\":\"/spec/managed/roles\",\"value\":[${role_json}]}]"
+    else
+      patch="[{\"op\":\"add\",\"path\":\"/spec/managed\",\"value\":{\"roles\":[${role_json}]}}]"
+    fi
+    kubectl -n "$ns" patch cluster postgres-cluster --type json -p "$patch" >/dev/null
+    info "✓ Managed role ${role} added to postgres-cluster"
+  fi
+
+  local reconciled=false i
+  for i in {1..24}; do
+    if kubectl -n "$ns" get cluster postgres-cluster -o json 2>/dev/null | \
+         jq -e --arg n "$role" '(.status.managedRolesStatus.byStatus.reconciled // []) | index($n) != null' >/dev/null; then
+      reconciled=true
+      break
+    fi
+    sleep 5
+  done
+  if [[ "$reconciled" != "true" ]]; then
+    warn "CNPG has not reconciled ${role} within 2 minutes (kubectl -n ${ns} get cluster postgres-cluster"
+    warn "  -o jsonpath='{.status.managedRolesStatus}'); re-run this script to set its session settings."
+    return 0
+  fi
+
+  local pg_pod
+  pg_pod=$(kubectl -n "$ns" get pod -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary \
+             -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [[ -z "$pg_pod" ]]; then
+    warn "No primary Postgres pod found - session settings of ${role} not checked"
+    return 0
+  fi
+  # ALTER ROLE ... SET is idempotent; reading first keeps a re-run quiet and honest.
+  local want="default_transaction_read_only=on,idle_in_transaction_session_timeout=60s,statement_timeout=30s" have
+  have=$(kubectl -n "$ns" exec -i "$pg_pod" -c postgres -- psql -U postgres -d postgres -At -v ON_ERROR_STOP=1 \
+           -v role="$role" 2>/dev/null <<'SQL' || true
+SELECT coalesce(string_agg(c, ',' ORDER BY c), '')
+FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole, unnest(s.setconfig) AS c
+WHERE r.rolname = :'role' AND s.setdatabase = 0
+  AND split_part(c, '=', 1) IN ('default_transaction_read_only', 'statement_timeout', 'idle_in_transaction_session_timeout');
+SQL
+)
+  if [[ "$have" == "$want" ]]; then
+    info "✓ ${role}: read-only session settings already in place"
+    return 0
+  fi
+  if kubectl -n "$ns" exec -i "$pg_pod" -c postgres -- psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
+       -v role="$role" >/dev/null <<'SQL'
+ALTER ROLE :"role" SET default_transaction_read_only = on;
+ALTER ROLE :"role" SET statement_timeout = '30s';
+ALTER ROLE :"role" SET idle_in_transaction_session_timeout = '60s';
+SQL
+  then
+    info "✓ ${role}: default_transaction_read_only=on, statement_timeout=30s, idle_in_transaction_session_timeout=60s"
+  else
+    warn "Could not set the session settings of ${role} on ${ns}/${pg_pod}"
+  fi
+}
+
+# ============================================================================
 # Phase 2: Create PostgreSQL Cluster
 # ============================================================================
 create_postgres_cluster() {
@@ -934,6 +1120,19 @@ create_postgres_cluster() {
   else
     # Create the PostgreSQL cluster
     info "Creating single-master PostgreSQL cluster..."
+    # The read-only login's role goes into the manifest (a new cluster), so its password
+    # Secret has to exist first; an existing cluster gets the role from
+    # ensure_pg_readonly_role. Unset PG_READONLY_ROLE renders the manifest exactly as before.
+    local managed_block=""
+    if [[ -n "$PG_READONLY_ROLE" ]]; then
+      ensure_pg_readonly_secret || warn "Read-only login: no password secret yet; CNPG will retry once it exists"
+      managed_block="
+  # Read-only login (PG_READONLY_ROLE); session settings: ensure_pg_readonly_role
+  managed:
+    roles:
+      - $(pg_readonly_role_json)
+"
+    fi
     cat <<YAML | kubectl apply -f -
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -949,7 +1148,7 @@ spec:
   
   # Enable superuser access (creates postgres-cluster-superuser secret)
   enableSuperuserAccess: true
-
+${managed_block}
   # Primary update strategy
   primaryUpdateStrategy: unsupervised
   
@@ -1060,6 +1259,7 @@ YAML
 }
 
 create_postgres_cluster
+ensure_pg_readonly_role
 
 # ============================================================================
 # Phase 3: Deploy PostgreSQL Exporter for Prometheus Metrics

@@ -1152,3 +1152,34 @@ provision::pomerium_routes_remove() {
   provision::pomerium_reload_routes "$namespace_sso" "$routes_file"
   return 0
 }
+
+# --- Grafana API (from inside the grafana pod) -----------------------------------
+# The running Grafana pod of NAMESPACE (not one being terminated by a rollout).
+# Usage: provision::grafana_pod NAMESPACE  -> echoes the pod name, or returns 1
+provision::grafana_pod() {
+  local ns="$1" pod
+  pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=grafana -o json 2>/dev/null | \
+    jq -r '[.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")][0].metadata.name // empty')
+  [[ -n "$pod" ]] || return 1
+  echo "$pod"
+}
+
+# Call Grafana's HTTP API inside the grafana pod, as the admin the pod is configured
+# with (GF_SECURITY_ADMIN_USER/PASSWORD, from secret/grafana). The credentials are
+# expanded inside the pod and never reach this machine; only the response body comes
+# back. The image's busybox wget speaks GET and POST only, and exits non-zero on any
+# HTTP error status (a 401 included), which is what callers test.
+# Usage: provision::grafana_api NAMESPACE GET|POST PATH [JSON_BODY]
+provision::grafana_api() {
+  local ns="$1" pod
+  shift
+  pod=$(provision::grafana_pod "$ns") || { provision::error "No running Grafana pod in namespace ${ns}"; return 1; }
+  # shellcheck disable=SC2016  # expanded by the pod's shell, not this one
+  kubectl -n "$ns" exec "$pod" -c grafana -- sh -c '
+    auth="Authorization: Basic $(printf "%s:%s" "$GF_SECURITY_ADMIN_USER" "$GF_SECURITY_ADMIN_PASSWORD" | base64 | tr -d "\n")"
+    if [ "$1" = POST ]; then
+      wget -q -O- --header "$auth" --header "Content-Type: application/json" --post-data "$3" "http://localhost:3000$2"
+    else
+      wget -q -O- --header "$auth" "http://localhost:3000$2"
+    fi' sh "$@"
+}

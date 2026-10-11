@@ -532,6 +532,85 @@ Argo CD automatically:
 3. Syncs application to cluster
 4. Monitors for drift and auto-heals
 
+## Read-only access for agents (MCP)
+
+An agent (Claude Code, for instance) can read a cluster through three MCP servers, each locked to
+reading on its own. Every piece is either a provisioning step here or a manifest in the envs repo.
+
+**Pomerium as the MCP OAuth server.** Pomerium >= v0.32 serves the OAuth 2.1 flow MCP clients
+expect, behind a runtime flag. In `envs/<env>/pomerium-routes.yaml`:
+
+```yaml
+config:
+  runtimeFlags:
+    mcp: true
+  mcpAllowedClientIdDomains:      # required with the flag: client registration 401s without it
+    - claude.ai
+    - "*.claude.ai"
+  routes:
+    - from: https://grafana.<base_domain>
+      prefix: /mcp
+      to: http://mcp-grafana.observability.svc.cluster.local:8000
+      preserve_host_header: true
+      mcp:
+        server: {}
+      policy:
+        - allow:
+            or:
+              - claim/groups: "<org>:admins"
+```
+
+`tools/k3s/apply-pomerium-routes.sh <env>` applies it and always brings Pomerium to the bundled
+chart's image (an older Pomerium ignores the flag). An Ingress in `sso` sends the host's MCP paths
+(`/mcp`, `/.pomerium`, `/.well-known/oauth-protected-resource`,
+`/.well-known/oauth-authorization-server`) to `pomerium-proxy`; the rest of the host keeps reaching
+Grafana, which does its own login.
+
+**Grafana** — `mcp-grafana` (`-disable-write`) in `envs/<env>/apps/observability/`, reading with the
+token of a Viewer service account from the Secret `observability/mcp-grafana-token` (key `token`).
+`GRAFANA_MCP=true` in `env.properties` makes `tools/k3s/observability.sh` ensure the account
+`mcp-grafana` and a working token; `tools/k3s/grafana-mcp-token.sh <env> --rotate` mints a new one.
+Either SOPS-encrypts the token into `envs/<env>/secrets.sops/mcp-grafana-token.yaml`; commit it.
+
+**Kubernetes** — the ServiceAccount `kube-system/claude-readonly`, GitOps in the envs repo
+(`envs/<env>/apps/claude-readonly/rbac.yaml`): the built-in ClusterRole `view` bound per namespace
+(no Secrets, no exec, no port-forward), leaving out `sso` (its `dex-config` ConfigMap carries client
+secrets in plain text), plus a ClusterRole for the cluster-scoped kinds and the operated CRDs (CNPG,
+cert-manager, Argo CD, Prometheus operator). A namespace created later is unreadable until it is
+added there. `tools/k3s/claude-ro-kubeconfig.sh <context>...` writes a kubeconfig with a 24 h
+TokenRequest token per context (no token Secret in any cluster), refuses a token that can read
+Secrets or exec, and installs the read-only `kubernetes-mcp-server` configuration.
+
+**Postgres** — `PG_READONLY_ROLE=claude_ro` in `env.properties` makes `tools/k3s/postgres.sh` keep a
+CNPG managed role on `postgres-cluster`: login, member of `pg_read_all_data`, 3 connections,
+`default_transaction_read_only=on`, `statement_timeout=30s`, `idle_in_transaction_session_timeout=60s`.
+Its password is the basic-auth Secret `claude-ro-pg` (namespace `postgres`), generated once and
+SOPS-encrypted into `envs/<env>/secrets.sops/`. The agent reaches it through a port-forward.
+
+## Journal backups (Litestream)
+
+Apps whose journal is SQLite (on a PVC) stream it to S3 with a Litestream sidecar. The app chart
+carries it, off by default; the env turns it on in `envs/<env>/apps/<app>/values.yaml`:
+
+```yaml
+backup:
+  litestream:
+    enabled: true
+    extraDatabases: [memory.db]     # further SQLite files next to the main one
+    s3:
+      endpoint: https://s3.<base_domain>
+      bucket: <bucket>
+      prefix: <env>/<app>
+```
+
+The S3 credentials are a SOPS secret of the env, applied before the app syncs. The chart annotates
+the pod so that Prometheus scrapes the sidecar; `envs/<env>/alerts/litestream.yml` alerts when the
+sidecar is down, its replica lags, or syncs and uploads fail. Alert fragments are merged by
+`tools/k3s/observability.sh <env>`, not by Argo CD: re-run it after changing one. A backup counts
+once it has been restored: keep a restore drill script in the envs repo (restore the latest replica
+with the sidecar's image, `PRAGMA integrity_check`, compare table counts with the live database read
+with `mode=ro`) and run it after every change to the backup.
+
 ## Monitoring and Troubleshooting
 
 ### Check Argo CD Status

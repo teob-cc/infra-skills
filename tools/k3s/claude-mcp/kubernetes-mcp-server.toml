@@ -1,0 +1,18 @@
+# kubernetes-mcp-server (0.0.67) for an agent, against the kubeconfig that
+# tools/k3s/claude-ro-kubeconfig.sh writes (the ServiceAccount kube-system/claude-readonly,
+# one context per cluster). The script installs this file to $MCP_CONFIG_OUT.
+#
+# Three locks, each enough alone: the RBAC of the ServiceAccount (view per namespace, no
+# Secrets, no exec), read_only here (only the tools annotated read-only are exposed), and
+# Secrets denied here as well. The core toolset only: no helm (its release objects are
+# Secrets), no kubeconfig tools (they would show the token).
+read_only = true
+toolsets = ["core"]
+cluster_provider_strategy = "kubeconfig"
+list_output = "table"
+disabled_tools = ["pods_exec", "pods_run", "pods_delete", "resources_create_or_update", "resources_delete"]
+
+[[denied_resources]]
+group = ""
+version = "v1"
+kind = "Secret"

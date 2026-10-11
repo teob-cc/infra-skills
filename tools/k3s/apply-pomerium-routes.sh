@@ -9,7 +9,10 @@ set -euo pipefail
 # reinstalling the entire Pomerium deployment.
 #
 # Usage:
-#   tools/k3s/apply-pomerium-routes.sh <env-name>
+#   tools/k3s/apply-pomerium-routes.sh <env-name> [--allow-route-removal]
+#
+# Every apply also brings the release up to the bundled chart: its defaults and
+# its image (see "Values mode" below); the live secrets and ingress values stay.
 #
 # Prerequisites:
 #   - Pomerium must be installed (via tools/k3s/identity.sh)
@@ -136,13 +139,54 @@ if [[ -n "$dropped_hosts" ]]; then
   fi
 fi
 
+# --- Values mode --------------------------------------------------------------
+# --reuse-values carries over the previous release's *chart defaults* as well as
+# its user-supplied values, so a chart bump never reaches the cluster through this
+# script: hosting kept pomerium v0.26.0 under chart 0.2.0 (image v0.33.1) until the
+# tag was forced by hand, and an older Pomerium silently ignores runtimeFlags.mcp.
+# --reset-then-reuse-values (Helm >= 3.14) renders the new chart's defaults and
+# keeps the live user-supplied values (secrets, ingress, middleware).
+#
+# The image is the chart's, not the release's: a hand fix (`--set image.tag=...`)
+# leaves image.tag among the user-supplied values, where it would pin the release
+# for good. So every apply sets image.repository/tag to the chart's own defaults,
+# unless the routes file pins them deliberately (image: in pomerium-routes.yaml).
+chart_dir="$(provision::chart_path pomerium)"
+values_mode=(--reset-then-reuse-values)
+if ! helm upgrade --help 2>/dev/null | grep -q -- '--reset-then-reuse-values'; then
+  warn "This Helm ($(helm version --short 2>/dev/null)) has no --reset-then-reuse-values (Helm >= 3.14);"
+  warn "falling back to --reuse-values: the chart's image is forced, other new chart defaults are not."
+  values_mode=(--reuse-values)
+fi
+image_args=()
+if [[ -n "$(yq eval '.image // ""' "$env_routes_file")" ]]; then
+  info "Image pinned by ${env_routes_file#"${envs_root}/"} (image:) - not forcing the chart's"
+else
+  chart_repo=$(yq eval '.image.repository // ""' "$chart_dir/values.yaml")
+  chart_tag=$(yq eval '.image.tag // ""' "$chart_dir/values.yaml")
+  [[ -n "$chart_repo" ]] && image_args+=(--set "image.repository=${chart_repo}")
+  [[ -n "$chart_tag" ]] && image_args+=(--set "image.tag=${chart_tag}")
+fi
+
+image_before=$(kubectl -n "$NAMESPACE_SSO" get deploy pomerium-proxy \
+  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+
 # Apply routes using Helm upgrade with existing values
-log "Updating Pomerium routes via Helm..."
-helm upgrade "$helm_release" "$(provision::chart_path pomerium)" \
+log "Updating Pomerium routes via Helm (${values_mode[*]})..."
+helm upgrade "$helm_release" "$chart_dir" \
   --namespace "$NAMESPACE_SSO" \
-  --reuse-values \
+  "${values_mode[@]}" \
   --values "$env_routes_file" \
+  ${image_args[@]+"${image_args[@]}"} \
   --wait --timeout=3m
+
+image_after=$(kubectl -n "$NAMESPACE_SSO" get deploy pomerium-proxy \
+  -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+if [[ "$image_before" != "$image_after" ]]; then
+  info "Pomerium image: ${image_before:-<none>} -> ${image_after}"
+else
+  info "Pomerium image: ${image_after} (unchanged)"
+fi
 
 # Force restart to pick up config changes (Pomerium doesn't auto-reload)
 info "Restarting Pomerium to apply route changes..."

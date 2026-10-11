@@ -22,6 +22,13 @@ set -euo pipefail
 #   --skip-dns           Skip DNS record creation
 #   --skip-sso           Skip GitHub SSO configuration
 #   --sync-dashboards    Only upsert dashboards from envs/shared/dashboards into Grafana
+#
+# env.properties (optional):
+#   GRAFANA_ADMIN_PASSWORD  Grafana admin password; unset = keep the one in
+#                        secret/grafana, generated on first install only
+#   GRAFANA_MCP=true     Ensure the Viewer service account `mcp-grafana` and its token
+#                        (Secret observability/mcp-grafana-token, SOPS copy in the envs
+#                        repo) for the mcp-grafana MCP server; see grafana-mcp-token.sh
 # ============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
@@ -329,6 +336,38 @@ upsert_repo_dashboards() {
   done
 
   info "✓ Shared dashboards upserted (ConfigMaps labeled grafana_dashboard=1)"
+}
+
+# --- Align Grafana's stored admin password with the configured one ---
+#
+# A Grafana whose database predates the password fix above still holds whatever
+# password its first run generated, while secret/grafana holds a later one. The
+# configured admin is then refused (the UI login, and the API calls of the
+# mcp-grafana step). Check the configured admin against the API and, only when it is
+# refused, reset the stored password to the configured one with grafana's own CLI:
+# the value is expanded inside the pod and never leaves it. Best-effort.
+ensure_grafana_admin_login() {
+  local ns="${NAMESPACE_OBSERVABILITY}" pod
+  if ! pod=$(provision::grafana_pod "$ns"); then
+    warn "No running Grafana pod - skipping the admin password check."
+    return 0
+  fi
+  if provision::grafana_api "$ns" GET /api/user >/dev/null 2>&1; then
+    info "✓ Grafana accepts the configured admin password"
+    return 0
+  fi
+  warn "Grafana refuses the configured admin password (its database predates secret/grafana's) - resetting it."
+  # shellcheck disable=SC2016  # expanded by the pod's shell
+  if kubectl -n "$ns" exec "$pod" -c grafana -- sh -c '
+       if command -v grafana >/dev/null 2>&1; then set -- grafana cli; else set -- grafana-cli; fi
+       "$@" --homepath /usr/share/grafana --config /etc/grafana/grafana.ini \
+         admin reset-admin-password "$GF_SECURITY_ADMIN_PASSWORD"' >/dev/null 2>&1 &&
+     provision::grafana_api "$ns" GET /api/user >/dev/null 2>&1; then
+    info "✓ Grafana's stored admin password reset to the one in secret/grafana"
+  else
+    warn "Could not align Grafana's admin password; the mcp-grafana step will fail until it is."
+    warn "  kubectl -n ${ns} exec deploy/grafana -c grafana -- sh -c 'grafana cli admin reset-admin-password \"\$GF_SECURITY_ADMIN_PASSWORD\"'"
+  fi
 }
 
 # --- Detect Tailscale IP ---
@@ -1515,14 +1554,27 @@ if [[ "$SKIP_GRAFANA" != "true" ]]; then
   # Ensure dashboards exist in-cluster before Grafana starts (idempotent)
   upsert_repo_dashboards || true
 
-  # Generate Grafana admin password if not provided
-  if [[ -z "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
-    if command -v openssl >/dev/null 2>&1; then
-      GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '\n' | tr -d '=/' | cut -c1-24)"
+  # Grafana admin password. Grafana applies GF_SECURITY_ADMIN_PASSWORD only when it
+  # creates its database, so a password generated afresh on every run (as this did)
+  # changed secret/grafana but never the stored admin: the two drifted apart, and the
+  # admin login and the API calls below failed until reset by hand (2026-10-11).
+  # Precedence: GRAFANA_ADMIN_PASSWORD from the environment > the one in the chart's
+  # secret/grafana (key admin-password) > generated, on first install only.
+  if [[ -n "${GRAFANA_ADMIN_PASSWORD:-}" ]]; then
+    log "Grafana admin password: GRAFANA_ADMIN_PASSWORD from the environment."
+  else
+    GRAFANA_ADMIN_PASSWORD="$(kubectl -n "$NAMESPACE_OBSERVABILITY" get secret grafana \
+      -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    if [[ -n "$GRAFANA_ADMIN_PASSWORD" ]]; then
+      log "Grafana admin password: reusing the one in secret/grafana (admin-password)."
     else
-      GRAFANA_ADMIN_PASSWORD="$(dd if=/dev/urandom bs=1 count=32 2>/dev/null | base64 | tr -d '\n' | tr -d '=/' | cut -c1-24)"
+      if command -v openssl >/dev/null 2>&1; then
+        GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 32 | tr -d '\n' | tr -d '=/' | cut -c1-24)"
+      else
+        GRAFANA_ADMIN_PASSWORD="$(dd if=/dev/urandom bs=1 count=32 2>/dev/null | base64 | tr -d '\n' | tr -d '=/' | cut -c1-24)"
+      fi
+      log "Grafana admin password: none in secret/grafana yet (first install) - generated one."
     fi
-    log "Generated GRAFANA_ADMIN_PASSWORD for this run."
   fi
   
   # Read-only PG role + password secret for the "UCE - shops & activity" dashboard.
@@ -1903,12 +1955,26 @@ EOF
   
   log "Waiting for Grafana to be ready ..."
   kubectl -n "$NAMESPACE_OBSERVABILITY" rollout status deploy/grafana --timeout=300s || true
+
+  ensure_grafana_admin_login || true
+
+  # mcp-grafana (envs/<env>/apps/observability/mcp-grafana.yaml, behind a Pomerium MCP
+  # route) reads Grafana with a Viewer service-account token from the Secret
+  # mcp-grafana-token. Opt in per env with GRAFANA_MCP=true: the service account is
+  # ensured on every run, a token is minted (and SOPS-encrypted into the envs repo)
+  # only when the Secret is missing or Grafana refuses its token.
+  if [[ "${GRAFANA_MCP:-false}" == "true" ]]; then
+    log "Ensuring the mcp-grafana service account and token (GRAFANA_MCP=true) ..."
+    NAMESPACE_OBSERVABILITY="$NAMESPACE_OBSERVABILITY" \
+      "$REPO_ROOT/tools/k3s/grafana-mcp-token.sh" "$ENV_NAME" --ensure || \
+      warn "mcp-grafana token step failed; retry: tools/k3s/grafana-mcp-token.sh ${ENV_NAME} --ensure"
+  fi
   
   info "✓ Grafana installed successfully"
   if [[ -n "${GRAFANA_HOST:-}" ]]; then
     info "  URL: https://${GRAFANA_HOST}/"
   fi
-  info "  Admin credentials: admin / ${GRAFANA_ADMIN_PASSWORD}"
+  info "  Admin: admin (password in secret/grafana, key admin-password)"
   info "  Dashboards: 20+ Kubernetes dashboards pre-configured"
 else
   info "Skipping Grafana installation (--skip-grafana)"
@@ -1949,7 +2015,7 @@ if [[ "$SKIP_GRAFANA" != "true" ]]; then
   if [[ -n "${GRAFANA_HOST:-}" ]]; then
     log "  URL: https://${GRAFANA_HOST}/"
   fi
-  log "  Admin: admin / ${GRAFANA_ADMIN_PASSWORD}"
+  log "  Admin: admin (password: kubectl -n ${NAMESPACE_OBSERVABILITY} get secret grafana -o jsonpath='{.data.admin-password}' | base64 -d)"
   log "  Storage: ${GRAFANA_STORAGE_SIZE} (${GRAFANA_STORAGE_CLASS})"
   
   if [[ "$SKIP_SSO" != "true" && -n "${DEX_CLIENT_SECRET_GRAFANA:-}" ]]; then
