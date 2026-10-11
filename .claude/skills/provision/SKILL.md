@@ -106,7 +106,9 @@ Must run first among the K3s scripts — cert-manager and Dex are dependencies f
 tools/k3s/identity.sh <env>
 ```
 Provisions cert-manager for TLS, the Dex OIDC provider with GitHub OAuth, and the Pomerium auth
-proxy with routes from `pomerium-routes.yaml`.
+proxy with routes from `pomerium-routes.yaml`. Later route changes: edit that file and run
+`tools/k3s/apply-pomerium-routes.sh <env>`, which also brings Pomerium to the bundled chart's image
+and refuses to drop live routes missing from the file (`--allow-route-removal` when deliberate).
 
 ### Step 3 — Environment secrets
 Applications synced by ArgoCD (Step 6) reference the Secrets committed in `envs/<env>/secrets.sops/`;
@@ -178,7 +180,10 @@ tools/k3s/mysql.sh <env>            # Percona MySQL operator + Adminer, adminer.
 ```
 The MySQL cluster may take 1–2 minutes to become ready after the script completes. Alert groups
 come from `envs/shared/alerts/` and `envs/<env>/alerts/`; `POSTGRES_SIZE_ALERT_EXCLUDE` in
-`env.properties` keeps by-design-growing databases out of the generic size alert.
+`env.properties` keeps by-design-growing databases out of the generic size alert. The Grafana admin
+password stays the one in `secret/grafana` across runs (set `GRAFANA_ADMIN_PASSWORD` to choose it);
+`GRAFANA_MCP=true` also ensures the Viewer service account and token of the read-only Grafana MCP
+server (docs/GITOPS.md, "Read-only access for agents").
 
 ### Step 8 — Databases and VPN (optional)
 
@@ -187,6 +192,8 @@ come from `envs/shared/alerts/` and `envs/<env>/alerts/`; `POSTGRES_SIZE_ALERT_E
 tools/k3s/postgres.sh <env>
 ```
 pgweb at `pgweb.<HOSTNAME>`. Supports `--provision-credentials <app-id>` for per-app DB users.
+`PG_READONLY_ROLE=claude_ro` in `env.properties` adds a read-only login (CNPG managed role,
+`pg_read_all_data`, read-only sessions; password SOPS-encrypted into the envs repo).
 
 **Redpanda + ScyllaDB** (Kafka-style journal persistence stack) — only for environments running
 apps that need it:
