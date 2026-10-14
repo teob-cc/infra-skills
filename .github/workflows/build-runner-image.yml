@@ -90,6 +90,9 @@ env:
 
 jobs:
   build-and-push:
+    concurrency:
+      group: runner-image-${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
+      cancel-in-progress: false
     outputs:
       image: ${{ steps.meta.outputs.image }}
       source_sha: ${{ steps.meta.outputs.source_sha }}
@@ -163,7 +166,10 @@ jobs:
       - name: Build and verify candidate
         run: |
           set -euo pipefail
-          docker buildx build --platform linux/amd64 --cache-from type=local,src=/tmp/.buildx-cache --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
+          # The host cache mount is root-owned. Use a dedicated runner-owned
+          # subdirectory so unrelated application caches stay untouched.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /tmp/.buildx-cache/runner-image /tmp/.buildx-cache/runner-image-next
+          docker buildx build --platform linux/amd64 --cache-from type=local,src=/tmp/.buildx-cache/runner-image --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
           docker run --rm --network none --entrypoint bash runner-candidate:${GITHUB_RUN_ID} -ec '
             test "$(/runnertmp/bin/Runner.Listener --version)" = 2.338.0
             test "$(rustc --version | cut -d" " -f2)" = 1.99.0
@@ -191,19 +197,15 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
             org.opencontainers.image.created=${{ steps.meta.outputs.date }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+          cache-from: type=local,src=/tmp/.buildx-cache/runner-image
+          cache-to: type=local,dest=/tmp/.buildx-cache/runner-image-next,mode=max
 
       - name: Move updated build cache
         if: success()
         run: |
-          # Remove old cache contents (not the directory itself, which may be a mount point)
-          rm -rf /tmp/.buildx-cache/* || true
-          # Move new cache contents
-          if [ -d /tmp/.buildx-cache-new ]; then
-            mv /tmp/.buildx-cache-new/* /tmp/.buildx-cache/ 2>/dev/null || true
-            rmdir /tmp/.buildx-cache-new || true
-          fi
+          set -euo pipefail
+          rm -rf /tmp/.buildx-cache/runner-image
+          mv /tmp/.buildx-cache/runner-image-next /tmp/.buildx-cache/runner-image
 
       - name: Show pushed tags
         run: |

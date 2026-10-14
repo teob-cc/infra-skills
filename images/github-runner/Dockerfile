@@ -188,6 +188,7 @@ RUN echo 'export PATH="/usr/local/sbt/bin:${PATH}"' >> /etc/profile.d/sbt.sh \
 # Make /home/runner world-writable so runner can create subdirectories
 RUN mkdir -p /home/runner/.config /home/runner/.cache /home/runner/.npm /home/runner/.sbt /home/runner/.ivy2 \
     && chown -R runner:runner /home/runner \
+    && chown -R runner:runner /runnertmp \
     && chmod -R 755 /home/runner
 
 USER runner
