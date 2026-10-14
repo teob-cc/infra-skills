@@ -658,7 +658,17 @@ detect_custom_runner_image() {
   # Actually, we can't distinguish, so we'll always check and update if needed
   
   local harbor_host="harbor.${HOSTNAME}"
-  local custom_runner_image="${harbor_host}/library/github-runner:latest"
+  local custom_runner_image="${RUNNER_IMAGE_REF:-${harbor_host}/library/github-runner:latest}"
+  if [[ -n "${RUNNER_IMAGE_REF:-}" ]]; then
+    # A source-controlled digest is an explicit operator choice; never silently
+    # replace it with latest or a bootstrap image during subsequent provisioning.
+    if [[ ! "$RUNNER_IMAGE_REF" =~ @sha256:[a-f0-9]{64}$ ]]; then
+      provision::error "RUNNER_IMAGE_REF must be pinned by sha256 digest"
+      return 1
+    fi
+    CUSTOM_RUNNER_IMAGE=true
+    return 0
+  fi
   
   info "Checking if custom runner image exists in Harbor..."
   
@@ -903,7 +913,7 @@ create_runner_deployment() {
   local runner_image
   local image_pull_policy=""
   if [[ "$CUSTOM_RUNNER_IMAGE" == "true" ]]; then
-    runner_image="harbor.${HOSTNAME}/library/github-runner:latest"
+    runner_image="${RUNNER_IMAGE_REF:-harbor.${HOSTNAME}/library/github-runner:latest}"
     image_pull_policy="Always"
     info "  Using custom runner image: ${runner_image}"
   else
@@ -1195,7 +1205,7 @@ else
   info "  Runner replicas: 2"
 fi
 if [[ "$CUSTOM_RUNNER_IMAGE" == "true" ]]; then
-  info "  Runner image: harbor.${HOSTNAME}/library/github-runner:latest (custom)"
+  info "  Runner image: ${RUNNER_IMAGE_REF:-harbor.${HOSTNAME}/library/github-runner:latest} (custom)"
 else
   info "  Runner image: summerwind/actions-runner:v2.336.0-ubuntu-24.04 (vanilla)"
 fi

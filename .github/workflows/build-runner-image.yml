@@ -27,11 +27,23 @@ on:
         required: false
         type: string
         default: ""
+      publish_latest:
+        description: Update the shared latest tag after validation
+        required: false
+        type: boolean
+        default: true
       skills_ref:
         description: "infra-skills git ref to build the image from"
         required: false
         type: string
         default: "main"
+    outputs:
+      digest:
+        description: Validated runner image digest
+        value: ${{ jobs.build-and-push.outputs.digest }}
+      source_sha:
+        description: infra-skills source commit
+        value: ${{ jobs.build-and-push.outputs.source_sha }}
     secrets:
       HARBOR_USERNAME:
         required: true
@@ -52,6 +64,11 @@ on:
         required: false
         type: string
         default: ""
+      publish_latest:
+        description: Update the shared latest tag after validation
+        required: false
+        type: boolean
+        default: true
       skills_ref:
         description: "infra-skills git ref to build the image from"
         required: false
@@ -73,6 +90,10 @@ env:
 
 jobs:
   build-and-push:
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      source_sha: ${{ steps.meta.outputs.source_sha }}
+      digest: ${{ steps.build.outputs.digest }}
     runs-on:
       - self-hosted
       - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
@@ -89,7 +110,7 @@ jobs:
       # Always check out infra-skills itself: when called from another repo the
       # default checkout would be the caller, which has no runner Dockerfile.
       - name: Checkout infra-skills
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: teob-cc/infra-skills
           ref: ${{ inputs.skills_ref || 'main' }}
@@ -108,10 +129,10 @@ jobs:
           echo "Using Harbor registry: ${HARBOR_REGISTRY}"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Login to Harbor
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ steps.harbor.outputs.registry }}
           username: ${{ secrets.HARBOR_USERNAME }}
@@ -119,29 +140,56 @@ jobs:
 
       - name: Compute tags
         id: meta
+        env:
+          PUBLISH_LATEST: ${{ inputs.publish_latest != false }}
         run: |
           set -euo pipefail
           IMAGE_REGISTRY="${{ steps.harbor.outputs.registry }}"
           IMAGE_REPO="${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}"
-          SHA_TAG=${GITHUB_SHA::12}
+          SOURCE_SHA=$(git rev-parse HEAD)
+          SHA_TAG=${SOURCE_SHA::12}
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           DATE_TAG=$(date -u +%Y%m%d)
 
-          TAGS="${IMAGE_REGISTRY}/${IMAGE_REPO}:${SHA_TAG},${IMAGE_REGISTRY}/${IMAGE_REPO}:${DATE_TAG},${IMAGE_REGISTRY}/${IMAGE_REPO}:latest"
+          TAGS="${IMAGE_REGISTRY}/${IMAGE_REPO}:${SHA_TAG}"
+          if [ "$PUBLISH_LATEST" = true ]; then
+            TAGS="${TAGS},${IMAGE_REGISTRY}/${IMAGE_REPO}:${DATE_TAG},${IMAGE_REGISTRY}/${IMAGE_REPO}:latest"
+          fi
 
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE_REGISTRY}/${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u --iso-8601=seconds)" >> "$GITHUB_OUTPUT"
 
+      - name: Build and verify candidate
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64 --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
+          docker run --rm --network none --entrypoint bash runner-candidate:${GITHUB_RUN_ID} -ec '
+            test "$(/runnertmp/bin/Runner.Listener --version)" = 2.338.0
+            test "$(rustc --version | cut -d" " -f2)" = 1.99.0
+            cargo audit --version
+            protoc --version
+            docker buildx version
+            helm version --short
+            yq --version
+            printf "fn main() {}\n" > /tmp/smoke.rs
+            rustc /tmp/smoke.rs -o /tmp/smoke
+            /tmp/smoke
+          '
+
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ env.CONTEXT }}
           file: ${{ env.DOCKERFILE }}
           platforms: linux/amd64
           push: true
+          provenance: mode=max
+          sbom: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.meta.outputs.source_sha }}
             org.opencontainers.image.created=${{ steps.meta.outputs.date }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max

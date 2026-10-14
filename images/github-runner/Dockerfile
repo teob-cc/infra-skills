@@ -23,12 +23,12 @@
 # only while buildkit reuses an already-open connection; the first re-dial (~30 min idle) fails
 # forever with "dial unix:///var/run/docker/containerd/containerd.sock: timeout" and `docker info`
 # (riding dockerd's old connection) keeps the liveness probe green. Found on prod 2026-10-09.
-FROM summerwind/actions-runner:v2.336.0-ubuntu-24.04
+FROM summerwind/actions-runner:v2.336.0-ubuntu-24.04@sha256:ac52790f2737b2ef1be90a6708280cf2f0b2cf838f421ee7cce42d7511951976
 
 USER root
 
 # Install base dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     curl \
     git \
     unzip \
@@ -38,7 +38,24 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     protobuf-compiler \
     build-essential \
+    cmake \
+    clang \
+    pkg-config \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Summerwind has no 2.338.0 tag yet. Replace the runner payload while preserving
+# ARC's startup scripts and hooks; ARC moves externalstmp into place at startup.
+ARG ACTIONS_RUNNER_VERSION=2.338.0
+ARG ACTIONS_RUNNER_SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" -o /tmp/runner.tgz \
+    && echo "${ACTIONS_RUNNER_SHA256}  /tmp/runner.tgz" | sha256sum -c - \
+    && rm -rf /runnertmp/bin /runnertmp/externalstmp \
+    && tar xzf /tmp/runner.tgz -C /runnertmp \
+    && mv /runnertmp/externals /runnertmp/externalstmp \
+    && rm /tmp/runner.tgz \
+    && test "$(/runnertmp/bin/Runner.Listener --version)" = "${ACTIONS_RUNNER_VERSION}"
 
 # Version variables (matching builder image)
 ENV SCALA3_VERSION=3.8.2
@@ -79,13 +96,17 @@ RUN npm install --global @playwright/test@${PLAYWRIGHT_VERSION} \
 RUN npm install --global yarn@${YARN_VERSION} pnpm@${PNPM_VERSION} \
     && pnpm config set store-dir .pnpm-store
 
-# Install Rust toolchain
+# Pin Rust independently of the image rebuild date. Repositories may override it
+# with rust-toolchain.toml; wsgrpc builds inside its own pinned Debian builder.
+ENV RUST_VERSION=1.99.0
+ARG CARGO_AUDIT_VERSION=0.22.2
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
-    && rustup component add rustfmt clippy
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain "${RUST_VERSION}" \
+    && rustup component add --toolchain "${RUST_VERSION}" rustfmt clippy \
+    && cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
 
 # Install Scala (using GitHub releases like builder image)
 RUN mkdir -p /usr/share/scala \
@@ -145,6 +166,8 @@ RUN java -version \
     && pnpm -v \
     && rustc --version \
     && cargo --version \
+    && test "$(rustc --version | cut -d' ' -f2)" = "${RUST_VERSION}" \
+    && cargo audit --version \
     && helm version \
     && yq --version \
     && docker buildx version
