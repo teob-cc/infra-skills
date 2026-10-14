@@ -163,7 +163,7 @@ jobs:
       - name: Build and verify candidate
         run: |
           set -euo pipefail
-          docker buildx build --platform linux/amd64 --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
+          docker buildx build --platform linux/amd64 --cache-from type=local,src=/tmp/.buildx-cache --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
           docker run --rm --network none --entrypoint bash runner-candidate:${GITHUB_RUN_ID} -ec '
             test "$(/runnertmp/bin/Runner.Listener --version)" = 2.338.0
             test "$(rustc --version | cut -d" " -f2)" = 1.99.0

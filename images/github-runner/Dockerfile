@@ -49,7 +49,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
 ARG ACTIONS_RUNNER_VERSION=2.338.0
 ARG ACTIONS_RUNNER_SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
 RUN test "$(dpkg --print-architecture)" = amd64 \
-    && curl -fsSL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" -o /tmp/runner.tgz \
+    && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" -o /tmp/runner.tgz \
     && echo "${ACTIONS_RUNNER_SHA256}  /tmp/runner.tgz" | sha256sum -c - \
     && rm -rf /runnertmp/bin /runnertmp/externalstmp \
     && tar xzf /tmp/runner.tgz -C /runnertmp \
@@ -109,13 +109,21 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
     && cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
 
 # Install Scala (using GitHub releases like builder image)
+ARG SCALA3_SHA256=9afb0811530090e2927441f943c757b44b97e91416df07ab0410c7f8d952b437
 RUN mkdir -p /usr/share/scala \
-    && curl -fsSL "https://github.com/scala/scala3/releases/download/${SCALA3_VERSION}/scala3-${SCALA3_VERSION}-x86_64-pc-linux.tar.gz" | tar xz -C /usr/share/scala --strip-components=1 \
+    && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/scala/scala3/releases/download/${SCALA3_VERSION}/scala3-${SCALA3_VERSION}-x86_64-pc-linux.tar.gz" -o /tmp/scala.tgz \
+    && echo "${SCALA3_SHA256}  /tmp/scala.tgz" | sha256sum -c - \
+    && tar xzf /tmp/scala.tgz -C /usr/share/scala --strip-components=1 \
+    && rm /tmp/scala.tgz \
     && ln -s /usr/share/scala/bin/* /usr/local/bin/
 
 # Install SBT (using GitHub releases like builder image)
+ARG SBT_SHA256=c546b0591039017adde7f340e8ef9f86b9152ee90cfabb29850b8284d1c820af
 RUN mkdir -p "/usr/local/sbt" \
-    && curl -fsSL "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" | tar xz -C /usr/local/sbt --strip-components=1 --exclude=bin/sbtn-x86_64-pc-win32.exe --exclude=bin/sbtn-x86_64-apple-darwin \
+    && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" -o /tmp/sbt.tgz \
+    && echo "${SBT_SHA256}  /tmp/sbt.tgz" | sha256sum -c - \
+    && tar xzf /tmp/sbt.tgz -C /usr/local/sbt --strip-components=1 --exclude=bin/sbtn-x86_64-pc-win32.exe --exclude=bin/sbtn-x86_64-apple-darwin \
+    && rm /tmp/sbt.tgz \
     && sbt --allow-empty -Dsbt.rootdir=true sbtVersion
 
 # Warm up SBT cache with Scala 3
