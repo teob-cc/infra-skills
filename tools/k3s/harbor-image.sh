@@ -40,7 +40,8 @@ provision::github_read_credentials >/dev/null 2>&1 || true
 [[ -n "${GITHUB_ORG:-}" ]] || { err "GITHUB_ORG unknown: set it in env.properties or provide github-oauth-credentials.yaml"; exit 1; }
 if [[ -n "${GITOPS_REPO_URL:-}" ]]; then ENVS_REPO="$(basename "${GITOPS_REPO_URL%.git}")"; else ENVS_REPO="infra-envs"; fi
 HARBOR_HOST="harbor.${HOSTNAME}"
-WORKFLOW_FILE="build-${IMAGE}-image.yml"
+# The runner image's caller is build-runner-image.yml (docs/examples/envs-repo), not build-github-runner-image.yml.
+case "$IMAGE" in github-runner) WORKFLOW_FILE="build-runner-image.yml" ;; *) WORKFLOW_FILE="build-${IMAGE}-image.yml" ;; esac
 
 image_exists() {
   local user pass body code count
