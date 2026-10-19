@@ -1087,8 +1087,9 @@ EOF
   tmp_filtered=$(mktemp)
   tmp_final=$(mktemp)
 
-  # Step 1: Remove existing route with same .from
-  if ! yq eval ".config.routes |= (map(select(.from != \"${from_url}\")))" "$routes_file" > "$tmp_filtered" 2>/dev/null; then
+  # Step 1: Remove the host's existing catch-all route (same .from). Routes on the same host
+  # that match only a path (prefix/path/regex, e.g. Grafana's /mcp route) are kept.
+  if ! yq eval ".config.routes |= (map(select(.from != \"${from_url}\" or has(\"prefix\") or has(\"path\") or has(\"regex\"))))" "$routes_file" > "$tmp_filtered" 2>/dev/null; then
     provision::error "Failed to filter routes in $routes_file using yq"
     rm -f "$tmp_filtered" "$tmp_final"
     return 1

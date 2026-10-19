@@ -370,6 +370,51 @@ ensure_grafana_admin_login() {
   fi
 }
 
+# --- Front Grafana with Pomerium ---
+#
+# Grafana's UI sits behind Pomerium like the other back-office tools (same pattern as
+# argocd.sh): an ingress in the sso namespace hands the whole host to pomerium-proxy, and a
+# route lets signed-in users through. Grafana's own Dex SSO and GitHub role mapping still
+# apply behind it; its password login and basic-auth API are no longer reachable from
+# outside. In-cluster callers (provision::grafana_api, mcp-grafana) use the Service and are
+# unaffected. The host's path routes (grafana-mcp's /mcp) are kept by pomerium_routes_add.
+ensure_grafana_pomerium() {
+  log "Fronting https://${GRAFANA_HOST} with Pomerium ..."
+  kubectl apply -f - <<YAML
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-pomerium
+  namespace: ${NAMESPACE_SSO}
+  annotations:
+    cert-manager.io/cluster-issuer: ${CLUSTER_ISSUER}
+    cert-manager.io/common-name: ${GRAFANA_HOST}
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+    - host: ${GRAFANA_HOST}
+      http:
+        paths:
+          - backend:
+              service:
+                name: pomerium-proxy
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - ${GRAFANA_HOST}
+      secretName: grafana-pomerium-tls
+YAML
+  if provision::pomerium_routes_add "https://${GRAFANA_HOST}" \
+       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true; then
+    info "✓ Pomerium route ensured: https://${GRAFANA_HOST} -> grafana"
+  else
+    warn "Failed to ensure the Pomerium route for https://${GRAFANA_HOST}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
+  fi
+}
+
 # --- Detect Tailscale IP ---
 detect_tailscale_ip() {
   local tailscale_ip=""
@@ -1918,8 +1963,13 @@ EOF
     fi
   fi
   
-  # Add Ingress configuration if GRAFANA_HOST is set
-  if [[ -n "${GRAFANA_HOST:-}" ]]; then
+  # With Pomerium in the sso namespace the UI goes through it (ensure_grafana_pomerium, after
+  # the install) and the chart gets no ingress; without it the chart's ingress exposes Grafana.
+  GRAFANA_VIA_POMERIUM=false
+  if [[ -n "${GRAFANA_HOST:-}" ]] && kubectl -n "$NAMESPACE_SSO" get svc pomerium-proxy >/dev/null 2>&1; then
+    GRAFANA_VIA_POMERIUM=true
+    info "Grafana will be exposed at: https://${GRAFANA_HOST}/ (behind Pomerium)"
+  elif [[ -n "${GRAFANA_HOST:-}" ]]; then
     cat >> "$grafana_values" <<EOF
 
 ingress:
@@ -1957,6 +2007,10 @@ EOF
   kubectl -n "$NAMESPACE_OBSERVABILITY" rollout status deploy/grafana --timeout=300s || true
 
   ensure_grafana_admin_login || true
+
+  if $GRAFANA_VIA_POMERIUM; then
+    ensure_grafana_pomerium
+  fi
 
   # mcp-grafana (envs/<env>/apps/observability/mcp-grafana.yaml, behind a Pomerium MCP
   # route) reads Grafana with a Viewer service-account token from the Secret
@@ -2057,7 +2111,7 @@ fi
 log ""
 log "Next steps:"
 log "  1. Access Grafana at https://${GRAFANA_HOST:-<GRAFANA_HOST>}/"
-log "  2. Log in with admin credentials or GitHub SSO"
+log "  2. Log in with GitHub SSO"
 log "  3. Explore pre-configured Kubernetes dashboards"
 log "  4. View logs in Loki datasource"
 log "  5. Monitor metrics in Prometheus datasource"
