@@ -15,10 +15,13 @@ FROM ${HARBOR_REGISTRY}/dockerhub-proxy/library/eclipse-temurin:25-ubi10-minimal
 USER root
 
 # Node.js from the official tarball: UBI minimal has no nodejs package.
-ENV NODE_VERSION=22.13.1
+ENV NODE_VERSION=22.23.4
+ARG NODE_SHA256=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
 RUN microdnf install -y tar gzip findutils && \
-    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" | \
-    tar xz -C /usr/local --strip-components=1 --no-same-owner && \
+    curl -fsSL --retry 5 --retry-all-errors "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tgz && \
+    echo "${NODE_SHA256}  /tmp/node.tgz" | sha256sum -c - && \
+    tar xzf /tmp/node.tgz -C /usr/local --strip-components=1 --no-same-owner && \
+    rm /tmp/node.tgz && \
     microdnf clean all && \
     node -v && npm -v
 

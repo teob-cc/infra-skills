@@ -77,10 +77,16 @@ RUN curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public | ap
 ENV JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Install Node.js 22
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y nodejs \
-    && rm -rf /var/lib/apt/lists/* \
+# Install Node.js 22 from the official tarball, pinned. NodeSource's setup_22.x installed whatever
+# was current on the rebuild day and lags upstream security releases (22.23.4, 2026-10-21, was
+# missing there when it shipped).
+ARG NODE_VERSION=22.23.4
+ARG NODE_SHA256=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
+RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tgz \
+    && echo "${NODE_SHA256}  /tmp/node.tgz" | sha256sum -c - \
+    && tar xzf /tmp/node.tgz -C /usr/local --strip-components=1 --no-same-owner \
+    && rm /tmp/node.tgz \
+    && test "$(node -v)" = "v${NODE_VERSION}" \
     && npm install --global npm@11
 
 # Playwright: pin version and pre-install Chromium binary + OS deps into the image.
