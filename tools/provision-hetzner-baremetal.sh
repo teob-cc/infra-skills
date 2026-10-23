@@ -1570,7 +1570,7 @@ else
     echo "[postinstall] Writing k3s config with TLS SANs for @PUBLIC_HOSTNAME@, @EXTERNAL_IP@, and $TS_IP ..."
     mkdir -p /etc/rancher/k3s
     cat >/etc/rancher/k3s/config.yaml <<K3S_EOF
-write-kubeconfig-mode: "0644"
+write-kubeconfig-mode: "0600"
 tls-san:
   - @PUBLIC_HOSTNAME@
   - @EXTERNAL_IP@

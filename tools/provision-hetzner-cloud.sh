@@ -1200,7 +1200,7 @@ else
     fi
 
     cat >/etc/rancher/k3s/config.yaml <<K3S_EOF
-write-kubeconfig-mode: "0644"
+write-kubeconfig-mode: "0600"
 tls-san:
 ${K3S_TLS_SANS}
 node-ip: @PRIVATE_IP_ADDR@
