@@ -204,7 +204,9 @@ server (docs/GITOPS.md, "Read-only access for agents").
 ```bash
 tools/k3s/postgres.sh <env>
 ```
-pgweb at `pgweb.<HOSTNAME>`. Supports `--provision-credentials <app-id>` for per-app DB users.
+pgweb at `pgweb.<HOSTNAME>`, for the org's `admins` team only (`PGWEB_ALLOWED_GROUPS` to change) and
+reachable only through Pomerium (NetworkPolicy `pgweb-from-pomerium-only`); it is a connect form,
+log in with a database role. Supports `--provision-credentials <app-id>` for per-app DB users.
 `PG_READONLY_ROLE=claude_ro` in `env.properties` adds a read-only login (CNPG managed role,
 `pg_read_all_data`, read-only sessions; password SOPS-encrypted into the envs repo).
 

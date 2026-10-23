@@ -1090,7 +1090,44 @@ provision::pomerium_routes_add() {
     provision::error "pomerium_routes_add: FROM_URL and TO_URL are required"
     return 1
   fi
+  local route
+  route=$(jq -cn --arg f "$from_url" --arg t "$to_url" --argjson ph "$preserve_host" \
+    --argjson pi "$pass_identity_headers" --argjson any "$allow_any" \
+    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi, allow_any_authenticated_user: $any}' 2>/dev/null) || {
+    provision::error "pomerium_routes_add: PRESERVE_HOST, PASS_ID and ALLOW_ANY must be true or false"
+    return 1
+  }
+  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso"
+}
 
+# Add or replace a route that only members of the given groups may use (Pomerium policy on the
+# groups claim, which Dex fills with "<github-org>:<team>").
+# Usage: provision::pomerium_routes_add_for_groups FROM_URL TO_URL GROUPS [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true]
+#   GROUPS: comma-separated, e.g. "my-org:admins" or "my-org:admins,my-org:dba"
+provision::pomerium_routes_add_for_groups() {
+  local from_url="$1" to_url="$2" groups="$3" namespace_sso="${4:-sso}"
+  local preserve_host="${5:-true}" pass_identity_headers="${6:-true}"
+
+  if [[ -z "$from_url" || -z "$to_url" || -z "$groups" ]]; then
+    provision::error "pomerium_routes_add_for_groups: FROM_URL, TO_URL and GROUPS are required"
+    return 1
+  fi
+  local route
+  route=$(jq -cn --arg f "$from_url" --arg t "$to_url" --arg g "$groups" --argjson ph "$preserve_host" \
+    --argjson pi "$pass_identity_headers" \
+    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi,
+      policy: [{allow: {or: [$g | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) | {"claim/groups": .}]}}]}' 2>/dev/null) || {
+    provision::error "pomerium_routes_add_for_groups: PRESERVE_HOST and PASS_ID must be true or false"
+    return 1
+  }
+  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso"
+}
+
+# Replace the host's catch-all route (same .from) with ROUTE_JSON and reload Pomerium. Routes on
+# the same host that match only a path (prefix/path/regex, e.g. Grafana's /mcp route) are kept.
+# Usage: provision::_pomerium_routes_upsert FROM_URL ROUTE_JSON [NAMESPACE_SSO]
+provision::_pomerium_routes_upsert() {
+  local from_url="$1" route="$2" namespace_sso="${3:-sso}"
   local routes_file
   if ! routes_file=$(provision::pomerium_routes_file); then
     return 1
@@ -1099,40 +1136,25 @@ provision::pomerium_routes_add() {
   # Create file with initial structure if it doesn't exist
   if [[ ! -f "$routes_file" ]]; then
     provision::info "Creating new pomerium-routes.yaml at: $routes_file"
-    cat > "$routes_file" <<'EOF'
+    cat > "$routes_file" <<'YAML'
 config:
   routes: []
-EOF
+YAML
   fi
 
-  # Two-step process: filter out existing route with same .from, then append new route
-  local tmp_filtered tmp_final
-  tmp_filtered=$(mktemp)
-  tmp_final=$(mktemp)
-
-  # Step 1: Remove the host's existing catch-all route (same .from). Routes on the same host
-  # that match only a path (prefix/path/regex, e.g. Grafana's /mcp route) are kept.
-  if ! yq eval ".config.routes |= (map(select(.from != \"${from_url}\" or has(\"prefix\") or has(\"path\") or has(\"regex\"))))" "$routes_file" > "$tmp_filtered" 2>/dev/null; then
-    provision::error "Failed to filter routes in $routes_file using yq"
-    rm -f "$tmp_filtered" "$tmp_final"
+  local tmp_out
+  tmp_out=$(mktemp)
+  if ! FROM="$from_url" ROUTE="$route" yq eval \
+      '.config.routes |= map(select(.from != strenv(FROM) or has("prefix") or has("path") or has("regex")))
+       | .config.routes += [env(ROUTE) | ... style=""]' "$routes_file" > "$tmp_out" 2>/dev/null; then
+    provision::error "Failed to update the route for ${from_url} in $routes_file using yq"
+    rm -f "$tmp_out"
     return 1
   fi
-  
-  # Step 2: Append the new route using JSON syntax (handles URLs properly)
-  if ! yq eval ".config.routes += [{\"from\": \"${from_url}\", \"to\": \"${to_url}\", \"preserve_host_header\": ${preserve_host}, \"pass_identity_headers\": ${pass_identity_headers}, \"allow_any_authenticated_user\": ${allow_any}}]" "$tmp_filtered" > "$tmp_final" 2>/dev/null; then
-    provision::error "Failed to append route in $routes_file using yq"
-    rm -f "$tmp_filtered" "$tmp_final"
-    return 1
-  fi
-  
-  rm -f "$tmp_filtered"
-  tmp_out="$tmp_final"
-
-  # Write back to the file
   mv "$tmp_out" "$routes_file"
-  
-  provision::info "Updated route in $routes_file: ${from_url} -> ${to_url}"
-  
+
+  provision::info "Updated route in $routes_file: ${from_url} -> $(jq -r .to <<<"$route")"
+
   # Apply the updated routes by running helm upgrade on pomerium
   provision::pomerium_reload_routes "$namespace_sso" "$routes_file"
   return 0

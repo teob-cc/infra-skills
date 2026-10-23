@@ -29,6 +29,11 @@ set -euo pipefail
 #   PG_READONLY_ROLE=claude_ro   A read-only login (pg_read_all_data, read-only sessions,
 #                                3 connections) as a CNPG managed role; see
 #                                "Read-only login" below
+#   PGWEB_ALLOWED_GROUPS=org:admins,org:dba
+#                                Groups (Dex groups claim) admitted to pgweb by its Pomerium
+#                                route; default: <github-org>:admins. pgweb has no login of its
+#                                own, so a NetworkPolicy (pgweb-from-pomerium-only) also keeps
+#                                every in-cluster client but Pomerium away from it.
 # ============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
@@ -1388,112 +1393,11 @@ deploy_pgweb() {
     return 0
   fi
 
-  # Get PostgreSQL connection info
-  local pg_host pg_port pg_user pg_pass pg_db
-  pg_host="postgres-cluster-rw.${NAMESPACE_POSTGRES}.svc.cluster.local"
-  pg_port="5432"
-  pg_db="postgres"  # Connect to postgres database by default
-  
-  # Get credentials from the superuser secret (for admin access to all databases)
-  if kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser >/dev/null 2>&1; then
-    pg_user=$(kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser -o jsonpath='{.data.username}' | base64 -d)
-    pg_pass=$(kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser -o jsonpath='{.data.password}' | base64 -d)
-    info "Using PostgreSQL superuser credentials for admin access to all databases"
-    info "  User: ${pg_user}"
-  else
-    warn "PostgreSQL superuser credentials not found - falling back to app user"
-    if kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-app >/dev/null 2>&1; then
-      pg_user=$(kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-app -o jsonpath='{.data.username}' | base64 -d)
-      pg_pass=$(kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-app -o jsonpath='{.data.password}' | base64 -d)
-      info "  User: ${pg_user}"
-    else
-      warn "PostgreSQL credentials not found - pgweb will need manual connection"
-      pg_user="postgres"
-      pg_pass=""
-    fi
-  fi
-
-  # Verify credentials by testing connection from a PostgreSQL pod
-  info "Verifying PostgreSQL credentials..."
-  local pg_pod
-  pg_pod=$(kubectl -n "$NAMESPACE_POSTGRES" get pods -l cnpg.io/cluster=postgres-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  
-  if [[ -n "$pg_pod" ]]; then
-    # Test connection using PGPASSWORD environment variable
-    if kubectl -n "$NAMESPACE_POSTGRES" exec "$pg_pod" -- env PGPASSWORD="$pg_pass" psql -U "$pg_user" -d "$pg_db" -c "SELECT version();" >/dev/null 2>&1; then
-      info "✓ Credentials verified successfully"
-    else
-      warn "⚠ Credential verification failed - connection may still work from pgweb pod"
-      warn "  This could be due to pg_hba.conf restrictions or credential issues"
-    fi
-  else
-    warn "⚠ Could not find PostgreSQL pod to verify credentials"
-  fi
-
-  info "Creating pgweb connection secret..."
-  # Selective URL encode - only encode characters that break URL parsing
-  # Characters that MUST be encoded in password: : @ / ? # [ ]
-  # Note: + doesn't need encoding in password portion, but some parsers may require it
-  selective_url_encode() {
-    local string="$1"
-    local encoded=""
-    local i=0
-    while [ $i -lt ${#string} ]; do
-      local char="${string:$i:1}"
-      case "$char" in
-        # Safe characters that don't need encoding
-        [a-zA-Z0-9.~_+-])
-          encoded="${encoded}${char}"
-          ;;
-        # Characters that MUST be encoded (break URL parsing)
-        :|@|/|\?|\#|\[|\]|" ")
-          local hex
-          printf -v hex '%%%02X' "'$char"
-          encoded="${encoded}${hex}"
-          ;;
-        # All other special characters - encode to be safe
-        *)
-          local hex
-          printf -v hex '%%%02X' "'$char"
-          encoded="${encoded}${hex}"
-          ;;
-      esac
-      i=$((i + 1))
-    done
-    echo -n "$encoded"
-  }
-  
-  # Encode username and password (selective encoding - keeps + unencoded)
-  local pg_user_enc pg_pass_enc
-  pg_user_enc=$(selective_url_encode "$pg_user")
-  pg_pass_enc=$(selective_url_encode "$pg_pass")
-  
-  info "Password encoding: keeping + unencoded, encoding / and other URL-breaking chars"
-  
-  # Build connection string
-  local pg_conn_string="postgres://${pg_user_enc}:${pg_pass_enc}@${pg_host}:${pg_port}/${pg_db}?sslmode=disable"
-  
-  # Debug: show connection string without password (for troubleshooting)
-  info "Connection string format: postgres://${pg_user}:***@${pg_host}:${pg_port}/${pg_db}?sslmode=disable"
-  
-  # Verify the connection string was created
-  if [[ -z "$pg_conn_string" ]]; then
-    err "Failed to create connection string"
-    return 1
-  fi
-  
-  # Create secret with connection string
-  # Store both encoded (for URL) and raw password (as backup)
-  kubectl -n "$NAMESPACE_POSTGRES" create secret generic pgweb-connection \
-    --from-literal=PGWEB_DATABASE_URL="$pg_conn_string" \
-    --from-literal=PGWEB_HOST="$pg_host" \
-    --from-literal=PGWEB_PORT="$pg_port" \
-    --from-literal=PGWEB_USER="$pg_user" \
-    --from-literal=PGWEB_PASS="$pg_pass" \
-    --from-literal=PGWEB_DB="$pg_db" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  
-  info "✓ Connection secret created (contains both URL and individual parameters)"
+  # pgweb is a connect-form console: it reads no connection settings from its environment
+  # (PGWEB_HOST/USER/PASS are not pgweb settings), so whoever opens it types the host and a
+  # login. Earlier versions put the superuser's credentials into pgweb-connection and the pod's
+  # env anyway, where nothing used them; that copy is removed.
+  kubectl -n "$NAMESPACE_POSTGRES" delete secret pgweb-connection --ignore-not-found=true >/dev/null
 
   # Clean up any existing pgweb deployment and service
   kubectl -n "$NAMESPACE_POSTGRES" delete deployment pgweb --ignore-not-found=true
@@ -1527,33 +1431,6 @@ spec:
         - containerPort: 8081
           name: http
         env:
-        # Try individual connection parameters first (avoids URL encoding issues)
-        # pgweb supports both PGWEB_DATABASE_URL and individual parameters
-        - name: PGWEB_HOST
-          valueFrom:
-            secretKeyRef:
-              name: pgweb-connection
-              key: PGWEB_HOST
-        - name: PGWEB_PORT
-          valueFrom:
-            secretKeyRef:
-              name: pgweb-connection
-              key: PGWEB_PORT
-        - name: PGWEB_USER
-          valueFrom:
-            secretKeyRef:
-              name: pgweb-connection
-              key: PGWEB_USER
-        - name: PGWEB_PASS
-          valueFrom:
-            secretKeyRef:
-              name: pgweb-connection
-              key: PGWEB_PASS
-        - name: PGWEB_DB
-          valueFrom:
-            secretKeyRef:
-              name: pgweb-connection
-              key: PGWEB_DB
         - name: PGWEB_BIND
           value: "0.0.0.0"
         - name: PGWEB_HTTP_PORT
@@ -1592,13 +1469,45 @@ spec:
     name: http
 YAML
 
+  # pgweb has no login of its own: whoever reaches its port has a database console. Behind
+  # Pomerium, only the Pomerium proxy may connect, so the admins-only route (Phase 6) is the
+  # one way in; without Pomerium the direct ingress needs Traefik to reach it, so no policy.
+  if [[ "${ENFORCE_POMERIUM}" == "true" ]]; then
+    cat <<YAML | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgweb-from-pomerium-only
+  namespace: ${NAMESPACE_POSTGRES}
+spec:
+  podSelector:
+    matchLabels:
+      app: pgweb
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${NAMESPACE_SSO}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: pomerium
+      ports:
+        - port: 8081
+          protocol: TCP
+YAML
+  else
+    kubectl -n "$NAMESPACE_POSTGRES" delete networkpolicy pgweb-from-pomerium-only --ignore-not-found=true >/dev/null
+  fi
+
   # Wait for pgweb to be ready
   info "Waiting for pgweb deployment to be ready..."
   kubectl -n "$NAMESPACE_POSTGRES" rollout status deployment/pgweb --timeout=300s || true
 
-  info "✓ pgweb deployed"
-  info "  Connected to: ${pg_host}:${pg_port}/${pg_db}"
-  info "  User: ${pg_user} (superuser - can see all databases)"
+  info "✓ pgweb deployed (connect form; log in with a database role, e.g. --show-credentials)"
+  [[ "${ENFORCE_POMERIUM}" == "true" ]] && info "  NetworkPolicy pgweb-from-pomerium-only: only Pomerium reaches it"
+  return 0
 }
 
 deploy_pgweb
@@ -1700,9 +1609,22 @@ register_pomerium_route() {
 
   local from_url="https://${PGWEB_HOST}"
   local to_url="http://pgweb.${NAMESPACE_POSTGRES}.svc.cluster.local:8080"
-  
-  if provision::pomerium_routes_add "$from_url" "$to_url" "${NAMESPACE_SSO}" true true true; then
-    info "✓ Pomerium route ensured: ${from_url} -> ${to_url}"
+
+  # pgweb opens every database a typed-in login can reach, so the route admits only
+  # PGWEB_ALLOWED_GROUPS (Dex groups claim "<github-org>:<team>", comma-separated), by default
+  # the org's admins team - not every org member.
+  local groups="${PGWEB_ALLOWED_GROUPS:-}"
+  if [[ -z "$groups" ]]; then
+    local org
+    if ! org=$(provision::git_org "$ENV_NAME" 2>/dev/null) || [[ -z "$org" || "$org" == "null" ]]; then
+      warn "GitHub org unknown and PGWEB_ALLOWED_GROUPS unset - not registering the pgweb route"
+      return 0
+    fi
+    groups="${org}:admins"
+  fi
+
+  if provision::pomerium_routes_add_for_groups "$from_url" "$to_url" "$groups" "${NAMESPACE_SSO}"; then
+    info "✓ Pomerium route ensured: ${from_url} -> ${to_url} (groups: ${groups})"
   else
     warn "Failed to ensure Pomerium route for ${from_url}"
   fi
