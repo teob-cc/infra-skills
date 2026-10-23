@@ -29,6 +29,15 @@ set -euo pipefail
 #   GRAFANA_MCP=true     Ensure the Viewer service account `mcp-grafana` and its token
 #                        (Secret observability/mcp-grafana-token, SOPS copy in the envs
 #                        repo) for the mcp-grafana MCP server; see grafana-mcp-token.sh
+#   LOG_SHIPPER=alloy    Ship logs with Grafana Alloy instead of Promtail (EOL 2026-03-02);
+#                        uninstalls the promtail release. Default: promtail
+#   LOKI_RETENTION_PERIOD  e.g. 2160h; enables compactor retention. Default: keep forever
+#   GITHUB_ORG           Org for Grafana's role mapping; default: secrets.plain, then the
+#                        live Dex config
+#
+# Environment:
+#   ALLOW_GRAFANA_REGRESSION=true  let a run drop SSO, root_url or a datasource that the
+#                        live Grafana release has (refused by default)
 # ============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
@@ -175,12 +184,40 @@ PROBE_TARGETS_POST="${PROBE_TARGETS_POST:-}"
 # forward or rolled back by a run -- prod is a major Loki version behind cit, so a
 # single shared default could only be wrong for one of them. Upgrading an env is
 # then a deliberate edit to its env.properties, not a side effect of provisioning.
-LOKI_CHART_VERSION="${LOKI_CHART_VERSION:-7.1.0}"
+LOKI_CHART_VERSION="${LOKI_CHART_VERSION:-7.5.0}"
 PROMTAIL_CHART_VERSION="${PROMTAIL_CHART_VERSION:-6.17.1}"
 PROMETHEUS_CHART_VERSION="${PROMETHEUS_CHART_VERSION:-29.27.0}"
 GRAFANA_CHART_VERSION="${GRAFANA_CHART_VERSION:-10.5.15}"
 BLACKBOX_CHART_VERSION="${BLACKBOX_CHART_VERSION:-11.17.2}"
 PROMETHEUS_OPERATOR_CRDS_CHART_VERSION="${PROMETHEUS_OPERATOR_CRDS_CHART_VERSION:-9.3.2}"
+ALLOY_CHART_VERSION="${ALLOY_CHART_VERSION:-1.14.2}"
+
+# Application images, pinned apart from the charts. Both charts are frozen upstream
+# (2026): grafana/grafana stopped at 10.5.15 / Grafana 12.3.1, which went out of
+# security support on 2026-08-19, and the OSS Loki chart moved to grafana-community.
+# Overriding the image keeps the rendered manifests identical except for the image
+# (checked with helm template against the live releases). Grafana 12.4 is the last
+# 12.x minor and is supported until 2027-05-24; Loki 3.6.x still gets security
+# patches. Tag and digest move together; the digest is the multi-arch index.
+GRAFANA_IMAGE_TAG="${GRAFANA_IMAGE_TAG:-12.4.13}"
+GRAFANA_IMAGE_SHA="${GRAFANA_IMAGE_SHA:-41bbc1b5e04416f81891806076db2a2ff60a5d4da5f78d36a88b033a8c199185}"
+LOKI_IMAGE_TAG="${LOKI_IMAGE_TAG:-3.6.19}"
+LOKI_IMAGE_DIGEST="${LOKI_IMAGE_DIGEST:-sha256:0f9cbc340cbe33ee498e654075034336962057db072f57b37f253e14d476443a}"
+LOKI_CANARY_IMAGE_DIGEST="${LOKI_CANARY_IMAGE_DIGEST:-sha256:43f68b496f2cdf49177dfa1136cc962afbf43f45ed34393ec345dab3701b0e88}"
+ALLOY_IMAGE_TAG="${ALLOY_IMAGE_TAG:-v1.21.1}"
+ALLOY_IMAGE_DIGEST="${ALLOY_IMAGE_DIGEST:-sha256:4039c971193053a84e53dd9ed3e7d4561c069256b024631cd3498a353ed7ece8}"
+
+# Log shipper. Promtail reached end of life on 2026-03-02; Grafana Alloy replaces it.
+# promtail (default) keeps the current DaemonSet. alloy installs the Alloy DaemonSet
+# with the Promtail config converted by `alloy convert --source-format=promtail`
+# (same labels, same Loki push URL), reads Promtail's positions file so nothing is
+# shipped twice, and uninstalls the promtail release. Set per env in env.properties.
+LOG_SHIPPER="${LOG_SHIPPER:-promtail}"
+
+# Loki retention. Empty (the default) keeps logs until the volume fills, which is
+# what every env did until 2026-10. A duration such as 2160h (90 days) turns on the
+# compactor's retention and deletes older chunks. Set per env in env.properties.
+LOKI_RETENTION_PERIOD="${LOKI_RETENTION_PERIOD:-}"
 
 # Ingress configuration
 INGRESS_CLASS="${INGRESS_CLASS:-traefik}"
@@ -368,6 +405,47 @@ ensure_grafana_admin_login() {
     warn "Could not align Grafana's admin password; the mcp-grafana step will fail until it is."
     warn "  kubectl -n ${ns} exec deploy/grafana -c grafana -- sh -c 'grafana cli admin reset-admin-password \"\$GF_SECURITY_ADMIN_PASSWORD\"'"
   fi
+}
+
+# --- Refuse to drop what the live Grafana release has ---
+#
+# Compares the live release's user values with the values this run rendered and lists
+# what would disappear: the Dex SSO block, envFromSecret (the Dex client secret),
+# server.root_url, and every datasource by name. Only names and flags are compared,
+# never secret values. Exits the script on a regression unless
+# ALLOW_GRAFANA_REGRESSION=true. No live release (first install) passes.
+grafana_values_guard() {
+  local new_file="$1" live_json new_json lost
+  live_json=$(helm get values grafana -n "$NAMESPACE_OBSERVABILITY" -o json 2>/dev/null || true)
+  if [[ -z "$live_json" || "$live_json" == "null" ]]; then
+    return 0
+  fi
+  new_json=$(yq eval -o=json '.' "$new_file")
+  lost=$(jq -rn --argjson live "$live_json" --argjson new "$new_json" '
+    def sso: (.["grafana.ini"]["auth.generic_oauth"].enabled // "") | tostring;
+    def dsnames: [.datasources["datasources.yaml"].datasources[]?.name];
+    [ (if ($live|sso) == "true" and ($new|sso) != "true"
+         then "Dex SSO (grafana.ini auth.generic_oauth)" else empty end),
+      (if ($live.envFromSecret // "") != "" and ($new.envFromSecret // "") == ""
+         then "envFromSecret \($live.envFromSecret)" else empty end),
+      (if ($live["grafana.ini"].server.root_url // "") != "" and ($new["grafana.ini"].server.root_url // "") == ""
+         then "grafana.ini server.root_url" else empty end),
+      (($live|dsnames) - ($new|dsnames) | .[] | "datasource \(.)")
+    ] | .[]')
+  if [[ -z "$lost" ]]; then
+    info "✓ New Grafana values keep the live release's SSO, root_url and datasources"
+    return 0
+  fi
+  if [[ "${ALLOW_GRAFANA_REGRESSION:-false}" == "true" ]]; then
+    warn "Grafana upgrade drops (ALLOW_GRAFANA_REGRESSION=true):"
+    printf '%s\n' "$lost" | sed 's/^/  - /' >&2
+    return 0
+  fi
+  err "This run would remove from the live Grafana release:"
+  printf '%s\n' "$lost" | sed 's/^/  - /' >&2
+  err "Usual causes: --skip-sso, the Dex client step failed, or the Postgres-UCE role check failed."
+  err "Fix the cause, or set ALLOW_GRAFANA_REGRESSION=true to accept the loss. Nothing was changed in Grafana."
+  exit 1
 }
 
 # --- Front Grafana with Pomerium ---
@@ -596,10 +674,24 @@ if [[ "$SKIP_LOKI" != "true" ]]; then
   loki_values=$(mktemp -t loki-values-XXXX.yaml)
   trap 'rm -f "$loki_values"' EXIT
   
+  loki_retention_block=""
+  if [[ -n "$LOKI_RETENTION_PERIOD" ]]; then
+    loki_retention_block="  compactor:
+    retention_enabled: true
+    delete_request_store: filesystem
+  limits_config:
+    retention_period: ${LOKI_RETENTION_PERIOD}"
+    info "Loki retention: ${LOKI_RETENTION_PERIOD} (compactor deletes older chunks)"
+  fi
+
   cat > "$loki_values" <<EOF
 deploymentMode: SingleBinary
 
 loki:
+  image:
+    tag: ${LOKI_IMAGE_TAG}
+    digest: ${LOKI_IMAGE_DIGEST}
+${loki_retention_block}
   auth_enabled: false
   commonConfig:
     replication_factor: 1
@@ -634,6 +726,11 @@ write:
 
 backend:
   replicas: 0
+
+lokiCanary:
+  image:
+    tag: ${LOKI_IMAGE_TAG}
+    digest: ${LOKI_CANARY_IMAGE_DIGEST}
 EOF
 
   helm upgrade --install loki grafana/loki \
@@ -652,9 +749,16 @@ fi
 # ============================================================================
 # Phase 2: Install Promtail (Log Shipper)
 # ============================================================================
-if [[ "$SKIP_PROMTAIL" != "true" ]]; then
+if [[ "$SKIP_PROMTAIL" != "true" && "$LOG_SHIPPER" != "alloy" ]]; then
   log "=== Phase 2: Installing Promtail (log shipper) ==="
-  
+
+  # Going back from Alloy: both DaemonSets would ship every line twice.
+  if helm status alloy -n "$NAMESPACE_OBSERVABILITY" >/dev/null 2>&1; then
+    err "LOG_SHIPPER=promtail but the alloy release exists in ${NAMESPACE_OBSERVABILITY}; refusing to run both."
+    err "  Roll back with: helm uninstall alloy -n ${NAMESPACE_OBSERVABILITY}, then re-run. Promtail resumes from its positions at the cutover, so lines Alloy shipped since then may be sent twice."
+    exit 1
+  fi
+
   promtail_values=$(mktemp -t promtail-values-XXXX.yaml)
   trap 'rm -f "$promtail_values"' EXIT
   cat > "$promtail_values" <<EOF
@@ -690,9 +794,179 @@ EOF
 
   info "✓ Promtail installed successfully"
   info "  Shipping logs to: http://loki:3100/loki/api/v1/push"
-  info "  shop_id label extraction enabled for app=uce"
+elif [[ "$SKIP_PROMTAIL" != "true" ]]; then
+  log "=== Phase 2: Installing Grafana Alloy (log shipper, LOG_SHIPPER=alloy) ==="
+
+  # The pipeline below is `alloy convert --source-format=promtail` (Alloy v1.21.1) of
+  # the Promtail config this script deployed (live on prod and hosting, 2026-10-23):
+  # same discovery, relabelling (app, instance, component, namespace, job, pod,
+  # container, node_name), cri stage and push URL, so every stream keeps its labels and
+  # dashboards and LogQL queries are unaffected. legacy_positions_file reads the
+  # Promtail positions on the node, so Alloy resumes where Promtail stopped instead of
+  # re-shipping every file. Alloy's own positions live under storagePath on a hostPath
+  # so they survive pod restarts. Alloy's self-metrics differ from Promtail's; nothing
+  # in the alert rules uses Promtail's.
+  alloy_config=$(mktemp -t alloy-config-XXXX.alloy)
+  alloy_values=$(mktemp -t alloy-values-XXXX.yaml)
+  trap 'rm -f "$alloy_config" "$alloy_values"' EXIT
+  cat > "$alloy_config" <<'ALLOY'
+discovery.kubernetes "kubernetes_pods" {
+	role = "pod"
+
+	selectors {
+		role  = "pod"
+		field = "spec.nodeName=" + coalesce(sys.env("HOSTNAME"), constants.hostname)
+	}
+}
+
+discovery.relabel "kubernetes_pods" {
+	targets = discovery.kubernetes.kubernetes_pods.targets
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_controller_name"]
+		regex         = "([0-9a-z-.]+?)(-[0-9a-f]{8,10})?"
+		target_label  = "__tmp_controller_name"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name", "__meta_kubernetes_pod_label_app", "__tmp_controller_name", "__meta_kubernetes_pod_name"]
+		regex         = "^;*([^;]+)(;.*)?$"
+		target_label  = "app"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_instance", "__meta_kubernetes_pod_label_instance"]
+		regex         = "^;*([^;]+)(;.*)?$"
+		target_label  = "instance"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_component", "__meta_kubernetes_pod_label_component"]
+		regex         = "^;*([^;]+)(;.*)?$"
+		target_label  = "component"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_node_name"]
+		target_label  = "node_name"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_namespace"]
+		target_label  = "namespace"
+	}
+
+	rule {
+		source_labels = ["namespace", "app"]
+		separator     = "/"
+		target_label  = "job"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_name"]
+		target_label  = "pod"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_container_name"]
+		target_label  = "container"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+		separator     = "/"
+		target_label  = "__path__"
+		replacement   = "/var/log/pods/*$1/*.log"
+	}
+
+	rule {
+		source_labels = ["__meta_kubernetes_pod_annotationpresent_kubernetes_io_config_hash", "__meta_kubernetes_pod_annotation_kubernetes_io_config_hash", "__meta_kubernetes_pod_container_name"]
+		separator     = "/"
+		regex         = "true/(.*)"
+		target_label  = "__path__"
+		replacement   = "/var/log/pods/*$1/*.log"
+	}
+}
+
+loki.source.file "kubernetes_pods" {
+	targets    = discovery.relabel.kubernetes_pods.output
+	forward_to = [loki.process.kubernetes_pods.receiver]
+
+	file_match {
+		enabled = true
+	}
+	legacy_positions_file = "/run/promtail/positions.yaml"
+}
+
+loki.process "kubernetes_pods" {
+	forward_to = [loki.write.default.receiver]
+
+	stage.cri { }
+}
+
+loki.write "default" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}
+ALLOY
+
+  cat > "$alloy_values" <<EOF
+image:
+  tag: ${ALLOY_IMAGE_TAG}
+  digest: ${ALLOY_IMAGE_DIGEST}
+crds:
+  create: false        # monitoring CRDs come from prometheus-operator-crds (Phase 3a)
+controller:
+  type: daemonset
+  volumes:
+    extra:
+      - name: promtail-positions
+        hostPath:
+          path: /run/promtail
+          type: DirectoryOrCreate
+      - name: alloy-data
+        hostPath:
+          path: /var/lib/alloy
+          type: DirectoryOrCreate
+alloy:
+  storagePath: /var/lib/alloy/data
+  # Runs as root like Promtail did: pod logs are root:root 0640. Same hardening as the
+  # promtail chart's container, minus readOnlyRootFilesystem.
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+  mounts:
+    varlog: true
+    extra:
+      - name: promtail-positions
+        mountPath: /run/promtail
+        readOnly: true
+      - name: alloy-data
+        mountPath: /var/lib/alloy
+EOF
+  ALLOY_CFG="$alloy_config" yq -i '.alloy.configMap.content = load_str(strenv(ALLOY_CFG))' "$alloy_values"
+
+  # Promtail first, so the two never ship the same lines; Promtail writes its positions
+  # on shutdown and Alloy picks them up. The gap delays logs, it does not lose them.
+  if helm status promtail -n "$NAMESPACE_OBSERVABILITY" >/dev/null 2>&1; then
+    log "Uninstalling the promtail release (replaced by Alloy) ..."
+    helm uninstall promtail -n "$NAMESPACE_OBSERVABILITY" --wait --timeout 5m
+  fi
+
+  helm upgrade --install alloy grafana/alloy \
+    --version "$ALLOY_CHART_VERSION" \
+    --namespace "$NAMESPACE_OBSERVABILITY" \
+    --wait \
+    --timeout 10m \
+    -f "$alloy_values"
+
+  info "✓ Grafana Alloy installed successfully (DaemonSet alloy)"
+  info "  Shipping logs to: http://loki:3100/loki/api/v1/push"
+  info "  Roll back: helm uninstall alloy -n ${NAMESPACE_OBSERVABILITY}; re-run with LOG_SHIPPER=promtail"
 else
-  info "Skipping Promtail installation (--skip-promtail)"
+  info "Skipping log shipper installation (--skip-promtail)"
 fi
 
 # ============================================================================
@@ -1672,6 +1946,10 @@ if [[ "$SKIP_GRAFANA" != "true" ]]; then
   cat > "$grafana_values" <<EOF
 adminPassword: ${GRAFANA_ADMIN_PASSWORD}
 
+image:
+  tag: "${GRAFANA_IMAGE_TAG}"
+  sha: "${GRAFANA_IMAGE_SHA}"
+
 ${uce_pg_env_block}
 
 # Fix permission issues with local-path storage
@@ -1918,13 +2196,21 @@ EOF
 
   # Add GitHub SSO configuration if Dex is available
   if [[ "$SKIP_SSO" != "true" && -n "${DEX_CLIENT_SECRET_GRAFANA:-}" ]]; then
-    # Load GitHub org from OAuth credentials
+    # GitHub org for the role mapping. secrets.plain is only a local cache and is often
+    # stale or missing (secrets.sops is the truth), and a missing org used to drop the
+    # whole SSO block with a warning - how prod lost SSO on 2026-08-23. Fall back to the
+    # org Dex itself authenticates against (live dex-config; not a secret).
     oauth_file="$ENVS_ROOT/${ENV_NAME}/secrets.plain/github-oauth-credentials.yaml"
-    github_org=""
-    if [[ -f "$oauth_file" ]]; then
+    github_org="${GITHUB_ORG:-}"
+    if [[ -z "$github_org" && -f "$oauth_file" ]]; then
       github_org=$(provision::yaml_get "$oauth_file" .stringData.githubOrg)
     fi
-    
+    if [[ -z "$github_org" ]]; then
+      github_org=$(kubectl -n "$NAMESPACE_SSO" get configmap dex-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null \
+        | yq eval '[.connectors[] | select(.type == "github") | .config.orgs[0].name][0] // ""' - 2>/dev/null || true)
+      [[ -n "$github_org" ]] && info "GitHub org for Grafana roles taken from the live Dex config: ${github_org}"
+    fi
+
     if [[ -n "$github_org" && -n "$DEX_HOST" ]]; then
       log "Configuring GitHub SSO via Dex ..."
       
@@ -1939,6 +2225,8 @@ envFromSecret: grafana-dex-secret
 
 grafana.ini:
   server:
+    # Explicit: the chart derives domain from its ingress, and behind Pomerium there is none.
+    domain: ${GRAFANA_HOST}
     root_url: https://${GRAFANA_HOST}
   auth.generic_oauth:
     enabled: "true"
@@ -1988,6 +2276,12 @@ EOF
     info "Grafana will be exposed at: https://${GRAFANA_HOST}/"
   fi
   
+  # The values above are rebuilt from scratch on every run, so anything this run could
+  # not re-derive would silently vanish from the release (Dex SSO, the Postgres-UCE
+  # datasource). Refuse to upgrade when the live release has something the new values
+  # lack; ALLOW_GRAFANA_REGRESSION=true accepts the loss deliberately.
+  grafana_values_guard "$grafana_values"
+
   log "Installing Grafana (this may take a few minutes)..."
   helm upgrade --install grafana grafana/grafana \
     --version "$GRAFANA_CHART_VERSION" \
