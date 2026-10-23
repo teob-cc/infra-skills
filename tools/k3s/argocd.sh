@@ -605,6 +605,14 @@ YAML
     fi
   fi
   
+  # Credential for the app charts in Harbor (oci://harbor.<HOSTNAME>/library/charts), needed
+  # once harbor.sh has made the library project private. From harbor.sh's pull-only robot.
+  if provision::argocd_harbor_charts_repo "harbor.${HOSTNAME}" "$NAMESPACE_ARGOCD"; then
+    info "✓ Repository credential repo-harbor-charts (harbor.${HOSTNAME}/library/charts)"
+  else
+    warn "No harbor/harbor-node-pull secret yet - repo-harbor-charts not created; run tools/k3s/harbor.sh ${ENV_NAME}"
+  fi
+
   # Create root application (apps-of-apps pattern)
   info "Creating root application for ${ENV_NAME}..."
   kubectl apply -f - <<YAML

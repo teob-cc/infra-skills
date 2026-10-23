@@ -129,6 +129,15 @@ Harbor with Dex SSO and a Docker Hub proxy cache, at `harbor.<HOSTNAME>`. Create
 for CI/CD. After a reprovision Harbor is **empty**: every application image must be rebuilt by
 its repository's CI (Step 10) before ArgoCD can start it.
 
+`library` and `dockerhub-proxy` end up **private**. Before that the script creates the pull-only
+`robot$node-pull` (Secret `harbor/harbor-node-pull`, encrypted into `secrets.sops/` - commit it),
+writes it into the server's `/etc/rancher/k3s/registries.yaml` over SSH (root at `TAILSCALE_IP`
+or `EXTERNAL_IP`; override with `NODE_SSH_USER` / `NODE_SSH_HOST`) and **restarts k3s** when that
+file changed - the API is away for up to a minute. With agent nodes, or with `--skip-node-auth`,
+the projects stay as they are until each agent has been (re)joined with `join-worker.sh` and the
+script is re-run with `HARBOR_PRIVATE_PROJECTS=force`. Pins: `HARBOR_CHART_VERSION`,
+`HARBOR_IMAGE_TAG` (docs/GITOPS.md).
+
 ### Step 5 — Harbor Credentials + GitHub Actions Runners
 The custom runner image is built by **your envs repo**, through a thin caller workflow that
 runs the public reusable `build-runner-image.yml` on your own runners (`/new-env` scaffolds it;

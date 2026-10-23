@@ -978,6 +978,29 @@ EOF
   echo "$client_secret"
 }
 
+# --- ArgoCD credential for the Helm charts in Harbor ---------------------------
+# App charts live in Harbor's library project (oci://<harbor-host>/library/charts). Once that
+# project is private (harbor.sh), ArgoCD needs a repository credential: the Secret
+# repo-harbor-charts (type helm, OCI) with the pull-only robot that harbor.sh keeps in
+# <harbor-ns>/harbor-node-pull. Called by harbor.sh and argocd.sh; idempotent.
+# Usage: provision::argocd_harbor_charts_repo HARBOR_HOST [ARGOCD_NS] [HARBOR_NS]
+# Returns 1 (and changes nothing) when the ArgoCD namespace or the robot Secret is missing.
+provision::argocd_harbor_charts_repo() {
+  local harbor_host="$1" argocd_ns="${2:-argocd}" harbor_ns="${3:-harbor}" user pass
+  [[ -n "$harbor_host" ]] || { provision::error "argocd_harbor_charts_repo: HARBOR_HOST is required"; return 1; }
+  kubectl get ns "$argocd_ns" >/dev/null 2>&1 || return 1
+  user=$(kubectl -n "$harbor_ns" get secret harbor-node-pull -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  pass=$(kubectl -n "$harbor_ns" get secret harbor-node-pull -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [[ -n "$user" && -n "$pass" ]] || return 1
+  jq -n --arg ns "$argocd_ns" --arg url "${harbor_host}/library/charts" --arg u "$user" --arg p "$pass" '{
+    apiVersion: "v1", kind: "Secret",
+    metadata: {name: "repo-harbor-charts", namespace: $ns,
+               labels: {"argocd.argoproj.io/secret-type": "repository"}},
+    stringData: {type: "helm", name: "harbor-charts", url: $url, enableOCI: "true",
+                 username: $u, password: $p}
+  }' | kubectl apply -f - >/dev/null
+}
+
 # --- Pomerium route management ------------------------------------------------
 # Manage routes in env-specific pomerium-routes.yaml file
 # This ensures routes persist and can be version-controlled

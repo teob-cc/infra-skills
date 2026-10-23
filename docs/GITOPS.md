@@ -298,11 +298,16 @@ tools/k3s/harbor.sh <env-name>
 3. Harbor configuration (OIDC, proxy, robot account)
 4. Validation
 
-**Docker Hub Proxy Usage**:
+**Docker Hub Proxy Usage** (the project is private: `docker login` first, as the reusable CI
+workflows do):
 ```dockerfile
 # Instead of: FROM nginx:latest
 FROM harbor.prod.example.com/dockerhub-proxy/library/nginx:latest
 ```
+
+**Private projects**: `library` and `dockerhub-proxy` are private by default, with a pull-only
+robot for containerd and ArgoCD; see "The platform recipe" below for how it is distributed and
+when the projects flip.
 
 ### 4. CI/CD (`ci.sh`)
 
@@ -471,8 +476,26 @@ The pattern every service built on this platform follows (reference: `teob-showc
    is registered with `provision::pomerium_routes_add` (any `tools/k3s/*.sh` can call it) or
    by editing `envs/<env>/pomerium-routes.yaml` and running `tools/k3s/apply-pomerium-routes.sh`.
 
-Harbor's `library` project is public, so neither ArgoCD (chart pull) nor the kubelet (image pull)
-needs credentials.
+Harbor's `library` and `dockerhub-proxy` projects are private (`harbor.sh`, Phase 4b): an anonymous
+client can neither pull an image nor read a chart. The pullers that do not log in themselves get
+one pull-only robot, `robot$node-pull` (Secret `harbor/harbor-node-pull`, SOPS-encrypted into
+`envs/<env>/secrets.sops/harbor-node-pull.yaml`):
+
+- **containerd** on the nodes reads it from `/etc/rancher/k3s/registries.yaml`
+  (`configs."harbor.<base_domain>".auth`). `harbor.sh` writes the server's file over SSH
+  (`NODE_SSH_USER`, default root, at `TAILSCALE_IP` or `EXTERNAL_IP`) and restarts k3s when the
+  file changed; `join-worker.sh` copies it to each agent.
+- **ArgoCD** reads it from the repository Secret `argocd/repo-harbor-charts` (type `helm`, OCI,
+  URL `harbor.<base_domain>/library/charts`), created by `harbor.sh` or `argocd.sh`, whichever
+  runs when both exist.
+
+The projects turn private only once every node is known to hold the credential (the server was
+written and there are no agents) and ArgoCD, if installed, has its Secret; afterwards a running
+library image is pulled on the node, and the projects go back to public if that pull fails.
+`HARBOR_PRIVATE_PROJECTS=force` skips the node condition (agents joined with `join-worker.sh`),
+`=false` leaves the visibility alone, and `--skip-node-auth` keeps `harbor.sh` off the node. CI
+logs in with its own robot (`harbor-robot-runner`) and is unaffected; so are the scripts, which
+query Harbor with that robot.
 
 **Private library artifacts** (a forked Maven/sbt dependency, for instance) go through the optional
 Nexus step (`UP_OPTIONAL_STEPS` gains `nexus`): the library repo publishes with its own

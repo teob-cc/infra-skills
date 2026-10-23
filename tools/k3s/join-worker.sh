@@ -242,6 +242,7 @@ for master_user in admin tim root; do
     "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null || true)
   if [[ -n "$MASTER_NODE_TOKEN" ]]; then
     info "  Fetched token via SSH as ${master_user}@${MASTER_SSH_HOST}"
+    MASTER_SSH_USER="$master_user"
     break
   fi
 done
@@ -253,6 +254,27 @@ if [[ -z "$MASTER_NODE_TOKEN" ]]; then
   exit 1
 fi
 ok "Got K3s node token"
+
+# --- Registry credentials (containerd) ---
+# harbor.sh writes the pull-only robot for Harbor's private projects into the server's
+# /etc/rancher/k3s/registries.yaml; an agent needs the same file or it cannot pull from
+# library/dockerhub-proxy. Copy it (never printed); an agent that is already running is
+# restarted below only when the file changed.
+REGISTRIES_CHANGED=false
+REGISTRIES_YAML=$(ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" \
+  "sudo cat /etc/rancher/k3s/registries.yaml 2>/dev/null" 2>/dev/null || true)
+if [[ -n "$REGISTRIES_YAML" ]]; then
+  if [[ "$(printf '%s\n' "$REGISTRIES_YAML" | shasum -a 256 | cut -d' ' -f1)" != \
+        "$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo cat /etc/rancher/k3s/registries.yaml 2>/dev/null | sha256sum" 2>/dev/null | cut -d' ' -f1)" ]]; then
+    printf '%s\n' "$REGISTRIES_YAML" | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+      "sudo sh -c 'umask 077; mkdir -p /etc/rancher/k3s && cat > /etc/rancher/k3s/registries.yaml'"
+    REGISTRIES_CHANGED=true
+    ok "Copied /etc/rancher/k3s/registries.yaml from the server"
+  else
+    info "/etc/rancher/k3s/registries.yaml already matches the server's"
+  fi
+fi
+unset REGISTRIES_YAML
 
 # --- Persist agent config (flannel-iface, labels, taints) ---
 # kubectl-applied labels/taints live on the node object and die with it (e.g. parked
@@ -302,6 +324,10 @@ if kubectl get node "$NODE_NAME" >/dev/null 2>&1; then
   NODE_STATUS=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
   if [[ "$NODE_STATUS" == "True" ]]; then
     ok "Node ${NODE_NAME} is already joined and Ready"
+    if [[ "$REGISTRIES_CHANGED" == "true" ]]; then
+      info "Restarting k3s-agent so containerd reads the new registries.yaml..."
+      ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo systemctl restart --no-block k3s-agent"
+    fi
     # Still apply labels/taints below
   else
     warn "Node ${NODE_NAME} exists but is not Ready (status: ${NODE_STATUS}). Proceeding with re-join."

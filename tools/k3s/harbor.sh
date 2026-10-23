@@ -10,7 +10,23 @@ set -euo pipefail
 #   - Dex client secret for Harbor must exist
 #
 # Usage:
-#   tools/k3s/harbor.sh <env-name>
+#   tools/k3s/harbor.sh <env-name> [--skip-node-auth]
+#
+# Pull credentials and private projects (Phase 4b): the `library` and `dockerhub-proxy`
+# projects are private by default. Before they turn private, a pull-only robot
+# (robot$node-pull) is created and its credential lands in:
+#   - harbor/harbor-node-pull (Secret), SOPS-encrypted into envs/<env>/secrets.sops/
+#   - /etc/rancher/k3s/registries.yaml on the server node (containerd), over SSH as
+#     ${NODE_SSH_USER:-root}@${TAILSCALE_IP:-EXTERNAL_IP}; k3s restarts when the file changes
+#   - argocd/repo-harbor-charts (ArgoCD OCI credential for the app charts), when ArgoCD exists
+#     (argocd.sh creates it otherwise)
+#
+#   --skip-node-auth            don't touch the node (no SSH, no k3s restart); the projects stay
+#                               as they are unless HARBOR_PRIVATE_PROJECTS=force
+#   HARBOR_PRIVATE_PROJECTS     true (default): private once every node has the credential, i.e.
+#                               the server was written and there are no agent nodes;
+#                               force: private regardless (agents joined with join-worker.sh,
+#                               which copies registries.yaml from the server); false: leave public
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
 # shellcheck disable=SC1091
@@ -31,6 +47,14 @@ else
   echo "ERROR: Environment '$1' not found (envs/$1/env.properties missing)." >&2
   exit 1
 fi
+
+SKIP_NODE_AUTH=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-node-auth) SKIP_NODE_AUTH=true; shift ;;
+    *) echo "Unknown option: $1 (known: --skip-node-auth)" >&2; exit 1 ;;
+  esac
+done
 
 # --- Validation ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
@@ -71,6 +95,14 @@ HARBOR_IMAGE_COMPONENTS=(nginx portal core jobservice registry.registry registry
 # default certSource=auto the chart renders the same secret with a self-signed cert, and every
 # upgrade fights cert-manager over it.
 TLS_SECRET_NAME="${TLS_SECRET_NAME:-harbor-ingress}"
+
+# Pull credentials and private projects (see the header).
+HARBOR_PRIVATE_PROJECTS="${HARBOR_PRIVATE_PROJECTS:-true}"
+HARBOR_PRIVATE_PROJECT_NAMES=(library dockerhub-proxy)
+NODE_PULL_ROBOT="${NODE_PULL_ROBOT:-node-pull}"
+NODE_PULL_SECRET="harbor-node-pull"
+NODE_SSH_USER="${NODE_SSH_USER:-root}"
+NODE_SSH_HOST="${NODE_SSH_HOST:-${TAILSCALE_IP:-${EXTERNAL_IP:-}}}"
 
 # Derive hosts from HOSTNAME if not provided
 if [[ -n "${HOSTNAME:-}" ]]; then
@@ -442,6 +474,8 @@ EOF
     err "Debug: registry_id='${registry_id}'"
     return 1
   else
+    # Created public; ensure_private_projects (Phase 4b) makes it private once the nodes
+    # and ArgoCD hold pull credentials.
     local proxy_payload
     proxy_payload=$(cat <<EOF
 {
@@ -484,12 +518,10 @@ EOF
       elif [[ "$project_registry_id" != "$registry_id" ]]; then
         info "  Project is not linked to Docker Hub registry (current registry_id: ${project_registry_id:-<unset>}). Patching..."
         local patch_payload patch_response patch_http_code patch_body
+        # No metadata.public here: visibility is ensure_private_projects' business.
         patch_payload=$(cat <<EOF
 {
   "project_name": "dockerhub-proxy",
-  "metadata": {
-    "public": "true"
-  },
   "registry_id": ${registry_id},
   "storage_limit": -1
 }
@@ -822,6 +854,299 @@ configure_harbor() {
 configure_harbor
 
 # ============================================================================
+# Phase 4b: Pull credentials and private projects
+# ============================================================================
+# Anything that pulls from library or dockerhub-proxy without logging in - containerd on the
+# nodes, ArgoCD fetching the app charts - needs a credential before those projects turn
+# private. One pull-only robot serves both (see the header for where it goes).
+
+# Harbor API as admin: METHOD PATH [JSON]. Prints the body, a newline and the HTTP code.
+# The password reaches curl through a config on a file descriptor, not argv.
+harbor_api() {
+  local method="$1" path="$2" data="${3:-}"
+  local args=(-sS --max-time 20 -X "$method" -H "Content-Type: application/json" -w '\n%{http_code}')
+  [[ -n "$data" ]] && args+=(-d "$data")
+  curl "${args[@]}" -K <(printf 'user = "admin:%s"\n' "$HARBOR_API_PASSWORD") \
+    "https://${HARBOR_HOST}/api/v2.0${path}" 2>/dev/null || printf '\n000'
+}
+http_code() { printf '%s' "${1##*$'\n'}"; }
+http_body() { printf '%s' "${1%$'\n'*}"; }
+
+# Does Harbor accept USER/PASS? The registry base /v2/ answers 200 to a valid credential and 401
+# to anything else. (/service/token is no test: it hands an anonymous token to a wrong secret.)
+pull_credential_valid() {
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+    -K <(printf 'user = "%s:%s"\n' "$1" "$2") "https://${HARBOR_HOST}/v2/" 2>/dev/null || echo 000)
+  [[ "$code" == "200" ]]
+}
+
+# Write the robot's Secret to secrets.plain, apply it, SOPS-encrypt it into secrets.sops and
+# remove the plaintext (the pattern of postgres.sh's read-only login). Values are never printed.
+store_node_pull_secret() {
+  local user="$1" pass="$2" file="${NODE_PULL_SECRET}.yaml"
+  local plain="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/${file}"
+  local sops_file="${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${file}"
+  provision::assert_plaintext_ignored "$plain" || return 1
+  ( umask 077
+    mkdir -p "$(dirname "$plain")"
+    cat > "$plain" <<YAML
+# Harbor robot ${user}: pull-only on $(IFS=,; echo "${HARBOR_PRIVATE_PROJECT_NAMES[*]}"). Used by containerd
+# (/etc/rancher/k3s/registries.yaml on the nodes) and by ArgoCD (argocd/repo-harbor-charts).
+# Written by infra-skills tools/k3s/harbor.sh; never commit.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${NODE_PULL_SECRET}
+  namespace: ${NAMESPACE_HARBOR}
+type: kubernetes.io/basic-auth
+stringData:
+  username: "${user}"
+  password: "${pass}"
+YAML
+  )
+  kubectl apply -f "$plain" >/dev/null
+  info "  ✓ Secret ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET} applied"
+  if command -v sops >/dev/null 2>&1 && \
+     "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$file" >/dev/null && \
+     grep -q 'password: ENC\[' "$sops_file"; then
+    rm -f "$plain"
+    info "  ✓ Encrypted to ${ENV_NAME}/secrets.sops/${file} - commit it in the envs repo"
+  else
+    warn "  Could not SOPS-encrypt it; the plaintext stays (git-ignored) at ${plain#"${ENVS_ROOT}/"}:"
+    warn "  tools/sops/encrypt.sh ${ENV_NAME} ${file}, then delete the plaintext"
+  fi
+}
+
+# Sets NODE_PULL_USER / NODE_PULL_PASS. Keeps a working credential (cluster Secret, else the
+# envs repo's SOPS copy); otherwise creates the robot, or gives an existing robot a new secret
+# when no copy of its current one is left.
+ensure_node_pull_credentials() {
+  NODE_PULL_USER="" NODE_PULL_PASS=""
+  if ! kubectl -n "$NAMESPACE_HARBOR" get secret "$NODE_PULL_SECRET" >/dev/null 2>&1; then
+    local f
+    for f in "${ENVS_ROOT}/${ENV_NAME}/secrets.sops/"*.yaml; do
+      [[ -f "$f" ]] || continue
+      if [[ -n "$(NS="$NAMESPACE_HARBOR" NAME="$NODE_PULL_SECRET" yq eval 'select(.kind == "Secret" and .metadata.name == strenv(NAME) and .metadata.namespace == strenv(NS)) | .metadata.name' "$f" 2>/dev/null)" ]]; then
+        info "Applying ${NODE_PULL_SECRET} from ${f#"${ENVS_ROOT}/"}"
+        sops -d "$f" | kubectl apply -f - >/dev/null || warn "  could not decrypt/apply ${f#"${ENVS_ROOT}/"} (sops and the age key are needed)"
+        break
+      fi
+    done
+  fi
+  NODE_PULL_USER=$(kubectl -n "$NAMESPACE_HARBOR" get secret "$NODE_PULL_SECRET" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  NODE_PULL_PASS=$(kubectl -n "$NAMESPACE_HARBOR" get secret "$NODE_PULL_SECRET" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  if [[ -n "$NODE_PULL_USER" && -n "$NODE_PULL_PASS" ]] && pull_credential_valid "$NODE_PULL_USER" "$NODE_PULL_PASS"; then
+    info "✓ Pull-only robot ${NODE_PULL_USER}: credential in ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET} is valid"
+    return 0
+  fi
+  [[ -n "$NODE_PULL_USER" ]] && warn "The credential in ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET} is refused by Harbor - replacing it"
+
+  local out robot_id
+  out=$(harbor_api GET "/robots?q=name%3D~${NODE_PULL_ROBOT}&page_size=100")
+  robot_id=$(http_body "$out" | jq -r --arg n "$NODE_PULL_ROBOT" \
+    '[.[]? | select(.name == $n or (.name | endswith("$" + $n)))][0].id // empty' 2>/dev/null || true)
+  if [[ -n "$robot_id" ]]; then
+    # The robot exists but no usable copy of its secret does: set a new one (8-128 chars,
+    # upper + lower + digit). Whatever used the old secret must take the new one.
+    local secret
+    secret="Np1$(openssl rand -hex 20)"
+    out=$(harbor_api PATCH "/robots/${robot_id}" "$(jq -cn --arg s "$secret" '{secret: $s}')")
+    if [[ "$(http_code "$out")" != "200" ]]; then
+      err "Could not refresh the secret of robot id ${robot_id} (HTTP $(http_code "$out"))"
+      return 1
+    fi
+    NODE_PULL_USER=$(harbor_api GET "/robots/${robot_id}" | sed '$d' | jq -r '.name // empty')
+    NODE_PULL_PASS="$secret"
+    info "✓ Robot ${NODE_PULL_USER} existed without a usable secret copy - set a new secret"
+  else
+    local payload
+    payload=$(jq -cn --arg n "$NODE_PULL_ROBOT" --arg projects "$(IFS=,; echo "${HARBOR_PRIVATE_PROJECT_NAMES[*]}")" '{
+      name: $n, level: "system", duration: -1, disable: false,
+      description: "Pull-only: containerd on the nodes and ArgoCD chart pulls (private projects)",
+      permissions: [($projects | split(","))[] | {kind: "project", namespace: ., access: [
+        {resource: "repository", action: "pull"}, {resource: "artifact", action: "read"}]}]}')
+    out=$(harbor_api POST "/robots" "$payload")
+    if [[ "$(http_code "$out")" != "201" ]]; then
+      err "Could not create robot ${NODE_PULL_ROBOT} (HTTP $(http_code "$out")): $(http_body "$out" | jq -c 'del(.secret)' 2>/dev/null)"
+      return 1
+    fi
+    NODE_PULL_USER=$(http_body "$out" | jq -r '.name // empty')
+    NODE_PULL_PASS=$(http_body "$out" | jq -r '.secret // empty')
+    info "✓ Created pull-only robot ${NODE_PULL_USER} ($(IFS=,; echo "${HARBOR_PRIVATE_PROJECT_NAMES[*]}"))"
+  fi
+  if ! pull_credential_valid "$NODE_PULL_USER" "$NODE_PULL_PASS"; then
+    err "Harbor refuses the new credential of ${NODE_PULL_USER}"
+    return 1
+  fi
+  store_node_pull_secret "$NODE_PULL_USER" "$NODE_PULL_PASS"
+}
+
+# containerd auth on the server node: /etc/rancher/k3s/registries.yaml gets
+# configs."<harbor-host>".auth = the robot; other entries in the file are kept. k3s reads the
+# file at start, so it is restarted when the file changed (or changed after k3s last started):
+# the API is away for under a minute; running pods are not restarted.
+# Returns 0 when the server has the credential active and there are no agent nodes,
+# 2 when agent nodes exist (they are not reached from here), 1 when skipped or failed.
+ensure_node_registry_auth() {
+  if [[ "$SKIP_NODE_AUTH" == "true" ]]; then
+    info "Node registry auth skipped (--skip-node-auth)"
+    return 1
+  fi
+  if [[ -z "$NODE_SSH_HOST" ]]; then
+    warn "No NODE_SSH_HOST / TAILSCALE_IP / EXTERNAL_IP - cannot reach the node"
+    return 1
+  fi
+  local target="${NODE_SSH_USER}@${NODE_SSH_HOST}" sudo="" f=/etc/rancher/k3s/registries.yaml
+  [[ "$NODE_SSH_USER" != "root" ]] && sudo="sudo"
+  local ssh_opts=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+  # shellcheck disable=SC2029  # the remote commands are composed on this side on purpose
+  node_ssh() { ssh "${ssh_opts[@]}" "$target" "$@"; }
+
+  if ! node_ssh "$sudo systemctl is-active --quiet k3s"; then
+    warn "Cannot reach ${target} over SSH, or k3s (server) is not active there - node auth not set"
+    return 1
+  fi
+  local current desired cur_user cur_pass restart=false
+  current=$(node_ssh "$sudo cat $f 2>/dev/null || true") || { warn "Cannot read ${f} on ${target}"; return 1; }
+  cur_user=$(printf '%s' "$current" | H="$HARBOR_HOST" yq eval '.configs[strenv(H)].auth.username // ""' - 2>/dev/null || true)
+  cur_pass=$(printf '%s' "$current" | H="$HARBOR_HOST" yq eval '.configs[strenv(H)].auth.password // ""' - 2>/dev/null || true)
+  if [[ "$cur_user" == "$NODE_PULL_USER" && "$cur_pass" == "$NODE_PULL_PASS" ]]; then
+    info "✓ ${f} on ${NODE_SSH_HOST} already holds the credential for ${HARBOR_HOST}"
+    # Written but not yet read by k3s (e.g. staged by hand without a restart)?
+    if ! node_ssh "m=\$(stat -c %Y $f); s=\$(date -d \"\$(systemctl show k3s -p ActiveEnterTimestamp --value)\" +%s); [ \"\$m\" -le \"\$s\" ]"; then
+      info "  ... but k3s started before it was written"
+      restart=true
+    fi
+  else
+    if [[ -n "$current" ]]; then
+      desired=$(printf '%s' "$current" | H="$HARBOR_HOST" U="$NODE_PULL_USER" P="$NODE_PULL_PASS" \
+        yq eval '.configs[strenv(H)].auth = {"username": strenv(U), "password": strenv(P)}' -)
+    else
+      desired=$(H="$HARBOR_HOST" U="$NODE_PULL_USER" P="$NODE_PULL_PASS" \
+        yq eval -n '.configs[strenv(H)].auth = {"username": strenv(U), "password": strenv(P)}')
+    fi
+    printf '%s\n' "$desired" | node_ssh "$sudo sh -c 'umask 077; mkdir -p /etc/rancher/k3s && cat > $f.tmp && mv $f.tmp $f'" \
+      || { err "Could not write ${f} on ${target}"; return 1; }
+    info "✓ Wrote the ${HARBOR_HOST} credential to ${f} on ${NODE_SSH_HOST}"
+    restart=true
+  fi
+
+  if [[ "$restart" == "true" ]]; then
+    info "Restarting k3s on ${NODE_SSH_HOST} so containerd reads ${f} (API away for up to a minute)..."
+    node_ssh "$sudo timeout 300 systemctl restart k3s" || warn "  systemctl restart k3s did not return cleanly"
+    local i
+    for i in $(seq 1 60); do
+      kubectl get --raw=/readyz >/dev/null 2>&1 && break
+      sleep 5
+    done
+    if ! kubectl get --raw=/readyz >/dev/null 2>&1; then
+      err "The API did not come back within 5 minutes of the k3s restart"
+      return 1
+    fi
+    kubectl wait node --all --for=condition=Ready --timeout=300s >/dev/null 2>&1 || warn "  not every node is Ready yet"
+    info "✓ k3s restarted; API back"
+  fi
+
+  local agents
+  agents=$(kubectl get nodes -o json | jq -r '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null) | .metadata.name] | join(" ")')
+  if [[ -n "$agents" ]]; then
+    warn "Agent node(s) not reached from here: ${agents}"
+    warn "  tools/k3s/join-worker.sh <env> <worker> copies ${f} from the server to a worker."
+    return 2
+  fi
+  return 0
+}
+
+# A running pod's image from library (cached on the node), to prove a pull with the node's
+# credential after the projects turned private. Digest references first: a moved tag would
+# download a new image. Empty when there is none.
+node_probe_image() {
+  kubectl get pods -A -o json 2>/dev/null | jq -r --arg h "${HARBOR_HOST}/" \
+    '[.items[].spec.containers[].image | select(startswith($h + "library/"))]
+     | (map(select(contains("@sha256:"))) + .) | first // empty'
+}
+
+set_project_public() { # <project> <true|false>
+  local out
+  out=$(harbor_api PUT "/projects/$1" "$(jq -cn --arg p "$2" '{metadata: {public: $p}}')")
+  [[ "$(http_code "$out")" == "200" ]]
+}
+
+# Make the projects private when every puller holds the credential (see HARBOR_PRIVATE_PROJECTS).
+ensure_private_projects() {
+  local node_auth_rc="$1" project out public changed=()
+  case "$HARBOR_PRIVATE_PROJECTS" in
+    false)
+      info "HARBOR_PRIVATE_PROJECTS=false - leaving project visibility as it is"
+      return 0 ;;
+    force) ;;
+    *)
+      if [[ "$node_auth_rc" != "0" ]]; then
+        warn "Not making ${HARBOR_PRIVATE_PROJECT_NAMES[*]} private: not every node is known to hold the pull credential."
+        warn "  Fix the node step above (or join agents with join-worker.sh and re-run with HARBOR_PRIVATE_PROJECTS=force)."
+        return 0
+      fi ;;
+  esac
+  if kubectl get ns argocd >/dev/null 2>&1 && ! kubectl -n argocd get secret repo-harbor-charts >/dev/null 2>&1; then
+    warn "ArgoCD is installed but argocd/repo-harbor-charts is missing - not making the projects private"
+    return 0
+  fi
+
+  for project in "${HARBOR_PRIVATE_PROJECT_NAMES[@]}"; do
+    out=$(harbor_api GET "/projects/${project}")
+    if [[ "$(http_code "$out")" != "200" ]]; then
+      warn "  Project ${project} not found (HTTP $(http_code "$out")) - skipped"
+      continue
+    fi
+    public=$(http_body "$out" | jq -r '.metadata.public // "false"')
+    if [[ "$public" == "false" ]]; then
+      info "  ✓ ${project} is private"
+    elif set_project_public "$project" false; then
+      info "  ✓ ${project} made private"
+      changed+=("$project")
+    else
+      err "  Could not make ${project} private"
+    fi
+  done
+  [[ ${#changed[@]} -gt 0 ]] || return 0
+
+  # Prove the node can still pull; undo on failure, so running workloads keep restarting.
+  local image target="${NODE_SSH_USER}@${NODE_SSH_HOST}" sudo=""
+  [[ "$NODE_SSH_USER" != "root" ]] && sudo="sudo"
+  image=$(node_probe_image)
+  if [[ -z "$image" || "$SKIP_NODE_AUTH" == "true" ]]; then
+    info "  (no running library image to probe a node pull with)"
+    return 0
+  fi
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$sudo k3s crictl pull '$image'" >/dev/null 2>&1; then
+    info "  ✓ The node pulls ${image} with its credential"
+  else
+    err "  The node cannot pull ${image} now - making ${changed[*]} public again"
+    for project in "${changed[@]}"; do set_project_public "$project" true || err "  Could not revert ${project}!"; done
+    return 1
+  fi
+}
+
+pull_credentials_and_private_projects() {
+  log "=== Phase 4b: Pull credentials and private projects ==="
+  HARBOR_API_PASSWORD=$(kubectl -n "$NAMESPACE_HARBOR" get secret harbor-core -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [[ -n "$HARBOR_API_PASSWORD" ]] || HARBOR_API_PASSWORD="$HARBOR_ADMIN_PASSWORD"
+
+  ensure_node_pull_credentials || return 1
+  if provision::argocd_harbor_charts_repo "$HARBOR_HOST"; then
+    info "✓ ArgoCD credential argocd/repo-harbor-charts ensured"
+  else
+    info "ArgoCD not installed yet - argocd.sh creates argocd/repo-harbor-charts"
+  fi
+  local node_auth_rc=0
+  ensure_node_registry_auth || node_auth_rc=$?
+  ensure_private_projects "$node_auth_rc"
+}
+
+pull_credentials_and_private_projects || warn "Phase 4b incomplete - see above; the projects keep their visibility"
+
+# ============================================================================
 # Phase 5: Validation
 # ============================================================================
 
@@ -968,15 +1293,18 @@ info "Harbor Resources:"
 info "  ✓ Docker Hub proxy registry endpoint"
 info "  ✓ Docker Hub proxy project (dockerhub-proxy)"
 info "  ✓ Robot account for CI/CD (harbor-robot-runner secret)"
+info "  ✓ Pull-only robot for the nodes and ArgoCD (${NODE_PULL_SECRET} secret)"
+for p in "${HARBOR_PRIVATE_PROJECT_NAMES[@]}"; do
+  vis=$(harbor_api GET "/projects/${p}" | sed '$d' | jq -r 'if .metadata.public == "true" then "public" elif .metadata.public == "false" then "private" else "?" end' 2>/dev/null || echo "?")
+  info "  Project ${p}: ${vis}"
+done
 info ""
 info "Robot Account Credentials:"
 if kubectl -n "$NAMESPACE_HARBOR" get secret harbor-robot-runner >/dev/null 2>&1; then
   robot_user=$(kubectl -n "$NAMESPACE_HARBOR" get secret harbor-robot-runner -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || echo "N/A")
-  robot_pass=$(kubectl -n "$NAMESPACE_HARBOR" get secret harbor-robot-runner -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "N/A")
   info "  Username: ${robot_user}"
-  info "  Password: ${robot_pass}"
   info ""
-  info "  Retrieve credentials later with:"
+  info "  Retrieve credentials with:"
   info "    kubectl -n ${NAMESPACE_HARBOR} get secret harbor-robot-runner -o jsonpath='{.data.username}' | base64 -d"
   info "    kubectl -n ${NAMESPACE_HARBOR} get secret harbor-robot-runner -o jsonpath='{.data.password}' | base64 -d"
 else
