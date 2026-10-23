@@ -384,7 +384,7 @@ ensure_harbor_db_collation() {
   fi
   kubectl -n "$NAMESPACE_HARBOR" wait --for=condition=Ready "pod/${pod}" --timeout=300s >/dev/null 2>&1 || true
   hdb_psql() {
-    kubectl -n "$NAMESPACE_HARBOR" exec -i "$pod" -c database -- \
+    kubectl -n "$NAMESPACE_HARBOR" exec "$pod" -c database -- \
       psql -U postgres -v ON_ERROR_STOP=1 -At "$@" 2>/dev/null
   }
   local mismatched db
@@ -869,13 +869,16 @@ configure_harbor
 # nodes, ArgoCD fetching the app charts - needs a credential before those projects turn
 # private. One pull-only robot serves both (see the header for where it goes).
 
+# A value for a double-quoted curl config entry: \ and " escaped (a hand-set password may hold them).
+curl_cfg_quote() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
+
 # Harbor API as admin: METHOD PATH [JSON]. Prints the body, a newline and the HTTP code.
 # The password reaches curl through a config on a file descriptor, not argv.
 harbor_api() {
   local method="$1" path="$2" data="${3:-}"
   local args=(-sS --max-time 20 -X "$method" -H "Content-Type: application/json" -w '\n%{http_code}')
   [[ -n "$data" ]] && args+=(-d "$data")
-  curl "${args[@]}" -K <(printf 'user = "admin:%s"\n' "$HARBOR_API_PASSWORD") \
+  curl "${args[@]}" -K <(printf 'user = "admin:%s"\n' "$(curl_cfg_quote "$HARBOR_API_PASSWORD")") \
     "https://${HARBOR_HOST}/api/v2.0${path}" 2>/dev/null || printf '\n000'
 }
 http_code() { printf '%s' "${1##*$'\n'}"; }
@@ -886,7 +889,7 @@ http_body() { printf '%s' "${1%$'\n'*}"; }
 pull_credential_valid() {
   local code
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-    -K <(printf 'user = "%s:%s"\n' "$1" "$2") "https://${HARBOR_HOST}/v2/" 2>/dev/null || echo 000)
+    -K <(printf 'user = "%s:%s"\n' "$(curl_cfg_quote "$1")" "$(curl_cfg_quote "$2")") "https://${HARBOR_HOST}/v2/" 2>/dev/null || echo 000)
   [[ "$code" == "200" ]]
 }
 
@@ -1053,7 +1056,7 @@ ensure_node_registry_auth() {
       err "The API did not come back within 5 minutes of the k3s restart"
       return 1
     fi
-    kubectl wait node --all --for=condition=Ready --timeout=300s >/dev/null 2>&1 || warn "  not every node is Ready yet"
+    kubectl wait node -l node-role.kubernetes.io/control-plane --for=condition=Ready --timeout=300s >/dev/null 2>&1 || warn "  the server node is not Ready yet"
     info "✓ k3s restarted; API back"
   fi
 
@@ -1149,7 +1152,13 @@ pull_credentials_and_private_projects() {
     info "ArgoCD not installed yet - argocd.sh creates argocd/repo-harbor-charts"
   fi
   local node_auth_rc=0
-  ensure_node_registry_auth || node_auth_rc=$?
+  if [[ "$HARBOR_PRIVATE_PROJECTS" == "false" ]]; then
+    # Public projects need no node credential: no SSH, no k3s restart.
+    info "HARBOR_PRIVATE_PROJECTS=false - node registry auth not touched"
+    node_auth_rc=1
+  else
+    ensure_node_registry_auth || node_auth_rc=$?
+  fi
   ensure_private_projects "$node_auth_rc"
 }
 
