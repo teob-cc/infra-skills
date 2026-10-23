@@ -1150,9 +1150,9 @@ restrict_runner_group() {
   fi
   current=$(printf '%s' "$current" | sed '/^$/d' | sort -u)
 
-  local wanted
+  local wanted repos_list="${RUNNER_GROUP_REPOS:-}"
   # shellcheck disable=SC2086  # split the list on spaces
-  wanted=$(printf '%s\n' ${RUNNER_GROUP_REPOS//,/ } | sed '/^$/d' | sort -u)
+  wanted=$(printf '%s\n' ${repos_list//,/ } | sed '/^$/d' | sort -u)
   if [[ -z "$wanted" ]]; then
     if [[ "$visibility" == "all" ]]; then
       warn "Runner group '${RUNNER_GROUP_NAME}' admits EVERY repo of ${org}; a workflow there runs as root on"
@@ -1170,6 +1170,13 @@ restrict_runner_group() {
     err "RUNNER_GROUP_REPOS would take these repos out of runner group '${RUNNER_GROUP_NAME}': $(echo "$removed" | tr '\n' ' ')"
     err "  Another environment may rely on them (the group is org-wide). Add them to RUNNER_GROUP_REPOS,"
     err "  or re-run with --allow-runner-repo-removal. Nothing was changed."
+    return 1
+  fi
+  # From "all", every repo not in the list loses the runners - the same risk, just unlisted.
+  if [[ "$visibility" == "all" && "$ALLOW_RUNNER_REPO_REMOVAL" != "true" ]]; then
+    err "Runner group '${RUNNER_GROUP_NAME}' admits every repo of ${org}; RUNNER_GROUP_REPOS would take out all"
+    err "  repos not in the list, which another environment may rely on (the group is org-wide). Check the"
+    err "  list, then re-run with --allow-runner-repo-removal. Nothing was changed."
     return 1
   fi
 
@@ -1195,7 +1202,19 @@ restrict_runner_group() {
   [[ "${out##*$'\n'}" == "200" ]] || { err "Could not restrict runner group '${RUNNER_GROUP_NAME}' (HTTP ${out##*$'\n'})"; return 1; }
   out=$(github_api PUT "/orgs/${org}/actions/runner-groups/${group_id}/repositories" \
     "$(jq -cn --argjson repo_ids "$repo_ids" '{selected_repository_ids: $repo_ids}')")
-  [[ "${out##*$'\n'}" == "204" ]] || { err "Could not set the repos of runner group '${RUNNER_GROUP_NAME}' (HTTP ${out##*$'\n'})"; return 1; }
+  if [[ "${out##*$'\n'}" != "204" ]]; then
+    err "Could not set the repos of runner group '${RUNNER_GROUP_NAME}' (HTTP ${out##*$'\n'})"
+    # The group is "selected" now, with whatever list it had before (none, when it was "all"):
+    # put the old visibility back rather than leave repos without runners.
+    out=$(github_api PATCH "/orgs/${org}/actions/runner-groups/${group_id}" \
+      "$(jq -cn --arg v "$visibility" --argjson p "$public_ok" '{visibility: $v, allows_public_repositories: $p}')")
+    if [[ "${out##*$'\n'}" == "200" ]]; then
+      err "  Visibility of '${RUNNER_GROUP_NAME}' set back to ${visibility}"
+    else
+      err "  Could not set the visibility back to ${visibility} (HTTP ${out##*$'\n'}) - fix it in Settings > Actions > Runner groups"
+    fi
+    return 1
+  fi
   info "✓ Runner group '${RUNNER_GROUP_NAME}' restricted to $(jq length <<<"$repo_ids") repos (was: ${visibility})"
   [[ -n "$removed" ]] && info "  removed: $(echo "$removed" | tr '\n' ' ')"
   info "  Undo: Settings > Actions > Runner groups > ${RUNNER_GROUP_NAME} > Repository access: All"
