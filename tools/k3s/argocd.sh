@@ -327,7 +327,18 @@ provision_argocd() {
   info "Configuring Argo CD with Dex SSO..."
   info "  Dex issuer: ${dex_issuer}"
   info "  GitHub org: ${github_org}"
-  
+
+  # Switching the admin account off leaves Dex as the only way in, so not while Dex does not
+  # answer as this issuer: the account stays on for this run (and argocd-initial-admin-secret
+  # stays), and a re-run once Dex is up switches it off.
+  if [[ "$ARGOCD_ADMIN_ENABLED" != "true" ]] && \
+     ! curl -fsS --max-time 15 "${dex_issuer}/.well-known/openid-configuration" 2>/dev/null \
+       | jq -e --arg i "$dex_issuer" '.issuer == $i' >/dev/null 2>&1; then
+    warn "Dex does not answer as ${dex_issuer} - keeping the built-in admin account ON for this run."
+    warn "  Fix Dex (tools/k3s/identity.sh ${ENV_NAME}), then re-run this script to switch it off."
+    ARGOCD_ADMIN_ENABLED=true
+  fi
+
   # Render Helm values. They carry the Dex client secret and the webhook secret, so the file
   # is private to this user and removed on exit.
   local values_file
