@@ -330,6 +330,14 @@ tools/k3s/github-action-runner.sh <env-name>
 - Creates runners with environment-specific labels
 - Docker-in-Docker (DinD) enabled for container builds
 - Auto-scales based on workflow demand
+- Runner group access: the runners register in the org's `Default` runner group and run DinD
+  privileged, so a job on them is root on the node. GitHub opens that group to every private repo
+  of the org by default. Set `RUNNER_GROUP_REPOS` (env.properties, repo names) and the script
+  restricts the group to exactly those repos, public repos excluded. The group is org-wide: every
+  environment whose runners share it carries the same list, and a run that would drop a repo from
+  the group stops unless `--allow-runner-repo-removal` is given. Unset, the group is left alone
+  (with a warning when it admits all repos). A repo that starts building here must be added to
+  the list (or in Settings > Actions > Runner groups)
 
 **Phases**:
 1. Prerequisites validation

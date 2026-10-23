@@ -171,6 +171,8 @@ The script auto-detects the custom image in Harbor and switches runners from van
 deleting the bootstrap deployment so GitHub can't schedule jobs on the vanilla runner. Runner
 labels are `self-hosted` + the environment name; any workflow with `runs-on: [self-hosted, <env>]`
 queues while this environment is down.
+`RUNNER_GROUP_REPOS` in `env.properties` restricts the org's `Default` runner group (privileged dind
+runners: root on the node) to the listed repos; see docs/GITOPS.md, "CI/CD".
 
 ### Step 6 — ArgoCD (GitOps)
 Required — application manifests in `envs/<env>/apps/` are ArgoCD Applications.

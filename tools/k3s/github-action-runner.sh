@@ -9,13 +9,20 @@ set -euo pipefail
 #   - GitHub App credentials must be configured
 #
 # Usage:
-#   tools/k3s/github-action-runner.sh <env-name> [--bootstrap] [--custom-runner]
+#   tools/k3s/github-action-runner.sh <env-name> [--bootstrap] [--custom-runner] [--allow-runner-repo-removal]
 #
 # Options:
 #   --bootstrap      Create bootstrap runners for building images (vanilla runner)
 #                    Use this for initial provisioning
 #   --custom-runner  Use custom runner image with pre-installed build tools
 #                    Eliminates need for job container, faster workflow startup
+#   --allow-runner-repo-removal
+#                    Let RUNNER_GROUP_REPOS take repos out of the org runner group (Phase 3b)
+#
+# env.properties:
+#   RUNNER_GROUP_REPOS  repos (space- or comma-separated) the org's "Default" runner group is
+#                       restricted to; the runners are privileged, so a job on them is root on the
+#                       node. Unset: the group is left alone (with a warning when it admits all repos)
 #
 # Workflow (Option A - Custom Runner Image, Recommended):
 #   1. Bootstrap:        tools/k3s/github-action-runner.sh dev --bootstrap
@@ -37,7 +44,7 @@ ENVS_ROOT=$(provision::envs_root)
 
 # --- Parse arguments ---
 if [[ -z "${1:-}" ]]; then
-  echo "Usage: $0 <env-name> [--bootstrap]" >&2
+  echo "Usage: $0 <env-name> [--bootstrap] [--custom-runner] [--allow-runner-repo-removal]" >&2
   echo "Available environments:" >&2
   find "$(provision::envs_root)" -maxdepth 2 -type f -name env.properties -print | sed "s#$(provision::envs_root)/##; s#/env.properties##" | sort || true
   exit 1
@@ -58,8 +65,13 @@ fi
 # Parse optional flags
 BOOTSTRAP_MODE=false
 CUSTOM_RUNNER_IMAGE=false
+ALLOW_RUNNER_REPO_REMOVAL=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --allow-runner-repo-removal)
+      ALLOW_RUNNER_REPO_REMOVAL=true
+      shift
+      ;;
     --bootstrap)
       BOOTSTRAP_MODE=true
       shift
@@ -1081,6 +1093,116 @@ EOF
 }
 
 create_runner_deployment
+
+# ============================================================================
+# Phase 3b: Runner group access
+# ============================================================================
+# The runners register in the org's "Default" runner group. They run Docker-in-Docker,
+# privileged: a job on them is root on the node, with the cluster's secrets in reach. By default
+# that group admits every private repo of the org, so anyone who can push a workflow to any
+# repo gets that. RUNNER_GROUP_REPOS (env.properties; repo names, space- or comma-separated)
+# restricts the group to exactly those repos and keeps public repos out. The group is org-wide:
+# every environment whose runners sit in it must carry the same list. A run that would take a
+# repo out of the group stops unless --allow-runner-repo-removal is given (a stale list in one
+# env must not lock another env's repos out). Empty: the group is left alone, with a warning
+# when it is open to all repos.
+RUNNER_GROUP_NAME="Default"
+
+github_api() { # METHOD PATH [JSON] -> body, newline, HTTP code
+  local method="$1" path="$2" data="${3:-}"
+  local args=(-sS --max-time 20 -X "$method" -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28" -w '\n%{http_code}')
+  [[ -n "$data" ]] && args+=(-H "Content-Type: application/json" -d "$data")
+  curl "${args[@]}" -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") \
+    "${GITHUB_API_URL:-https://api.github.com}${path}" 2>/dev/null || printf '\n000'
+}
+
+restrict_runner_group() {
+  log "=== Phase 3b: Runner group access ==="
+  local org out code group visibility public_ok group_id
+  org=$(provision::yaml_get "$ENVS_ROOT/${ENV_NAME}/secrets.plain/github-oauth-credentials.yaml" .stringData.githubOrg)
+  GH_TOKEN=$(provision::github_get_installation_token) || { warn "No GitHub App token - runner group not checked"; return 1; }
+
+  out=$(github_api GET "/orgs/${org}/actions/runner-groups?per_page=100")
+  code=${out##*$'\n'}
+  if [[ "$code" != "200" ]]; then
+    warn "Cannot read the runner groups of ${org} (HTTP ${code}); the GitHub App needs the"
+    warn "organization permission 'Self-hosted runners: Read and write'"
+    return 1
+  fi
+  group=$(printf '%s' "${out%$'\n'*}" | jq -c --arg n "$RUNNER_GROUP_NAME" '[.runner_groups[] | select(.name == $n)][0] // empty')
+  [[ -n "$group" ]] || { warn "No runner group '${RUNNER_GROUP_NAME}' in ${org}"; return 1; }
+  group_id=$(jq -r .id <<<"$group")
+  visibility=$(jq -r .visibility <<<"$group")
+  public_ok=$(jq -r .allows_public_repositories <<<"$group")
+
+  # Current members (only meaningful when visibility is "selected").
+  local current="" page=1 names
+  if [[ "$visibility" == "selected" ]]; then
+    while :; do
+      out=$(github_api GET "/orgs/${org}/actions/runner-groups/${group_id}/repositories?per_page=100&page=${page}")
+      [[ "${out##*$'\n'}" == "200" ]] || { warn "Cannot list the repos of runner group ${RUNNER_GROUP_NAME}"; return 1; }
+      names=$(printf '%s' "${out%$'\n'*}" | jq -r '.repositories[].name')
+      [[ -n "$names" ]] || break
+      current+="${names}"$'\n'
+      page=$((page + 1))
+    done
+  fi
+  current=$(printf '%s' "$current" | sed '/^$/d' | sort -u)
+
+  local wanted
+  # shellcheck disable=SC2086  # split the list on spaces
+  wanted=$(printf '%s\n' ${RUNNER_GROUP_REPOS//,/ } | sed '/^$/d' | sort -u)
+  if [[ -z "$wanted" ]]; then
+    if [[ "$visibility" == "all" ]]; then
+      warn "Runner group '${RUNNER_GROUP_NAME}' admits EVERY repo of ${org}; a workflow there runs as root on"
+      warn "  this cluster's node. Set RUNNER_GROUP_REPOS in env.properties to the repos that build here."
+    else
+      info "Runner group '${RUNNER_GROUP_NAME}': ${visibility}, $(printf '%s' "$current" | grep -c . || true) repo(s); RUNNER_GROUP_REPOS unset - left alone"
+    fi
+    [[ "$public_ok" == "true" ]] && warn "Runner group '${RUNNER_GROUP_NAME}' allows public repositories - any fork PR could run on it"
+    return 0
+  fi
+
+  local removed
+  removed=$(comm -23 <(printf '%s\n' "$current" | sed '/^$/d') <(printf '%s\n' "$wanted"))
+  if [[ -n "$removed" && "$ALLOW_RUNNER_REPO_REMOVAL" != "true" ]]; then
+    err "RUNNER_GROUP_REPOS would take these repos out of runner group '${RUNNER_GROUP_NAME}': $(echo "$removed" | tr '\n' ' ')"
+    err "  Another environment may rely on them (the group is org-wide). Add them to RUNNER_GROUP_REPOS,"
+    err "  or re-run with --allow-runner-repo-removal. Nothing was changed."
+    return 1
+  fi
+
+  local repo_ids repo id missing_repos=""
+  repo_ids="[]"
+  for repo in $wanted; do
+    out=$(github_api GET "/repos/${org}/${repo}")
+    id=$(printf '%s' "${out%$'\n'*}" | jq -r '.id // empty' 2>/dev/null)
+    if [[ "${out##*$'\n'}" != "200" || -z "$id" ]]; then missing_repos+="${repo} "; continue; fi
+    repo_ids=$(jq -c --argjson i "$id" '. + [$i]' <<<"$repo_ids")
+  done
+  if [[ -n "$missing_repos" ]]; then
+    err "Unknown repos in RUNNER_GROUP_REPOS (or not visible to the GitHub App): ${missing_repos}- nothing changed"
+    return 1
+  fi
+
+  if [[ "$visibility" == "selected" && "$public_ok" != "true" && "$current" == "$wanted" ]]; then
+    info "✓ Runner group '${RUNNER_GROUP_NAME}' already admits exactly the $(jq length <<<"$repo_ids") listed repos"
+    return 0
+  fi
+  out=$(github_api PATCH "/orgs/${org}/actions/runner-groups/${group_id}" \
+    '{"visibility":"selected","allows_public_repositories":false}')
+  [[ "${out##*$'\n'}" == "200" ]] || { err "Could not restrict runner group '${RUNNER_GROUP_NAME}' (HTTP ${out##*$'\n'})"; return 1; }
+  out=$(github_api PUT "/orgs/${org}/actions/runner-groups/${group_id}/repositories" \
+    "$(jq -cn --argjson repo_ids "$repo_ids" '{selected_repository_ids: $repo_ids}')")
+  [[ "${out##*$'\n'}" == "204" ]] || { err "Could not set the repos of runner group '${RUNNER_GROUP_NAME}' (HTTP ${out##*$'\n'})"; return 1; }
+  info "✓ Runner group '${RUNNER_GROUP_NAME}' restricted to $(jq length <<<"$repo_ids") repos (was: ${visibility})"
+  [[ -n "$removed" ]] && info "  removed: $(echo "$removed" | tr '\n' ' ')"
+  info "  Undo: Settings > Actions > Runner groups > ${RUNNER_GROUP_NAME} > Repository access: All"
+  return 0
+}
+
+restrict_runner_group || warn "Runner group access not ensured - see above"
 
 # ============================================================================
 # Phase 4: Validation

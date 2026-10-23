@@ -60,6 +60,9 @@ ACME_EMAIL=<acme-email>
 # Optional — CI runner pod sizing (defaults fit JVM builds on a 64 GiB node; two runners):
 # RUNNER_MEMORY_LIMIT=16Gi
 # DOCKERD_MEMORY_LIMIT=8Gi
+# Recommended — the repos allowed on this org's privileged runners (root on the node); every env
+# sharing the GitHub org carries the same list (github-action-runner.sh, Phase 3b):
+# RUNNER_GROUP_REPOS="<envs-repo> <app-repo> ..."
 # Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
 ```
