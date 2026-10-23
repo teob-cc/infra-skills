@@ -997,6 +997,14 @@ EOF
 }
 
 # --- ArgoCD credential for the Helm charts in Harbor ---------------------------
+# curl config line "user = ..." for user+password, so the password never appears on argv:
+#   curl -K <(provision::curl_user_cfg "$user" "$pass") URL
+provision::curl_user_cfg() {
+  local u="${1//\\/\\\\}" p="${2//\\/\\\\}"
+  u="${u//\"/\\\"}"; p="${p//\"/\\\"}"
+  printf 'user = "%s:%s"\n' "$u" "$p"
+}
+
 # App charts live in Harbor's library project (oci://<harbor-host>/library/charts). Once that
 # project is private (harbor.sh), ArgoCD needs a repository credential: the Secret
 # repo-harbor-charts (type helm, OCI) with the pull-only robot that harbor.sh keeps in
@@ -1004,7 +1012,7 @@ EOF
 # Usage: provision::argocd_harbor_charts_repo HARBOR_HOST [ARGOCD_NS] [HARBOR_NS]
 # Returns 1 (and changes nothing) when the ArgoCD namespace or the robot Secret is missing.
 provision::argocd_harbor_charts_repo() {
-  local harbor_host="$1" argocd_ns="${2:-argocd}" harbor_ns="${3:-harbor}" user pass
+  local harbor_host="$1" argocd_ns="${2:-${NAMESPACE_ARGOCD:-argocd}}" harbor_ns="${3:-harbor}" user pass
   [[ -n "$harbor_host" ]] || { provision::error "argocd_harbor_charts_repo: HARBOR_HOST is required"; return 1; }
   kubectl get ns "$argocd_ns" >/dev/null 2>&1 || return 1
   user=$(kubectl -n "$harbor_ns" get secret harbor-node-pull -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)

@@ -80,6 +80,7 @@ err() { echo "[registry:error] $*" >&2; }
 
 # --- Config defaults ---
 NAMESPACE_HARBOR="${NAMESPACE_HARBOR:-harbor}"
+NAMESPACE_ARGOCD="${NAMESPACE_ARGOCD:-argocd}"
 NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 
 # Version pins. goharbor has no chart for Harbor 2.14.5 (1.18.4 ships 2.14.4), so the chart
@@ -1100,8 +1101,8 @@ ensure_private_projects() {
         return 0
       fi ;;
   esac
-  if kubectl get ns argocd >/dev/null 2>&1 && ! kubectl -n argocd get secret repo-harbor-charts >/dev/null 2>&1; then
-    warn "ArgoCD is installed but argocd/repo-harbor-charts is missing - not making the projects private"
+  if kubectl get ns "$NAMESPACE_ARGOCD" >/dev/null 2>&1 && ! kubectl -n "$NAMESPACE_ARGOCD" get secret repo-harbor-charts >/dev/null 2>&1; then
+    warn "ArgoCD is installed but ${NAMESPACE_ARGOCD}/repo-harbor-charts is missing - not making the projects private"
     return 0
   fi
 
@@ -1146,7 +1147,7 @@ pull_credentials_and_private_projects() {
   [[ -n "$HARBOR_API_PASSWORD" ]] || HARBOR_API_PASSWORD="$HARBOR_ADMIN_PASSWORD"
 
   ensure_node_pull_credentials || return 1
-  if provision::argocd_harbor_charts_repo "$HARBOR_HOST"; then
+  if provision::argocd_harbor_charts_repo "$HARBOR_HOST" "$NAMESPACE_ARGOCD"; then
     info "✓ ArgoCD credential argocd/repo-harbor-charts ensured"
   else
     info "ArgoCD not installed yet - argocd.sh creates argocd/repo-harbor-charts"

@@ -48,7 +48,7 @@ image_exists() {
   kubectl -n harbor get secret harbor-robot-runner >/dev/null 2>&1 || return 1
   user=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.username}' | base64 -d)
   pass=$(kubectl -n harbor get secret harbor-robot-runner -o jsonpath='{.data.password}' | base64 -d)
-  body=$(curl -sS -m 20 -w '\n%{http_code}' -u "${user}:${pass}" \
+  body=$(curl -sS -m 20 -w '\n%{http_code}' -K <(provision::curl_user_cfg "$user" "$pass") \
     "https://${HARBOR_HOST}/api/v2.0/projects/library/repositories/${IMAGE}/artifacts?page_size=1" 2>/dev/null || echo "000")
   code=${body##*$'\n'}
   count=$(printf '%s' "${body%$'\n'*}" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)

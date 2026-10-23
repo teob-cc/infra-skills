@@ -699,7 +699,7 @@ detect_custom_runner_image() {
   # (observed on a fresh registry), so the status code alone is a false positive: require at
   # least one artifact in the response body.
   local api_body api_check artifact_count
-  api_body=$(curl -sS -w '\n%{http_code}' -u "${harbor_user}:${harbor_pass}" \
+  api_body=$(curl -sS -w '\n%{http_code}' -K <(provision::curl_user_cfg "$harbor_user" "$harbor_pass") \
     "https://${harbor_host}/api/v2.0/projects/library/repositories/github-runner/artifacts?page_size=1" 2>/dev/null || echo "000")
   api_check=${api_body##*$'\n'}
   artifact_count=$(printf '%s' "${api_body%$'\n'*}" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo 0)

@@ -6,7 +6,7 @@ set -euo pipefail
 # The worker connects to the master via Tailscale IPs.
 #
 # Usage: join-worker.sh <env> <worker-name> [flags]
-#   e.g.: join-worker.sh cit gpu-worker --ssh-user tim
+#   e.g.: join-worker.sh cit gpu-worker --ssh-user <user>
 #
 # Reads env.properties from envs/<env>/<worker-name>/env.properties
 # Expects: VLAN_IP (Tailscale IP), MASTER_VLAN_IP, MASTER_HOSTNAME, EXTERNAL_IP
@@ -150,7 +150,7 @@ if [[ -n "$SSH_USER" ]]; then
   fi
 fi
 if [[ -z "$SSH_USER" ]]; then
-  for u in admin tim root; do
+  for u in admin root; do
     if ssh "${SSH_OPTS[@]}" "$u@${SSH_HOST}" "true" 2>/dev/null; then
       SSH_USER="$u"
       break
@@ -159,7 +159,7 @@ if [[ -z "$SSH_USER" ]]; then
   # Fall back to Tailscale IP
   if [[ -z "$SSH_USER" ]]; then
     SSH_HOST="$VLAN_IP_ADDR"
-    for u in admin tim root; do
+    for u in admin root; do
       if ssh "${SSH_OPTS[@]}" "$u@${SSH_HOST}" "true" 2>/dev/null; then
         SSH_USER="$u"
         break
@@ -234,7 +234,9 @@ info "Fetching K3s node token from master..."
 MASTER_SSH_HOST="$MASTER_VLAN_IP_ADDR"
 MASTER_NODE_TOKEN=""
 
-for master_user in admin tim root; do
+MASTER_USERS=(admin root)
+[[ -n "${MASTER_SSH_USER:-}" ]] && MASTER_USERS=("$MASTER_SSH_USER" "${MASTER_USERS[@]}")
+for master_user in "${MASTER_USERS[@]}"; do
   MASTER_NODE_TOKEN=$(ssh "${SSH_OPTS[@]}" "${master_user}@${MASTER_SSH_HOST}" \
     "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null || true)
   if [[ -n "$MASTER_NODE_TOKEN" ]]; then
@@ -247,7 +249,7 @@ done
 if [[ -z "$MASTER_NODE_TOKEN" ]]; then
   err "Could not fetch K3s node token from master."
   err "Retrieve it manually: ssh <user>@${MASTER_SSH_HOST} sudo cat /var/lib/rancher/k3s/server/node-token"
-  err "Then set K3S_TOKEN=<token> and re-run."
+  err "Or set MASTER_SSH_USER=<user> (a login with sudo on the master) and re-run."
   exit 1
 fi
 ok "Got K3s node token"
