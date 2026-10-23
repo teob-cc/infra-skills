@@ -420,7 +420,7 @@ ensure_harbor_db_collation || warn "harbor-db collation step failed - see above"
 configure_harbor_resources() {
   local admin_password="$1"
   local api_url="$2"
-  local curl_args=(-sS -k)
+  local curl_args=(-sS)
   
   # Create Docker Hub registry endpoint
   info "Creating Docker Hub proxy registry endpoint..."
@@ -560,7 +560,7 @@ EOF
       err "Response: ${proxy_body}"
       err ""
       err "Manual recovery - run this command:"
-      err "  curl -k -u admin:PASSWORD -H 'Content-Type: application/json' -X POST \\"
+      err "  curl -u admin:PASSWORD -H 'Content-Type: application/json' -X POST \\"
       err "    -d '{\"project_name\":\"dockerhub-proxy\",\"metadata\":{\"public\":\"true\"},\"registry_id\":${registry_id},\"storage_limit\":-1}' \\"
       err "    https://${HARBOR_HOST}/api/v2.0/projects"
     fi
@@ -641,7 +641,7 @@ EOF
 configure_harbor_retention_gc() {
   local admin_password="$1"
   local api_url="$2"
-  local curl_args=(-sS -k)
+  local curl_args=(-sS)
   local keep_last="${HARBOR_RETAIN_LAST_K:-10}"
 
   info "Configuring Harbor tag retention (keep last ${keep_last} per repo) + weekly GC..."
@@ -713,7 +713,7 @@ configure_harbor_oidc() {
   local admin_password="$1"
   local api_url="$2"
   local auth_mode="$3"
-  local curl_args=(-sS -k)
+  local curl_args=(-sS)
   
   info "Configuring Harbor OIDC (current auth_mode: ${auth_mode:-db_auth})..."
   
@@ -786,7 +786,7 @@ configure_harbor() {
   fi
   
   local base_api="https://${HARBOR_HOST}/api/v2.0"
-  local curl_args=(-sS -k)  # Use -k for self-signed certs
+  local curl_args=(-sS)  # publicly trusted cert (cert-manager ACME)
   
   # Wait for Harbor API to be ready (max 10 minutes)
   info "Waiting for Harbor API to be ready..."
@@ -1246,7 +1246,7 @@ validate_deployment() {
     local endpoint_ok=false
     
     while [[ $attempt -lt $max_attempts ]]; do
-      if curl -sSf -k --max-time 10 "https://${HARBOR_HOST}" >/dev/null 2>&1; then
+      if curl -sSf --max-time 10 "https://${HARBOR_HOST}" >/dev/null 2>&1; then
         info "  ✓ Harbor endpoint responding"
         endpoint_ok=true
         break
@@ -1278,7 +1278,7 @@ validate_deployment() {
     warn "  kubectl -n ${NAMESPACE_HARBOR} get pods"
     warn "  kubectl -n ${NAMESPACE_HARBOR} get ingress"
     warn "  kubectl -n ${NAMESPACE_HARBOR} get certificate"
-    warn "  curl -k https://${HARBOR_HOST}"
+    warn "  curl -sSI https://${HARBOR_HOST}"
     warn ""
     return 1
   else

@@ -295,7 +295,7 @@ check_releases() {
   command -v helm >/dev/null 2>&1 || { record "releases" "SKIP" "helm not available" ""; return; }
   local releases count
   releases="$(helm --kube-context "$(kubectl config current-context)" list -A -o json 2>/dev/null)"
-  count="$(echo "$releases" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)"
+  count="$(echo "$releases" | jq -r 'length' 2>/dev/null || echo 0)"
   local manifest="$(provision::envs_root)/shared/versions.yaml"
   if [[ ! -f "$manifest" ]]; then
     record "releases" "SKIP" "$count helm release(s); no upstream versions manifest to compare" \
@@ -303,19 +303,11 @@ check_releases() {
     return
   fi
   local behind
-  behind="$(echo "$releases" | python3 - "$manifest" <<'PY' 2>/dev/null || echo "?"
-import sys, json, re
-releases = json.load(sys.stdin)
-latest = {}
-for line in open(sys.argv[1]):
-    m = re.match(r'\s*([\w.-]+)\s*:\s*([\w.+-]+)', line)
-    if m: latest[m.group(1)] = m.group(2)
-behind = [r["name"] for r in releases
-          if r.get("chart","").rsplit("-",1)[0] in latest
-          and not r.get("chart","").endswith(latest[r["chart"].rsplit("-",1)[0]])]
-print(len(behind))
-PY
-)"
+  behind="$(echo "$releases" | jq --rawfile m "$manifest" '
+    ($m | split("\n") | map(capture("^\\s*(?<k>[\\w.-]+)\\s*:\\s*(?<v>[\\w.+-]+)")? // empty)
+         | map({key: .k, value: .v}) | from_entries) as $latest
+    | [.[] | (.chart // "") as $c | ($c | sub("-[^-]*$"; "")) as $n
+       | select($latest[$n] != null and ($c | endswith($latest[$n]) | not))] | length' 2>/dev/null || echo "?")"
   if [[ "$behind" == "0" ]]; then
     record "releases" "OK" "$count release(s), all at latest known version" ""
   elif [[ "$behind" == "?" ]]; then
@@ -481,7 +473,7 @@ check_floating_images
 check_hardening
 
 # --- Output ----------------------------------------------------------------
-json_escape() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
+json_escape() { jq -n --arg s "$1" '$s'; }
 
 if [[ "$JSON" == true ]]; then
   printf '{\n  "env": %s,\n  "checks": [\n' "$(json_escape "$ENV_NAME")"
