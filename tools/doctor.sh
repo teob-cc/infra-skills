@@ -344,6 +344,34 @@ check_scanning() {
   fi
 }
 
+# --- Check: floating image tags --------------------------------------------
+# A third-party image on :latest / no tag / pull-Always can change, or vanish
+# from its registry, between two pod restarts (boxburn's minio/minio:latest was
+# a 404 on 2026-10-21). WARN on any such image; images that carry a @sha256
+# digest are immutable and never flagged. Our own Harbor images (CI-generated
+# tags, pull-Always by design) are only flagged when they use :latest/no tag.
+check_floating_images() {
+  require_api "image-pins" || return
+  local pods bad n
+  pods="$(kc get pods -A -o json)"
+  bad="$(echo "$pods" | jq -r '
+    .items[] | .metadata as $m
+    | ((.spec.initContainers // []) + .spec.containers)[]
+    | select(.image | contains("@sha256:") | not)
+    | (.image | split("/") | last) as $leaf
+    | (.image | test("^harbor\\.[^/]+/")) as $own
+    | select( ($leaf | (contains(":") | not) or endswith(":latest"))
+              or (($own | not) and .imagePullPolicy == "Always") )
+    | "\($m.namespace)/\($m.name) \(.image)"' 2>/dev/null | sort -u)"
+  if [[ -z "$bad" ]]; then
+    record "image-pins" "OK" "no floating tags (:latest / untagged / third-party pull-Always) without a digest" ""
+    return
+  fi
+  n="$(echo "$bad" | wc -l | tr -d ' ')"
+  record "image-pins" "WARN" "$n pod image(s) on a floating tag: $(echo "$bad" | head -3 | tr '\n' ';')" \
+    "pin to <version>@sha256:<digest> with imagePullPolicy IfNotPresent (full list: kubectl get pods -A -o json | jq -r '.items[].spec.containers[].image' | grep -E ':latest$')"
+}
+
 # --- Check: alert delivery -------------------------------------------------
 # observability.sh installs labelled placeholder Secrets when an environment has no SMTP
 # relay / Telegram bot yet, so Alertmanager starts. That environment evaluates every rule
@@ -393,6 +421,7 @@ check_alerting
 check_tailscale_key
 check_releases
 check_scanning
+check_floating_images
 
 # --- Output ----------------------------------------------------------------
 json_escape() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
