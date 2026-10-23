@@ -116,6 +116,11 @@ The repository uses Argo CD's **Apps-of-Apps pattern** for declarative applicati
 
 1. **Root Application**: Created per environment (e.g., `cit-root`, `dev-root`)
    - Watches `envs/<env-name>/apps/` directory
+   - Skips chart `templates/` (`directory.exclude: '*/templates/*'`): those files belong to the
+     chart's own Application. Plain YAML at a chart's root (e.g. `<app>/pomerium-ingress.yaml`)
+     is rendered by the root only, since Helm renders nothing outside `templates/`
+   - Defined by `envs/<env-name>/argocd/root-app.yaml` when the env repo has one (kept outside
+     `apps/`, applied by `argocd.sh`); otherwise generated with `ARGOCD_ROOT_EXCLUDE`
    - Auto-syncs all Application manifests in that directory
    - Enables GitOps: commit → automatic deployment
 
@@ -237,7 +242,7 @@ tools/k3s/argocd.sh <env-name>
   The script feeds Helm the values `argocd-secret` already holds, so re-runs do not conflict; if
   one still does (a value edited by hand), check the live value and re-run with
   `ARGOCD_FORCE_CONFLICTS=true` (`helm upgrade --force-conflicts`)
-- Creates root application watching `envs/<env-name>/apps/`
+- Creates root application watching `envs/<env-name>/apps/` (skipping chart `templates/`; `envs/<env-name>/argocd/root-app.yaml` wins if present)
 - Auto-sync enabled for GitOps workflow
 
 **Phases**:

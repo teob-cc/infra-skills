@@ -18,6 +18,9 @@ set -euo pipefail
 #   ARGOCD_ADMIN_ENABLED   the built-in local `admin` account (default false: Dex SSO only)
 #   ARGOCD_FORCE_CONFLICTS true = pass --force-conflicts to a server-side-apply upgrade (Helm 4),
 #                          see "argocd-secret and server-side apply" below
+#   ARGOCD_ROOT_EXCLUDE    glob of files under envs/<env>/apps the root app skips (default
+#                          '*/templates/*'; add directory-type apps, e.g. '{*/templates/*,gpu-status/*}').
+#                          Ignored when envs/<env>/argocd/root-app.yaml exists: that file is applied.
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
 # shellcheck disable=SC1091
@@ -75,6 +78,7 @@ ARGOCD_IMAGE_TAG="${ARGOCD_IMAGE_TAG-v3.3.17}"
 # with ARGOCD_ADMIN_ENABLED=true and set a password (see the summary at the end).
 ARGOCD_ADMIN_ENABLED="${ARGOCD_ADMIN_ENABLED:-false}"
 ARGOCD_FORCE_CONFLICTS="${ARGOCD_FORCE_CONFLICTS:-false}"
+ARGOCD_ROOT_EXCLUDE="${ARGOCD_ROOT_EXCLUDE:-*/templates/*}"
 
 # Derive hosts from HOSTNAME if not provided
 if [[ -n "${HOSTNAME:-}" ]]; then
@@ -624,8 +628,24 @@ YAML
     warn "No harbor/harbor-node-pull secret yet - repo-harbor-charts not created; run tools/k3s/harbor.sh ${ENV_NAME}"
   fi
 
-  # Create root application (apps-of-apps pattern)
-  info "Creating root application for ${ENV_NAME}..."
+  # Create root application (apps-of-apps pattern).
+  # The root renders envs/<env>/apps recursively: the <app>-app.yaml Applications plus plain
+  # manifests no other Application renders (chart-root files such as <app>/pomerium-ingress.yaml;
+  # Helm renders only templates/). It must NOT read a chart's templates/ as plain YAML: those
+  # objects belong to the chart's own Application, and reading them here double-claims them
+  # (SharedResourceWarning; with prune on both apps, either one can delete them) and puts
+  # namespace-less copies into the argocd namespace. ArgoCD matches the exclude glob against the
+  # path relative to apps/ with no separators, so '*' crosses '/'.
+  # An env repo can own the definition: envs/<env>/argocd/root-app.yaml is applied as-is when it
+  # exists (keep it outside apps/ so the root cannot prune itself).
+  local root_app_file="$ENVS_ROOT/${ENV_NAME}/argocd/root-app.yaml"
+  if [[ -f "$root_app_file" ]]; then
+    info "Applying root application from ${root_app_file}..."
+    kubectl apply -f "$root_app_file"
+    info "✓ Root application applied from the env repo"
+    return 0
+  fi
+  info "Creating root application for ${ENV_NAME} (exclude: ${ARGOCD_ROOT_EXCLUDE})..."
   kubectl apply -f - <<YAML
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -640,6 +660,7 @@ spec:
     path: envs/${ENV_NAME}/apps
     directory:
       recurse: true
+      exclude: '${ARGOCD_ROOT_EXCLUDE}'
   destination:
     server: https://kubernetes.default.svc
     namespace: ${NAMESPACE_ARGOCD}
