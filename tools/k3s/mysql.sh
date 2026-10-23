@@ -696,17 +696,18 @@ dump_table() {
   info "Dumping table: ${database}.${table_name}"
   info "Pod: ${mysql_pod}"
 
+  # Password goes over stdin into MYSQL_PWD inside the pod, never on an argv (INFRA-36)
   # Perform the dump
   if [[ -n "$output_file" ]]; then
     info "Output file: ${output_file}"
-    kubectl -n "$namespace" exec "$mysql_pod" -- mysqldump -uroot -p"${root_pass}" "$database" "$table_name" --no-create-db --skip-lock-tables > "$output_file" || {
+    kubectl -n "$namespace" exec -i "$mysql_pod" -- sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec mysqldump "$@"' mysqldump -uroot "$database" "$table_name" --no-create-db --skip-lock-tables <<< "$root_pass" > "$output_file" || {
       err "Failed to dump table"
       exit 1
     }
     info "Table dumped to: ${output_file}"
   else
     info "Dumping to stdout..."
-    kubectl -n "$namespace" exec "$mysql_pod" -- mysqldump -uroot -p"${root_pass}" "$database" "$table_name" --no-create-db --skip-lock-tables || {
+    kubectl -n "$namespace" exec -i "$mysql_pod" -- sh -c 'IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec mysqldump "$@"' mysqldump -uroot "$database" "$table_name" --no-create-db --skip-lock-tables <<< "$root_pass" || {
       err "Failed to dump table"
       exit 1
     }
