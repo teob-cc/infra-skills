@@ -130,6 +130,15 @@ if [[ -z "${EXTERNAL_IP:-}" ]]; then
   exit 1
 fi
 
+# harborAdminPassword only seeds the admin account when Harbor's database is created; setting a
+# new one on an upgrade changes the harbor-core Secret but not the account, and every API call
+# this script makes afterwards (it reads the Secret) is refused. So a re-run keeps the
+# installed value unless HARBOR_ADMIN_PASSWORD is given explicitly.
+if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" ]]; then
+  HARBOR_ADMIN_PASSWORD=$(kubectl -n "$NAMESPACE_HARBOR" get secret harbor-core \
+    -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  [[ -n "$HARBOR_ADMIN_PASSWORD" ]] && info "Keeping the admin password of the installed Harbor (harbor/harbor-core)"
+fi
 if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" ]]; then
   info "HARBOR_ADMIN_PASSWORD not set - generating random password..."
   HARBOR_ADMIN_PASSWORD=$(openssl rand -base64 32 | tr -d '\n')
