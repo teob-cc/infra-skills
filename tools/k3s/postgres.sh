@@ -166,9 +166,15 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${POSTGRES_STORAGE_SIZE:=50Gi}"
 : "${POSTGRES_INSTANCES:=1}"
 : "${ENFORCE_POMERIUM:=true}"
-# PostgreSQL image - must be CNPG-compatible (requires specific version tag format)
-# Use ghcr.io/cloudnative-pg/postgresql for vanilla PG, or ghcr.io/tensorchord/cloudnative-pgvecto.rs for pgvector
-: "${POSTGRES_IMAGE:=ghcr.io/cloudnative-pg/postgresql:16.6}"
+# PostgreSQL operand image (CNPG postgres-containers). Use the immutable
+# MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
+# "system" images on Debian bullseye, slated for removal upstream. "standard" = minimal +
+# pgvector, pgaudit, pg_failover_slots, all locales; it needs no Barman binaries
+# because these clusters back up with pg_dump CronJobs, not barmanObjectStore.
+# 16.15-202610190958-standard-trixie = sha256:f105e137d731f6ac4f69667383f2373345ce8b72dadcc10ab6d385a7a32d6e7f
+# (pgvector 0.8.7, glibc 2.41). Like the operator, a running cluster keeps its image;
+# a changed POSTGRES_IMAGE only warns (see create_postgres_cluster).
+: "${POSTGRES_IMAGE:=ghcr.io/cloudnative-pg/postgresql:16.15-202610190958-standard-trixie}"
 
 # CloudNativePG operator settings
 # Note: CNPG_VERSION is the Helm chart version, not the operator version
@@ -1116,6 +1122,15 @@ create_postgres_cluster() {
     local phase
     phase=$(kubectl -n "$NAMESPACE_POSTGRES" get cluster postgres-cluster -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
     info "Cluster phase: ${phase}"
+
+    # The image is never changed here: a new imageName restarts the instance. Say so.
+    local live_image
+    live_image=$(kubectl -n "$NAMESPACE_POSTGRES" get cluster postgres-cluster -o jsonpath='{.spec.imageName}' 2>/dev/null || true)
+    if [[ -n "$live_image" && "$live_image" != "$POSTGRES_IMAGE" ]]; then
+      warn "postgres-cluster runs ${live_image}; POSTGRES_IMAGE is ${POSTGRES_IMAGE}. Not changing it here."
+      warn "  Back up, then (restarts the instance; same major only, a major upgrade needs its own plan):"
+      warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '{\"spec\":{\"imageName\":\"${POSTGRES_IMAGE}\"}}'"
+    fi
 
     # Ensure required secrets exist (CloudNativePG operator should create them but sometimes doesn't)
     if ! kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser >/dev/null 2>&1; then
