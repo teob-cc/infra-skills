@@ -224,6 +224,19 @@ tools/k3s/argocd.sh <env-name>
 **Key Features**:
 - Disables embedded Dex (uses external Dex from `identity.sh`)
 - Configures RBAC: GitHub org admins → Argo CD admin role
+- The built-in local `admin` account is off (`admin.enabled: false`) and
+  `argocd-initial-admin-secret` is deleted: everyone logs in through Dex. Break-glass:
+  `ARGOCD_ADMIN_ENABLED=true tools/k3s/argocd.sh <env>`, then set a bcrypt password in
+  `argocd-secret` (the script's summary prints the command)
+- Version pins `ARGOCD_CHART_VERSION` (9.4.15) and `ARGOCD_IMAGE_TAG` (v3.3.17): argo-helm has no
+  chart for ArgoCD 3.3.10+ yet, so the image tag is overridden on the 9.4.15 chart. Clear
+  `ARGOCD_IMAGE_TAG` once a chart ships the wanted version
+- The Dex client secret and the GitHub webhook secret reach `argocd-secret` through the Helm
+  values (`configs.secret`), not a `kubectl patch`. Helm 4 upgrades server-side, and a field
+  last written by `kubectl patch` with a different value is a conflict that stops the upgrade.
+  The script feeds Helm the values `argocd-secret` already holds, so re-runs do not conflict; if
+  one still does (a value edited by hand), check the live value and re-run with
+  `ARGOCD_FORCE_CONFLICTS=true` (`helm upgrade --force-conflicts`)
 - Creates root application watching `envs/<env-name>/apps/`
 - Auto-sync enabled for GitOps workflow
 

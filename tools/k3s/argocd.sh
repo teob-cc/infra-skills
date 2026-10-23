@@ -11,6 +11,13 @@ set -euo pipefail
 #
 # Usage:
 #   tools/k3s/argocd.sh <env-name>
+#
+# Environment (env.properties or the shell):
+#   ARGOCD_CHART_VERSION   argo-cd Helm chart version (default below)
+#   ARGOCD_IMAGE_TAG       ArgoCD image tag for every component; empty = the chart's appVersion
+#   ARGOCD_ADMIN_ENABLED   the built-in local `admin` account (default false: Dex SSO only)
+#   ARGOCD_FORCE_CONFLICTS true = pass --force-conflicts to a server-side-apply upgrade (Helm 4),
+#                          see "argocd-secret and server-side apply" below
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
 # shellcheck disable=SC1091
@@ -56,6 +63,18 @@ err() { echo "[gitops:error] $*" >&2; }
 # --- Config defaults ---
 NAMESPACE_ARGOCD="${NAMESPACE_ARGOCD:-argocd}"
 NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
+
+# Version pins. argo-helm has no chart for ArgoCD 3.3.10+ yet, so the chart stays on 9.4.15
+# (app 3.3.4) and every component's image is overridden to 3.3.17, which carries the fixes for
+# the 2026-10-07 repo-server advisories; 3.3.4 -> 3.3.17 changes no CRDs. Move to the chart that
+# ships the tag once it exists, and clear ARGOCD_IMAGE_TAG then.
+ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-9.4.15}"
+ARGOCD_IMAGE_TAG="${ARGOCD_IMAGE_TAG-v3.3.17}"
+# The built-in `admin` account is off: Dex SSO is configured below and the org's admins team
+# maps to role:admin, so the script deletes argocd-initial-admin-secret. Break-glass: re-run
+# with ARGOCD_ADMIN_ENABLED=true and set a password (see the summary at the end).
+ARGOCD_ADMIN_ENABLED="${ARGOCD_ADMIN_ENABLED:-false}"
+ARGOCD_FORCE_CONFLICTS="${ARGOCD_FORCE_CONFLICTS:-false}"
 
 # Derive hosts from HOSTNAME if not provided
 if [[ -n "${HOSTNAME:-}" ]]; then
@@ -309,17 +328,45 @@ provision_argocd() {
   info "  Dex issuer: ${dex_issuer}"
   info "  GitHub org: ${github_org}"
   
-  # Render Helm values
+  # Render Helm values. They carry the Dex client secret and the webhook secret, so the file
+  # is private to this user and removed on exit.
   local values_file
-  values_file=$(mktemp -t argocd-values-XXXX.yaml)
-  
-  cat <<YAML > "$values_file"
+  values_file=$(umask 077; mktemp -t argocd-values-XXXX.yaml)
+  # shellcheck disable=SC2064  # expand now: values_file is local to this function
+  trap "rm -f '$values_file'" EXIT
+
+  # argocd-secret and server-side apply. Helm 4 applies releases server-side (SSA), and a
+  # field another manager wrote is a conflict for it unless Helm applies the same value.
+  # Earlier versions of this script set oidc.default.clientSecret and webhook.github.secret
+  # with `kubectl patch` after the install (field manager kubectl-patch); a release whose
+  # values carried a different webhook secret then failed to upgrade with a conflict on
+  # argocd-secret. Helm now owns both fields through the values below (configs.secret), fed
+  # with the values argocd-secret already holds, so a re-run applies them unchanged and does
+  # not conflict. If an upgrade still stops on a conflict (a value was changed by hand), check
+  # the value in argocd-secret is the one wanted and re-run with ARGOCD_FORCE_CONFLICTS=true:
+  # Helm takes the fields over (--force-conflicts).
+  {
+    cat <<YAML
+global:
+  domain: ${ARGOCD_HOST}
+YAML
+    if [[ -n "$ARGOCD_IMAGE_TAG" ]]; then
+      cat <<YAML
+  image:
+    tag: ${ARGOCD_IMAGE_TAG}
+YAML
+    fi
+    cat <<YAML
 configs:
   params:
     server.insecure: true
+  secret:
+    githubSecret: "${ARGOCD_WEBHOOK_SECRET}"
+    extra:
+      oidc.default.clientSecret: "${DEX_CLIENT_SECRET}"
   cm:
     url: https://${ARGOCD_HOST}
-    admin.enabled: "true"
+    admin.enabled: "${ARGOCD_ADMIN_ENABLED}"
 
     # Reconciliation cadence. Default upstream is 180s. We keep it tight (10s) so that
     # non-webhook-driven changes (manual edits, ConfigMap drift, missed webhooks) get
@@ -392,14 +439,8 @@ dex:
   enabled: false
 
 server:
-  insecure: true
   service:
     type: ClusterIP
-
-global:
-  domain: ${ARGOCD_HOST}
-
-server:
   # No direct ingress: argocd-server is reached via Pomerium (SSO / GitHub-team gate).
   # The Pomerium ingress for ${ARGOCD_HOST} is created below (in the sso namespace);
   # the Pomerium route lives in envs/<env>/pomerium-routes.yaml. argocd-server runs with
@@ -407,26 +448,32 @@ server:
   ingress:
     enabled: false
 YAML
-  
+  } > "$values_file"
+
+  local helm_args=(--namespace "$NAMESPACE_ARGOCD" --version "$ARGOCD_CHART_VERSION" --wait --timeout 10m)
+  [[ "$ARGOCD_FORCE_CONFLICTS" == "true" ]] && helm_args+=(--force-conflicts)
+  info "  Chart argo-cd ${ARGOCD_CHART_VERSION}, image ${ARGOCD_IMAGE_TAG:-<chart appVersion>}, admin account enabled: ${ARGOCD_ADMIN_ENABLED}"
+
   # Check if Argo CD is already installed to avoid updating ingress
   if helm list -n "$NAMESPACE_ARGOCD" 2>/dev/null | grep -q "^argocd"; then
-    info "Argo CD already installed - updating without modifying ingress..."
-    # Reuse existing ingress configuration to avoid triggering cert-manager
-    helm upgrade --install argocd argo-cd/argo-cd \
-      --namespace "$NAMESPACE_ARGOCD" \
-      --wait \
-      --timeout 10m \
-      --reuse-values \
-      -f "$values_file"
-    info "  Note: Ingress not updated to avoid cert-manager rate limits"
+    info "Argo CD already installed - upgrading (release values reused, script values on top)..."
+    if ! helm upgrade --install argocd argo-cd/argo-cd "${helm_args[@]}" --reuse-values -f "$values_file"; then
+      err "helm upgrade of argocd failed. A 'conflict' on argocd-secret means a field Helm sets was"
+      err "changed by another manager (kubectl patch/edit); see the comment above the values in"
+      err "this script, then re-run with ARGOCD_FORCE_CONFLICTS=true."
+      exit 1
+    fi
   else
     info "Installing Argo CD via Helm..."
-    helm upgrade --install argocd argo-cd/argo-cd \
-      --namespace "$NAMESPACE_ARGOCD" \
-      --create-namespace \
-      --wait \
-      --timeout 10m \
-      -f "$values_file"
+    helm upgrade --install argocd argo-cd/argo-cd "${helm_args[@]}" --create-namespace -f "$values_file"
+  fi
+  rm -f "$values_file"
+  trap - EXIT
+
+  if [[ "$ARGOCD_ADMIN_ENABLED" != "true" ]]; then
+    # The initial admin password is useless with the account off; don't leave it lying around.
+    kubectl -n "$NAMESPACE_ARGOCD" delete secret argocd-initial-admin-secret --ignore-not-found >/dev/null
+    info "  ✓ Built-in admin account disabled (Dex SSO only); argocd-initial-admin-secret removed"
   fi
   
   # Pomerium ingress for the Argo CD UI/API (argocd-server has no direct ingress).
@@ -473,16 +520,9 @@ YAML
   # Remove a leftover direct argocd-server ingress from older installs (now disabled in Helm values).
   kubectl -n "$NAMESPACE_ARGOCD" delete ingress argocd-server --ignore-not-found
 
-  # Store Dex client secret and GitHub webhook secret in argocd-secret.
-  # We patch these post-install rather than rendering them into Helm values,
-  # because the values file is committed to disk via heredoc and any ${VAR}
-  # references would be passed through verbatim to argocd-secret without
-  # substitution (no envsubst pass).
-  info "Configuring OIDC client secret and GitHub webhook secret..."
-  kubectl -n "$NAMESPACE_ARGOCD" patch secret argocd-secret \
-    -p "{\"stringData\":{\"oidc.default.clientSecret\":\"${DEX_CLIENT_SECRET}\",\"webhook.github.secret\":\"${ARGOCD_WEBHOOK_SECRET}\"}}" \
-    --type=merge
-  
+  # The Dex client secret and the webhook secret are in argocd-secret through the Helm values
+  # (configs.secret) - no kubectl patch, which is what made upgrades conflict under SSA.
+
   # Restart Argo CD server to pick up OIDC configuration
   info "Restarting Argo CD server to apply OIDC configuration..."
   kubectl -n "$NAMESPACE_ARGOCD" rollout restart deployment/argocd-server
@@ -491,9 +531,6 @@ YAML
   kubectl -n "$NAMESPACE_ARGOCD" rollout status deploy/argocd-server --timeout=600s || true
   kubectl -n "$NAMESPACE_ARGOCD" rollout status deploy/argocd-repo-server --timeout=600s || true
   kubectl -n "$NAMESPACE_ARGOCD" rollout status deploy/argocd-applicationset-controller --timeout=600s || true
-  
-  # Cleanup temp file
-  rm -f "$values_file"
   
   info "✓ Argo CD provisioned successfully"
 }
@@ -747,7 +784,7 @@ info ""
 info "GitHub Webhook (for instant sync on push):"
 info "  Webhook URL: https://${ARGOCD_HOST}/api/webhook"
 info "  Content type: application/json"
-info "  Secret: $(kubectl -n ${NAMESPACE_ARGOCD} get secret argocd-secret -o jsonpath='{.data.webhook\.github\.secret}' 2>/dev/null | base64 -d || echo '<not set>')"
+info "  Secret: kubectl -n ${NAMESPACE_ARGOCD} get secret argocd-secret -o jsonpath='{.data.webhook\\.github\\.secret}' | base64 -d"
 info "  Events: Just the push event"
 info ""
 info "Sync Behavior:"
@@ -761,6 +798,14 @@ info "  2. Login with GitHub SSO"
 info "  3. Configure GitHub webhook in repo Settings > Webhooks"
 info "  4. Root application will auto-sync apps from envs/${ENV_NAME}/apps"
 info ""
-info "To get admin password (for emergency access):"
-info "  kubectl -n ${NAMESPACE_ARGOCD} get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+if [[ "$ARGOCD_ADMIN_ENABLED" == "true" ]]; then
+  info "Built-in admin account: ENABLED (ARGOCD_ADMIN_ENABLED=true). Initial password, if not yet changed:"
+  info "  kubectl -n ${NAMESPACE_ARGOCD} get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d"
+else
+  info "Built-in admin account: disabled - log in with Dex SSO. Break-glass, when SSO is down:"
+  info "  1. ARGOCD_ADMIN_ENABLED=true tools/k3s/argocd.sh ${ENV_NAME}"
+  info "  2. kubectl -n ${NAMESPACE_ARGOCD} patch secret argocd-secret --type merge -p \\"
+  info "       '{\"stringData\":{\"admin.password\":\"<bcrypt from: argocd account bcrypt --password ...>\",\"admin.passwordMtime\":\"<date -u +%FT%TZ>\"}}'"
+  info "  3. Re-run without ARGOCD_ADMIN_ENABLED afterwards to switch it off again."
+fi
 info ""

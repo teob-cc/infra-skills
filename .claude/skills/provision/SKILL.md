@@ -171,6 +171,10 @@ tools/k3s/argocd.sh <env>
 The GitOps repo URL defaults to `https://github.com/<your-github-org>/infra-envs.git` (org taken
 from `github-oauth-credentials.yaml`). Override with `GITOPS_REPO_URL` in `env.properties` (or a
 `REPO_URL` environment variable) if your envs repo is named or hosted differently.
+ArgoCD comes up on the pinned `ARGOCD_CHART_VERSION`/`ARGOCD_IMAGE_TAG` with the built-in `admin`
+account off: log in with Dex SSO (the org's `admins` team is `role:admin`). Break-glass access and
+the `ARGOCD_FORCE_CONFLICTS` route for a server-side-apply conflict on `argocd-secret` are in
+docs/GITOPS.md.
 
 ### Step 7 — Observability + MySQL (independent, any order)
 
