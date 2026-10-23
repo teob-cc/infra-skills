@@ -235,6 +235,24 @@ stringData:
   chat_id: "<telegram-chat-id>"
 ```
 
+Optional, dead-man's switch. Nothing inside the cluster can report that Alertmanager, Prometheus
+or the node itself is down. With this Secret, Alertmanager POSTs the always-firing `Watchdog`
+alert to a heartbeat URL every minute or two (healthchecks.io, Cronitor, Better Stack…), and
+that service pages through its own channel when the heartbeats stop: set its period to 5 min
+and grace to 10 min. Without it the Watchdog goes to a null receiver.
+`envs/<env>/secrets.plain/alertmanager-deadman.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-deadman
+  namespace: observability
+type: Opaque
+stringData:
+  url: "<heartbeat-ping-url>"
+```
+
 Also confirm the operator has: an SSH key (`~/.ssh/id_ed25519`) and the CLIs
 `kubectl helm sops age yq jq curl`.
 

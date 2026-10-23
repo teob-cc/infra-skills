@@ -158,6 +158,21 @@ POSTGRES_SIZE_ALERT_EXCLUDE="${POSTGRES_SIZE_ALERT_EXCLUDE:-}"
 # smtp_auth_password_file.
 ALERTMANAGER_SMTP_HOST="${ALERTMANAGER_SMTP_HOST:-smtp.resend.com:465}"
 
+# Dead-man's switch for the alerting pipeline itself. The infra-alerting group fires
+# an always-on Watchdog alert; when a heartbeat URL is configured, Alertmanager POSTs
+# it to that URL every minute or two (healthchecks.io, Cronitor, Better Stack
+# heartbeats and similar all accept a POST). The external service pages you when the
+# heartbeats stop, which is the only way to learn that Prometheus, Alertmanager or the
+# whole node is down: nothing inside the cluster can report its own death.
+# Off by default. Two ways to switch it on:
+#   - apply a Secret `alertmanager-deadman` (namespace observability, key `url`) via
+#     SOPS like alertmanager-telegram -- preferred, the URL is a credential;
+#   - export ALERTMANAGER_DEADMAN_URL before running this script; the script writes
+#     it into that Secret. Keep it out of env.properties, which is committed in plain.
+# With neither, the Watchdog goes to a null receiver and is visible only in the
+# Alertmanager UI.
+ALERTMANAGER_DEADMAN_URL="${ALERTMANAGER_DEADMAN_URL:-}"
+
 # Public endpoints probed end-to-end by the blackbox exporter, space-separated, set
 # per env in envs/<env>/env.properties. Empty (the default) skips the exporter and the
 # scrape job entirely, so envs that have not opted in are unaffected. The shared
@@ -1075,7 +1090,39 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   # kafka-journal stack namespaces (redpanda.sh / scylla.sh)
   NAMESPACE_REDPANDA="${NAMESPACE_REDPANDA:-redpanda}"
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
-  
+  # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
+  NAMESPACE_MYSQL="${NAMESPACE_MYSQL:-mysql}"
+
+  # Dead-man's switch (see ALERTMANAGER_DEADMAN_URL above). The Secret must exist
+  # before the chart mounts it, so this runs ahead of the values file.
+  DEADMAN_ENABLED=false
+  if [[ -n "$ALERTMANAGER_DEADMAN_URL" ]]; then
+    info "Writing ALERTMANAGER_DEADMAN_URL into Secret ${NAMESPACE_OBSERVABILITY}/alertmanager-deadman"
+    kubectl -n "$NAMESPACE_OBSERVABILITY" create secret generic alertmanager-deadman \
+      --from-literal=url="$ALERTMANAGER_DEADMAN_URL" --dry-run=client -o yaml \
+      | kubectl apply -f - >/dev/null
+    DEADMAN_ENABLED=true
+  elif kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-deadman >/dev/null 2>&1; then
+    DEADMAN_ENABLED=true
+  fi
+  if [[ "$DEADMAN_ENABLED" == "true" ]]; then
+    info "Dead-man's switch on: Watchdog heartbeats go to the URL in Secret alertmanager-deadman"
+    WATCHDOG_RECEIVER="deadman"
+    DEADMAN_SECRET_MOUNT="    - name: deadman-url
+      mountPath: /etc/alertmanager/deadman
+      secretName: alertmanager-deadman
+      readOnly: true"
+    DEADMAN_RECEIVER_BLOCK="      - name: deadman
+        webhook_configs:
+          - url_file: /etc/alertmanager/deadman/url
+            send_resolved: false"
+  else
+    info "No dead-man's switch configured (Secret alertmanager-deadman absent); Watchdog goes to a null receiver"
+    WATCHDOG_RECEIVER="watchdog-null"
+    DEADMAN_SECRET_MOUNT=""
+    DEADMAN_RECEIVER_BLOCK=""
+  fi
+
   # Create Prometheus values with PostgreSQL exporter scrape config
   prometheus_values=$(mktemp -t prometheus-values-XXXX.yaml)
   trap 'rm -f "$prometheus_values"' EXIT
@@ -1213,6 +1260,52 @@ ${BLACKBOX_SCRAPE_JOB_POST}
         target_label: service
       - source_labels: [__meta_kubernetes_pod_name]
         target_label: pod
+  # mysqld-exporter deployed by tools/k3s/mysql.sh (Service mysql-exporter, port
+  # 'metrics' :9104). The Service carries no prometheus.io/scrape annotation, so the
+  # chart's kubernetes-service-endpoints job skips it; without this job MySQL is
+  # unmonitored. Inert in envs without the MySQL stack.
+  - job_name: 'mysql-exporter'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - ${NAMESPACE_MYSQL}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: mysql-exporter
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_service_name]
+        target_label: service
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+  # Alertmanager's own metrics (notification failures, config reloads). The chart
+  # does not scrape it, so a Telegram outage or a rejected message was invisible.
+  # Matches the regular Service only; the -headless one fronts the same pod.
+  - job_name: 'alertmanager'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - ${NAMESPACE_OBSERVABILITY}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_label_app_kubernetes_io_name]
+        action: keep
+        regex: alertmanager
+      - source_labels: [__meta_kubernetes_service_name]
+        action: drop
+        regex: .*-headless
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: http
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
 
 alertmanager:
   enabled: true
@@ -1233,6 +1326,7 @@ alertmanager:
       mountPath: /etc/alertmanager/telegram
       secretName: alertmanager-telegram
       readOnly: true
+${DEADMAN_SECRET_MOUNT}
   config:
     global:
       smtp_smarthost: ${ALERTMANAGER_SMTP_HOST}
@@ -1247,6 +1341,14 @@ alertmanager:
       group_interval: 5m
       repeat_interval: 4h
       routes:
+        # The always-firing Watchdog (infra-alerting group) must never reach a human
+        # channel: it goes to the dead-man heartbeat when one is configured, else to
+        # a null receiver. First route, no continue.
+        - matchers: [alertname="Watchdog"]
+          receiver: ${WATCHDOG_RECEIVER}
+          group_wait: 0s
+          group_interval: 1m
+          repeat_interval: 1m
         - matchers: [severity="p1"]
           receiver: ops-email
           group_wait: 0s
@@ -1291,6 +1393,8 @@ alertmanager:
               {{ range .Alerts }}{{ .Annotations.summary }}
               {{ if .Annotations.runbook }}runbook: {{ .Annotations.runbook }}{{ end }}
               {{ end }}
+      - name: watchdog-null
+${DEADMAN_RECEIVER_BLOCK}
     inhibit_rules:
       - source_matchers: [severity="p1"]
         target_matchers: [severity=~"p2|p3"]
@@ -1443,6 +1547,265 @@ serverFiles:
                 Either the node-exporter textfile collector lost its config, the stamp
                 files under /var/lib/node_exporter/textfile were removed, or the crontab
                 no longer calls /usr/local/bin/nas-backup-stamp (tools/backup.sh).
+
+      # Hardware watchdog: software RAID, NVMe controllers, filesystems remounted
+      # read-only, ECC memory, temperatures. All from node-exporter collectors that
+      # are on by default (mdadm, nvme, filesystem, edac, hwmon); no extra daemon.
+      # mdadm on the hosts has no mail transport, so a dead RAID member is otherwise
+      # silent: a node can run on a single disk for weeks without anyone noticing.
+      # node_md_state also reports "check", "resync" and "recovering" -- the monthly
+      # checkarray scrub and a rebuild after a disk swap -- which are normal; only
+      # "inactive" means the array is down. Loss of redundancy is node_md_degraded.
+      # SMART wear and media-error counters need smartctl (a textfile-collector
+      # script); not wired yet.
+      - name: infra-hardware
+        interval: 1m
+        rules:
+          - alert: MdRaidDegraded
+            expr: node_md_degraded > 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "RAID {{ \$labels.device }} on {{ \$labels.instance }} degraded ({{ \$value }} disk(s) missing)"
+              description: |
+                Software RAID {{ \$labels.device }} on {{ \$labels.instance }} has lost redundancy:
+                the next disk failure loses the data on it. Check \`cat /proc/mdstat\` and
+                \`mdadm --detail /dev/{{ \$labels.device }}\` on the node, open a disk-replacement
+                ticket with the hosting provider, and re-add the new disk with mdadm.
+                Silence this in Alertmanager (with an expiry) while the swap is scheduled.
+          - alert: MdRaidDiskFailed
+            expr: node_md_disks{state="failed"} > 0
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "RAID {{ \$labels.device }} on {{ \$labels.instance }} has {{ \$value }} failed member(s)"
+              description: |
+                mdadm marked a member of {{ \$labels.device }} on {{ \$labels.instance }} as faulty.
+                If MdRaidDegraded is not firing a spare took over; replace the failed disk and
+                \`mdadm --remove\` the faulty member either way.
+          - alert: MdRaidInactive
+            expr: node_md_state{state="inactive"} == 1
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "RAID {{ \$labels.device }} on {{ \$labels.instance }} is inactive"
+              description: |
+                Software RAID {{ \$labels.device }} on {{ \$labels.instance }} is not running.
+                Anything on it (LVM volumes, /boot) is unavailable. Check /proc/mdstat.
+          - alert: MdRaidRebuildStuck
+            expr: node_md_state{state=~"recovering|resync"} == 1
+            for: 24h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "RAID {{ \$labels.device }} on {{ \$labels.instance }} in {{ \$labels.state }} for over 24h"
+              description: |
+                A rebuild or resync of {{ \$labels.device }} normally finishes within hours.
+                Check /proc/mdstat for progress and the kernel log for I/O errors on the
+                remaining member.
+          - alert: NvmeControllerNotLive
+            expr: node_nvme_info{state!="live"} == 1
+            for: 10m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "NVMe {{ \$labels.device }} ({{ \$labels.model }}) on {{ \$labels.instance }} is {{ \$labels.state }}"
+              description: |
+                The kernel reports NVMe controller {{ \$labels.device }} (serial {{ \$labels.serial }})
+                as {{ \$labels.state }}. A dead controller has dropped out of every RAID array it
+                was in. Give the serial to the hosting provider when requesting the swap.
+          - alert: NodeFilesystemReadOnly
+            expr: |
+              node_filesystem_readonly{fstype=~"ext[234]|xfs|btrfs",mountpoint!~"/var/lib/kubelet/.*|/run/.*|/snap/.*"} == 1
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "{{ \$labels.mountpoint }} on {{ \$labels.instance }} is read-only"
+              description: |
+                {{ \$labels.device }} at {{ \$labels.mountpoint }} on {{ \$labels.instance }} is mounted
+                read-only. ext4 remounts itself read-only on I/O errors (errors=remount-ro), so this
+                usually means the disk underneath is failing. Every write to it fails until fixed.
+          - alert: NodeMemoryUncorrectableErrors
+            expr: increase(node_edac_uncorrectable_errors_total[1h]) > 0
+            for: 0m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Uncorrectable ECC memory errors on {{ \$labels.instance }}"
+              description: |
+                EDAC controller {{ \$labels.controller }} on {{ \$labels.instance }} logged
+                uncorrectable memory errors in the last hour. Data may have been corrupted; ask
+                the hosting provider for a memory check.
+          - alert: NodeMemoryCorrectableErrorsHigh
+            expr: increase(node_edac_correctable_errors_total[24h]) > 10
+            for: 0m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Correctable ECC memory errors rising on {{ \$labels.instance }}"
+              description: |
+                EDAC controller {{ \$labels.controller }} on {{ \$labels.instance }} corrected more than
+                10 memory errors in 24h. A DIMM is degrading; plan a replacement.
+          - alert: NodeHardwareTemperatureCritical
+            expr: |
+              node_hwmon_temp_celsius
+                >= on (instance, chip, sensor) (node_hwmon_temp_crit_celsius > 0)
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.chip }}/{{ \$labels.sensor }} on {{ \$labels.instance }} at its critical temperature"
+              description: |
+                Sensor {{ \$labels.sensor }} of {{ \$labels.chip }} on {{ \$labels.instance }} reads
+                {{ \$value }}°C, at or above its critical threshold. NVMe drives throttle and then
+                shut down; CPUs throttle.
+          - alert: NodeTextfileScrapeError
+            expr: node_textfile_scrape_error == 1
+            for: 30m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "node-exporter cannot parse a textfile metric on {{ \$labels.instance }}"
+              description: |
+                A file under /var/lib/node_exporter/textfile is malformed, so the stamp metrics
+                it carries (NAS backups, Scylla snapshots) are missing or stale. Check the
+                node-exporter log for the file name.
+
+      # Alerting-pipeline watchdog. Without these, a Telegram outage, a message
+      # Telegram rejects, or a dead Alertmanager looks exactly like "nothing firing".
+      # Watchdog always fires; Alertmanager routes it to the dead-man heartbeat (see
+      # ALERTMANAGER_DEADMAN_URL) or to a null receiver. Only that external heartbeat
+      # can report AlertmanagerDown or a dead node: an alert about the pipeline that
+      # cannot deliver alerts is visible in the Alertmanager and Grafana UIs only.
+      - name: infra-alerting
+        interval: 1m
+        rules:
+          - alert: Watchdog
+            expr: vector(1)
+            labels: { severity: none, app: infra }
+            annotations:
+              summary: "Always firing: proves Prometheus -> Alertmanager -> heartbeat works"
+              description: |
+                This alert is meant to fire all the time. Alertmanager forwards it to the
+                dead-man heartbeat URL, and the external service pages when it stops arriving.
+          - alert: AlertmanagerDown
+            expr: up{job="alertmanager"} == 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Prometheus cannot scrape Alertmanager"
+              description: |
+                No alert reaches any channel while Alertmanager is down. Check the
+                prometheus-alertmanager-0 pod in the observability namespace.
+          - alert: AlertmanagerScrapeMissing
+            expr: absent(up{job="alertmanager"})
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "No Alertmanager scrape target"
+              description: |
+                The 'alertmanager' scrape job finds no target, so notification failures go
+                unseen. The Service label app.kubernetes.io/name=alertmanager or its 'http'
+                port name changed; fix the job in tools/k3s/observability.sh.
+          - alert: AlertmanagerNotificationsFailing
+            expr: |
+              sum by (integration, reason) (
+                increase(alertmanager_notifications_failed_total{integration!="email"}[15m])
+              ) > 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Alertmanager {{ \$labels.integration }} notifications failing ({{ \$labels.reason }})"
+              description: |
+                Alertmanager gave up on {{ \$value | printf "%.0f" }} {{ \$labels.integration }}
+                notification(s) in 15 minutes after retries. For Telegram the usual causes are a
+                revoked bot token, a changed chat id, or a message Telegram rejects (over 4096
+                characters, or HTML parse_mode choking on a '<' in an annotation). Check the
+                alertmanager log for the API error.
+          # Email is a second channel next to Telegram; its failures are a defect to fix,
+          # not an outage, so they get the low tier (daily Telegram reminder).
+          - alert: AlertmanagerEmailNotificationsFailing
+            expr: |
+              sum by (integration, reason) (
+                increase(alertmanager_notifications_failed_total{integration="email"}[1h])
+              ) > 0
+            for: 1h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Alertmanager email notifications failing ({{ \$labels.reason }})"
+              description: |
+                Every email notification in the last hour failed after retries, so alerts reach
+                Telegram only. Check the alertmanager log for the SMTP reply; a 550 "API key is
+                not authorized to send emails from <domain>" means the SMTP provider key has not
+                been authorised for ALERTMANAGER_FROM_EMAIL's domain.
+          - alert: AlertmanagerConfigReloadFailed
+            expr: alertmanager_config_last_reload_successful == 0
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Alertmanager failed to load its configuration"
+              description: |
+                Alertmanager runs on its previous configuration; the latest change is not in
+                effect. The alertmanager log names the offending field.
+          - alert: PrometheusAlertmanagerUnreachable
+            expr: prometheus_notifications_alertmanagers_discovered < 1
+            for: 10m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Prometheus has no Alertmanager to send alerts to"
+              description: |
+                Prometheus discovers no Alertmanager endpoint; every alert is dropped.
+          - alert: PrometheusNotificationErrors
+            expr: |
+              sum by (alertmanager) (rate(prometheus_notifications_errors_total[5m])) > 0
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Prometheus fails to push alerts to {{ \$labels.alertmanager }}"
+              description: |
+                Prometheus gets errors posting alerts to Alertmanager. Alerts may arrive late
+                or not at all.
+          - alert: PrometheusRuleEvaluationFailures
+            expr: |
+              sum by (rule_group) (increase(prometheus_rule_evaluation_failures_total[15m])) > 0
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Rule group {{ \$labels.rule_group }} fails to evaluate"
+              description: |
+                At least one rule in {{ \$labels.rule_group }} errors on every evaluation (often a
+                many-to-many match after a label change), so it can never fire. Check the
+                Prometheus /rules page.
+
+      # MySQL (Percona operator stack from tools/k3s/mysql.sh, scraped by the
+      # 'mysql-exporter' job above). Inert in envs without the MySQL stack.
+      - name: mysql
+        interval: 1m
+        rules:
+          - alert: MysqlExporterDown
+            expr: up{job="mysql-exporter"} == 0
+            for: 10m
+            labels: { severity: p2, app: mysql }
+            annotations:
+              summary: "Prometheus cannot scrape mysql-exporter"
+              description: |
+                MySQL is unmonitored while the exporter is down. Check the mysql-exporter
+                Deployment in the mysql namespace.
+          - alert: MysqlDown
+            expr: mysql_up == 0
+            for: 5m
+            labels: { severity: p1, app: mysql }
+            annotations:
+              summary: "mysql-exporter cannot connect to MySQL"
+              description: |
+                mysqld-exporter's connection to MySQL fails. Either MySQL is down or the
+                exporter's credentials (Secret mysql-exporter-credentials) no longer work.
+                Check the mysql-cluster-mysql-0 pod first.
+          - alert: MysqlConnectionsNearLimit
+            expr: |
+              mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
+            for: 10m
+            labels: { severity: p2, app: mysql }
+            annotations:
+              summary: "MySQL connections above 80% of max_connections"
+              description: |
+                {{ \$value | humanizePercentage }} of max_connections in use. New connections fail
+                with "Too many connections" at 100%, which takes the PHP sites down. Usually a
+                scraper flood or a wedged pool holding connections.
 
       # kafka-journal stack watchdog (Redpanda + ScyllaDB + replicator; see
       # docs/KAFKA-JOURNAL-OPS.md). Rules are inert until the redpanda/scylla scrape jobs
