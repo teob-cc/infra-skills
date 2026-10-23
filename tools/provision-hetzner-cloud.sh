@@ -939,6 +939,31 @@ else
   mark_step "02-apt-update-packages"
 fi
 
+# Step 2a: Prevent needrestart from auto-restarting k3s/containerd/cron on package upgrades.
+# A k3s restart unmounts /var/lib/rancher/k3s/storage bind mounts and pod
+# volume mounts, leaving services (Harbor, Nexus, Loki, Grafana) with stale
+# mounts. Restart k3s manually during a maintenance window instead.
+# needrestart matches override_rc keys against the full unit name ("k3s.service"),
+# so the keys must carry the .service suffix (the earlier ^k3s$ keys never matched).
+if skip_if_done "02a-needrestart-override-k3s-v2" "needrestart override for k3s"; then
+  :
+else
+  mkdir -p /etc/needrestart/conf.d
+  cat > /etc/needrestart/conf.d/k3s.conf <<'NEEDRESTART_EOF'
+# Managed by infra-skills (provision-hetzner-*.sh). Never auto-restart these from needrestart:
+# needrestart matches override_rc keys as regexes against the full systemd unit name
+# ("k3s.service", not "k3s"), so keys must account for the ".service" suffix.
+#  - k3s / k3s-agent: a restart unmounts pod volumes and bind mounts (stale Harbor/Nexus/Loki
+#    mounts) and bounces every workload on the node; do it in a maintenance window.
+#  - containerd (+ its shims, which live in the k3s unit's cgroup on k3s): same blast radius.
+#  - cron: a restart kills in-flight cron jobs (nightly rdiff-backup); it picks up new libs at reboot.
+$nrconf{override_rc}{qr(^k3s(-agent)?\.service$)} = 0;
+$nrconf{override_rc}{qr(^containerd\.service$)} = 0;
+$nrconf{override_rc}{qr(^cron\.service$)} = 0;
+NEEDRESTART_EOF
+  mark_step "02a-needrestart-override-k3s-v2"
+fi
+
 # Step 3: Configure locales
 if skip_if_done "03-configure-locales" "Locale configuration"; then
   :
