@@ -278,6 +278,19 @@ tools/k3s/harbor.sh <env-name>
 - Creates `dockerhub-proxy` project for caching
 - Generates robot account for CI/CD pipelines
 - Stores robot credentials in `harbor-robot-runner` secret
+- Version pins `HARBOR_CHART_VERSION` (1.18.4) and `HARBOR_IMAGE_TAG` (v2.14.5, set on every
+  component): goharbor has no chart for 2.14.5 yet. Clear `HARBOR_IMAGE_TAG` once a chart ships
+  the wanted version
+- TLS: cert-manager issues the ingress certificate into `harbor-ingress` and the chart only reads
+  it (`expose.tls.certSource=secret`, `expose.tls.secret.secretName` and `caSecretName` =
+  `harbor-ingress`). The chart's default `certSource=auto` renders that same secret with a
+  self-signed cert, so upgrades fought cert-manager over it. An install from before this change
+  is moved over on the next run: the secret gets `helm.sh/resource-policy: keep` first, so Helm
+  does not delete the live certificate when it drops out of the release
+- After every install or upgrade, the harbor-db collation check: a harbor-db image on a newer
+  glibc (2.14.5 moved 2.36 → 2.43) leaves text indexes sorted by the old collation. Databases
+  whose recorded collation version differs are reindexed and get `REFRESH COLLATION VERSION`;
+  nothing happens when the versions match
 
 **Phases**:
 1. DNS Management

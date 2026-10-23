@@ -58,6 +58,20 @@ err() { echo "[registry:error] $*" >&2; }
 NAMESPACE_HARBOR="${NAMESPACE_HARBOR:-harbor}"
 NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 
+# Version pins. goharbor has no chart for Harbor 2.14.5 (1.18.4 ships 2.14.4), so the chart
+# stays on 1.18.4 and every component image is set to v2.14.5, which patches the 2026-10-06
+# advisories (robot -> system admin, webhook SSRF, signed-image policy bypass). 2.14.4 -> 2.14.5
+# has no database migration. Empty HARBOR_IMAGE_TAG = the chart's appVersion; raise deliberately.
+HARBOR_CHART_VERSION="${HARBOR_CHART_VERSION:-1.18.4}"
+HARBOR_IMAGE_TAG="${HARBOR_IMAGE_TAG-v2.14.5}"
+HARBOR_IMAGE_COMPONENTS=(nginx portal core jobservice registry.registry registry.controller trivy database.internal redis.internal exporter)
+
+# The ingress certificate. cert-manager issues it into this secret (ingress-shim, from the
+# ingress annotations) and Harbor only reads it: expose.tls.certSource=secret. With the chart's
+# default certSource=auto the chart renders the same secret with a self-signed cert, and every
+# upgrade fights cert-manager over it.
+TLS_SECRET_NAME="${TLS_SECRET_NAME:-harbor-ingress}"
+
 # Derive hosts from HOSTNAME if not provided
 if [[ -n "${HOSTNAME:-}" ]]; then
   HARBOR_HOST="${HARBOR_HOST:-harbor.${HOSTNAME}}"
@@ -208,11 +222,32 @@ install_harbor() {
   helm repo update goharbor
   
   # Check if TLS secret already exists to prevent rate limiting
-  local tls_secret_name="${TLS_SECRET_NAME:-harbor-tls}"
+  local tls_secret_name="${TLS_SECRET_NAME}"
   if kubectl -n "$NAMESPACE_HARBOR" get secret "$tls_secret_name" >/dev/null 2>&1; then
     info "TLS secret '$tls_secret_name' already exists - will reuse it"
+    # An install from before certSource=secret has the chart own this secret; the upgrade below
+    # drops it from the release, and without this annotation Helm would delete the live
+    # certificate. cert-manager keeps renewing it either way.
+    kubectl -n "$NAMESPACE_HARBOR" annotate secret "$tls_secret_name" \
+      helm.sh/resource-policy=keep --overwrite >/dev/null
   fi
-  
+
+  # Settings every run applies, install or upgrade: the chart and image pins and the TLS source.
+  # caSecretName points harbor-core's CA download at the same secret; with certSource=secret and
+  # no caSecretName the chart renders that volume without a secret name.
+  local common_args=(--version "$HARBOR_CHART_VERSION"
+    --set expose.tls.enabled=true
+    --set expose.tls.certSource=secret
+    --set "expose.tls.secret.secretName=${tls_secret_name}"
+    --set "caSecretName=${tls_secret_name}")
+  local component
+  if [[ -n "$HARBOR_IMAGE_TAG" ]]; then
+    for component in "${HARBOR_IMAGE_COMPONENTS[@]}"; do
+      common_args+=(--set "${component}.image.tag=${HARBOR_IMAGE_TAG}")
+    done
+  fi
+  info "  Chart harbor ${HARBOR_CHART_VERSION}, image ${HARBOR_IMAGE_TAG:-<chart appVersion>}, TLS from secret ${tls_secret_name}"
+
   # Storage configuration with defaults
   local registry_size="${REGISTRY_SIZE:-50Gi}"
   local chartmuseum_size="${CHARTMUSEUM_SIZE:-5Gi}"
@@ -234,6 +269,7 @@ install_harbor() {
       --wait \
       --timeout 15m \
       --reuse-values \
+      "${common_args[@]}" \
       --set harborAdminPassword="$HARBOR_ADMIN_PASSWORD" \
       --set persistence.enabled=true \
       --set persistence.resourcePolicy=keep
@@ -256,8 +292,7 @@ install_harbor() {
       --set expose.ingress.annotations."cert-manager\.io/cluster-issuer"="${cluster_issuer}" \
       --set expose.ingress.annotations."cert-manager\.io/common-name"="$HARBOR_HOST" \
       --set-string expose.ingress.annotations."acme\.cert-manager\.io/http01-edit-in-place"="true" \
-      --set expose.tls.enabled=true \
-      --set expose.tls.secretName="${tls_secret_name}" \
+      "${common_args[@]}" \
       --set externalURL="https://$HARBOR_HOST" \
       --set harborAdminPassword="$HARBOR_ADMIN_PASSWORD" \
       --set persistence.enabled=true \
@@ -289,6 +324,52 @@ install_harbor() {
 }
 
 install_harbor
+
+# ============================================================================
+# Phase 3b: harbor-db collation versions
+# ============================================================================
+# A harbor-db image built on a newer glibc changes the collation of every text index built
+# under the old one (2.14.5 moved glibc 2.36 -> 2.43): non-ASCII keys can mis-sort until the
+# indexes are rebuilt, and Postgres warns "collation version mismatch" on every connection.
+# For each database whose recorded collation version differs from the library's: REINDEX it
+# (the registry database is small; writes to an index block while it is rebuilt), then
+# REFRESH COLLATION VERSION. A no-op when nothing is mismatched, and on an external database.
+ensure_harbor_db_collation() {
+  log "=== Phase 3b: harbor-db collation versions ==="
+  local pod="harbor-database-0"
+  if ! kubectl -n "$NAMESPACE_HARBOR" get pod "$pod" >/dev/null 2>&1; then
+    info "No ${pod} (external database?) - skipping"
+    return 0
+  fi
+  kubectl -n "$NAMESPACE_HARBOR" wait --for=condition=Ready "pod/${pod}" --timeout=300s >/dev/null 2>&1 || true
+  hdb_psql() {
+    kubectl -n "$NAMESPACE_HARBOR" exec -i "$pod" -c database -- \
+      psql -U postgres -v ON_ERROR_STOP=1 -At "$@" 2>/dev/null
+  }
+  local mismatched db
+  if ! mismatched=$(hdb_psql -c "SELECT datname FROM pg_database WHERE datallowconn AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)"); then
+    warn "Could not read collation versions from ${pod} - skipping (check by hand after an image change)"
+    return 0
+  fi
+  if [[ -z "$mismatched" ]]; then
+    info "✓ Collation versions current"
+    return 0
+  fi
+  info "Collation version changed for: $(echo "$mismatched" | tr '\n' ' ')"
+  for db in $mismatched; do
+    info "  REINDEX DATABASE ${db} ..."
+    hdb_psql -d "$db" -c "REINDEX DATABASE \"${db}\"" >/dev/null || { err "  REINDEX of ${db} failed"; return 1; }
+    hdb_psql -d "$db" -c "ALTER DATABASE \"${db}\" REFRESH COLLATION VERSION" >/dev/null || { err "  REFRESH COLLATION VERSION of ${db} failed"; return 1; }
+  done
+  mismatched=$(hdb_psql -c "SELECT datname FROM pg_database WHERE datallowconn AND datcollversion IS DISTINCT FROM pg_database_collation_actual_version(oid)" || echo "?")
+  if [[ -n "$mismatched" ]]; then
+    err "Still mismatched after reindexing: ${mismatched}"
+    return 1
+  fi
+  info "✓ Indexes rebuilt and collation versions refreshed"
+}
+
+ensure_harbor_db_collation || warn "harbor-db collation step failed - see above"
 
 # ============================================================================
 # Phase 4: Harbor Configuration
