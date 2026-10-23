@@ -25,7 +25,9 @@ infra-envs/
 ```
 
 The `.gitignore` line for `secrets.plain/` is mandatory — verify it before writing any secret
-template.
+template. The `kubeconfig.yaml` line keeps cluster-admin credentials out of git; the provisioning
+scripts write an encrypted copy to `envs/<env>/secrets.sops/kubeconfig` for you to commit
+(`tools/sops/kubeconfig.sh save|restore <env>`).
 
 ## Step 2 — Interview
 

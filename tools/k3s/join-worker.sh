@@ -175,11 +175,8 @@ SSH_TARGET="${SSH_USER}@${SSH_HOST}"
 info "  SSH: ${SSH_TARGET}"
 
 # --- Load master kubeconfig ---
-KUBECONFIG_FILE="${ENV_ROOT}/${ENV_ARG}/kubeconfig.yaml"
-if [[ ! -f "$KUBECONFIG_FILE" ]]; then
-  err "Kubeconfig not found: ${KUBECONFIG_FILE}"
-  exit 1
-fi
+# Restored from envs/<env>/secrets.sops/kubeconfig when the git-ignored file is missing.
+KUBECONFIG_FILE="$(provision::ensure_kubeconfig "${ENV_ARG}")" || exit 1
 export KUBECONFIG="$KUBECONFIG_FILE"
 
 # --- Remove mode ---

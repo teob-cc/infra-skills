@@ -89,7 +89,9 @@ tools/provision-hetzner-cloud.sh <env> --destroy            # Tear down (server 
 Requires `envs/shared/secrets.plain/hetzner-cloud-token.txt`. **`--destroy`** removes the server,
 the Tailscale device, and the Cloudflare DNS records — confirm with the user first.
 
-Both options write `envs/<env>/kubeconfig.yaml` with the Tailscale IP as the API server address.
+Both options write `envs/<env>/kubeconfig.yaml` with the Tailscale IP as the API server address,
+and save an encrypted copy to `envs/<env>/secrets.sops/kubeconfig` (commit it). The plaintext
+file is gitignored; in a fresh clone run `tools/sops/kubeconfig.sh restore <env>`.
 
 #### Worker nodes (optional)
 An environment may have worker directories `envs/<env>/<worker>/env.properties` with
@@ -291,7 +293,8 @@ curl -sS -o /dev/null -w "%{http_code}" https://grafana.<HOSTNAME>/api/health
   `helm -n <ns> uninstall <release>` before `up.sh` can resume that step; a transient API loss
   needs nothing but a re-run (`up.sh` resumes from the checkpoint).
 - **kubectl context mismatch**: all scripts validate the context matches the target env. Check
-  `envs/<env>/kubeconfig.yaml` and `~/.kube/config`.
+  `envs/<env>/kubeconfig.yaml` and `~/.kube/config`. A missing `kubeconfig.yaml` (fresh clone) comes
+  back with `tools/sops/kubeconfig.sh restore <env>`.
 - **Secrets**: plaintext lives in `secrets.plain/` (gitignored, never committed); encrypted
   copies in `secrets.sops/` are the truth. Manage with `tools/sops/encrypt.sh` / `decrypt.sh` /
   `apply.sh`. `apply.sh` uses the **current kubectl context** — verify it before applying.

@@ -30,12 +30,13 @@ Each environment lives at `envs/<env>/`:
 envs/
   <env>/
     env.properties          # HOSTNAME, EXTERNAL_IP, VLAN_IP, ACME_EMAIL (+ HCLOUD_* for cloud VMs)
-    kubeconfig.yaml         # written by the server-provisioning script
+    kubeconfig.yaml         # cluster-admin; written by the server-provisioning script; gitignored
     pomerium-routes.yaml    # auth-proxy routing rules
     apps/                   # ArgoCD Application manifests + Helm charts
     alerts/                 # optional Prometheus alert-group fragments (merged by observability.sh)
     secrets.plain/          # plaintext secrets — gitignored, NEVER committed
     secrets.sops/           # age-encrypted secrets — committed
+                            #   (incl. `kubeconfig`: sops-binary copy, tools/sops/kubeconfig.sh)
   shared/
     alerts/                 # optional alert-group fragments applied to every environment
     secrets.plain/          # cross-env credentials (Cloudflare token, GitHub App, Hetzner token)

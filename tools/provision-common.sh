@@ -198,9 +198,11 @@ provision::envs_root() {
 # non-existent target is fine too: we walk up to the nearest directory that does
 # exist, because the caller is about to create the rest.
 #
-# Usage: provision::assert_plaintext_ignored PATH   (returns non-zero to refuse)
+# Usage: provision::assert_plaintext_ignored PATH [IGNORE_RULE]   (returns non-zero to refuse)
+#   IGNORE_RULE is the .gitignore line suggested when PATH is not ignored
+#   (default: **/secrets.plain/).
 provision::assert_plaintext_ignored() {
-  local target="$1" base repo rel
+  local target="$1" rule="${2:-**/secrets.plain/}" base repo rel
   base="$target"
   while [[ ! -d "$base" && "$base" != "/" && "$base" != "." ]]; do
     base="$(dirname "$base")"
@@ -219,10 +221,26 @@ provision::assert_plaintext_ignored() {
   if ! git -C "$repo" check-ignore -q -- "$target" 2>/dev/null; then
     provision::error "Refusing to write plaintext credentials: '${rel}' is not git-ignored in ${repo}."
     provision::error "Add the rule before anything is written there:"
-    provision::error "    echo '**/secrets.plain/' >> ${repo}/.gitignore"
+    provision::error "    echo '${rule}' >> ${repo}/.gitignore"
     return 1
   fi
   return 0
+}
+
+# Echo the path of an environment's admin kubeconfig, restoring it from its encrypted copy
+# (envs/<env>/secrets.sops/kubeconfig) when the git-ignored plaintext is missing, e.g. in a
+# fresh clone of the envs repo. See tools/sops/kubeconfig.sh.
+# Usage: KUBECONFIG="$(provision::ensure_kubeconfig <env>)" || exit 1
+provision::ensure_kubeconfig() {
+  local env_name="$1" file
+  file="$(provision::envs_root)/${env_name}/kubeconfig.yaml"
+  if [[ ! -f "$file" ]]; then
+    "$(provision::repo_root)/tools/sops/kubeconfig.sh" restore "$env_name" >&2 || {
+      provision::error "Kubeconfig not found: ${file}"
+      return 1
+    }
+  fi
+  echo "$file"
 }
 
 # Resolve a Helm chart directory, allowing an envs-repo override.

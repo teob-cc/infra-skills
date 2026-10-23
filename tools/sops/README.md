@@ -14,11 +14,15 @@
     - Safety: if a destination exists and is newer than the source, it will not be overwritten unless you pass `--force`.
     - Prints the output directory path at the end.
 
-- `tools/sops/apply.sh [ENV] [FILE]`
-    - Prefers applying plaintext YAML from `envs/<ENV>/secrets.plain/` and will NOT decrypt if that directory exists (and contains YAML or the specified file).
-    - If plaintext is missing (or the requested file is absent there), falls back to decrypting from `envs/<ENV>/secrets.sops/` to a temp dir and applies from there.
-    - Only YAML is applied via `kubectl apply -f ...`.
+- `tools/sops/apply.sh [--plain] [--dry-run] [ENV] [FILE]`
+    - Decrypts `envs/<ENV>/secrets.sops/` (the source of truth) to a temp dir and applies from there; warns where `secrets.plain/` differs. `--plain` applies `secrets.plain/` instead.
+    - Only `*.yaml`/`*.yml` files that declare a `kind:` are applied via `kubectl apply -f ...`.
     - Assumes your `kubectl` context already points to the target cluster.
+
+- `tools/sops/kubeconfig.sh save|restore [--force] <ENV>`
+    - The admin kubeconfig stays at `envs/<ENV>/kubeconfig.yaml` but is gitignored (`**/kubeconfig.yaml`); its committed copy is `envs/<ENV>/secrets.sops/kubeconfig`.
+    - Binary mode on purpose: as YAML, the `encrypted_regex: ^(data|stringData)$` rule would leave `client-key-data` in plaintext, and `apply.sh` would try to apply a `kind: Config` file.
+    - `save` encrypts the current file (the provisioning scripts do this after fetching it); `restore` writes it back (mode 600) when missing, e.g. in a fresh clone. `join-worker.sh`, `gpu-nvidia.sh` and `setup-gpu-controld.sh` restore it themselves.
 
 ### Prerequisites
 - Install SOPS and age
@@ -98,10 +102,10 @@ creation_rules:
     - Overwrite newer targets: `tools/sops/decrypt.sh --force cit`
     - The script prints the output directory; files in there are plaintext.
 
-- Apply to the cluster (prefers plaintext)
+- Apply to the cluster
     - Ensure your `kubectl` context points to the correct cluster.
     - `tools/sops/apply.sh cit`
-    - If `secrets.plain/` exists, it applies YAML from there without decrypting. Otherwise it decrypts from `secrets.sops/` and applies.
+    - It decrypts `secrets.sops/` and applies that; run `--dry-run` first to see drift warnings.
 
 ### Alternative without `.sops.yaml` (quick test)
 - You can skip `.sops.yaml` and pass recipients via env var once:

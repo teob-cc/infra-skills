@@ -1404,8 +1404,12 @@ function fetch_kubeconfig(){
       /^[[:space:]]*current-context:/ { print "current-context: " env; next }
       { print }
     ')
-  echo "${adjusted}" > "${out_dir}/kubeconfig.yaml"
+  ( umask 077; echo "${adjusted}" > "${out_dir}/kubeconfig.yaml" )
+  chmod 600 "${out_dir}/kubeconfig.yaml"
   ok "Wrote kubeconfig to ${out_dir}/kubeconfig.yaml (context: ${ENV_NAME}, server: https://${api_server_host}:6443)"
+  # The plaintext is git-ignored; commit the encrypted copy so another checkout can restore it.
+  "${REPO_ROOT}/tools/sops/kubeconfig.sh" save "${ENV_NAME}" \
+    || warn "Could not save an encrypted copy; run: tools/sops/kubeconfig.sh save ${ENV_NAME}"
 
   local kube_home="${HOME}/.kube"
   mkdir -p "${kube_home}"

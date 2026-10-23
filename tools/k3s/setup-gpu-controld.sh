@@ -44,7 +44,8 @@ ENV_ROOT="$(provision::envs_root)"
 ENV_FILE="${ENV_ROOT}/${ENV_ARG}/${WORKER_ARG}/env.properties"
 [[ -f "$ENV_FILE" ]] || { err "Environment file not found: ${ENV_FILE}"; exit 1; }
 source "$ENV_FILE"
-export KUBECONFIG="${ENV_ROOT}/${ENV_ARG}/kubeconfig.yaml"
+KUBECONFIG="$(provision::ensure_kubeconfig "${ENV_ARG}")" || exit 1
+export KUBECONFIG
 VLAN_IP_ADDR="${VLAN_IP%%/*}"
 
 # --- SSH target (prefer LAN EXTERNAL_IP, fall back to Tailscale IP) ---
