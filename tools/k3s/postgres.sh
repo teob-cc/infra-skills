@@ -172,9 +172,13 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 
 # CloudNativePG operator settings
 # Note: CNPG_VERSION is the Helm chart version, not the operator version
-# Chart 0.22.0 = Operator 1.24.0, Chart 0.26.1 = Operator 1.27.1
+# Chart 0.29.1 = Operator 1.30.1 (supports Kubernetes 1.34-1.36, Postgres 14-18).
+# Earlier pairs: 0.22.0 = 1.24.0 (EOL May 2025), 0.27.0 = 1.28.0, 0.28.0 = 1.29.0.
+# Only the latest CNPG minor is supported (plus 3 months); bump this every quarter.
+# This script installs the operator but never upgrades a running one; to upgrade,
+# see the warning printed by install_cnpg_operator below.
 CNPG_NAMESPACE="${CNPG_NAMESPACE:-cnpg-system}"
-CNPG_VERSION="${CNPG_VERSION:-0.22.0}"
+CNPG_VERSION="${CNPG_VERSION:-0.29.1}"
 
 # Optional read-only login on postgres-cluster (e.g. for an operator's or an
 # agent's Postgres MCP server): set PG_READONLY_ROLE (e.g. claude_ro) in
@@ -806,6 +810,21 @@ ensure_dns_records
 # ============================================================================
 # Phase 1: Install CloudNativePG Operator
 # ============================================================================
+# A running operator is left alone: an operator upgrade restarts every Postgres
+# instance (a single-instance cluster has no switchover), so it is a planned step,
+# not a side effect of re-running this script. Say so when the live chart differs.
+warn_cnpg_chart_drift() {
+  local live_chart
+  live_chart=$(kubectl -n "$CNPG_NAMESPACE" get deploy cnpg-cloudnative-pg \
+    -o jsonpath='{.metadata.labels.helm\.sh/chart}' 2>/dev/null || true)
+  if [[ -n "$live_chart" && "$live_chart" != "cloudnative-pg-${CNPG_VERSION}" ]]; then
+    warn "CloudNativePG operator runs ${live_chart}; CNPG_VERSION is ${CNPG_VERSION}. Not upgrading it here."
+    warn "  Read the CNPG release notes, back up, then (restarts every instance):"
+    warn "  helm upgrade cnpg cnpg/cloudnative-pg -n ${CNPG_NAMESPACE} --version ${CNPG_VERSION} --reset-values --wait"
+    warn "  (--reuse-values fails across chart versions: the new templates need values the old chart lacks)"
+  fi
+}
+
 install_cnpg_operator() {
   log "=== Phase 1: CloudNativePG Operator ==="
 
@@ -831,6 +850,7 @@ install_cnpg_operator() {
     # Check if operator is running
     if kubectl -n "$CNPG_NAMESPACE" get deploy cnpg-cloudnative-pg >/dev/null 2>&1; then
       info "CloudNativePG operator already installed and running"
+      warn_cnpg_chart_drift
       return 0
     else
       warn "CloudNativePG CRDs exist but operator deployment not found"
