@@ -1071,7 +1071,8 @@ spec:
     spec:
       containers:
       - name: mysqld-exporter
-        image: prom/mysqld-exporter:v0.16.0
+        image: prom/mysqld-exporter:v0.16.0@sha256:617b7244a31922c30eeddb0e3b39b4c125e890d46179be4a30561b20f111ca6c
+        imagePullPolicy: IfNotPresent
         args:
         - --config.my-cnf=/etc/mysql-exporter/.my.cnf
         ports:
@@ -1387,7 +1388,8 @@ spec:
     spec:
       containers:
       - name: adminer
-        image: adminer:latest
+        image: adminer:6.1.2@sha256:251295c1cd51d3889f1c42ffa4864b24eeab51f0caf395cfe5bf4726c5ec9a2a
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
           name: http

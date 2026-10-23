@@ -1521,7 +1521,8 @@ spec:
     spec:
       containers:
       - name: pgweb
-        image: sosedoff/pgweb:latest
+        image: sosedoff/pgweb:0.17.0@sha256:a5256d416e2e8b92d69a4459058e3eca33a9f075d8325491644411d0bc3bd70b
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8081
           name: http
