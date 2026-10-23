@@ -8,15 +8,17 @@ set -uo pipefail
 # doctor — read-only health & drift diagnosis for a Sovereign Stack environment
 # ============================================================================
 # Runs entirely against your own cluster with your own kubeconfig. It NEVER
-# mutates anything (only `kubectl get`, `helm list/get`, `openssl x509`), needs
-# NO hosted control plane, and every check is independently guarded so a missing
-# capability degrades to SKIP rather than an error.
+# mutates anything (only `kubectl get`, `helm list/get`, `openssl x509` and
+# anonymous HTTPS GETs), needs NO hosted control plane, and every check is
+# independently guarded so a missing capability degrades to SKIP rather than an
+# error.
 #
 # It reports drift and risk — cluster health, certificate expiry, config drift,
-# backups & restore-test evidence, releases-behind, image scanning — and prints
-# a remedy path. The remedies you can act on yourself are free; the managed,
-# orchestrated form of the same remedies is the commercial control plane
-# (see pragmasoft.nl).
+# backups & restore-test evidence, releases-behind, image scanning, hardening
+# defaults (ArgoCD/Harbor version pins, ArgoCD admin account, private Harbor
+# projects, pgweb NetworkPolicy) — and prints a remedy path. The remedies you
+# can act on yourself are free; the managed, orchestrated form of the same
+# remedies is the commercial control plane (see pragmasoft.nl).
 #
 # Usage:
 #   tools/doctor.sh <env-name> [--json] [--strict]
@@ -411,6 +413,60 @@ check_tailscale_key() {
   fi
 }
 
+# --- Check: hardening defaults ---------------------------------------------
+# What the provisioning scripts set up and a hand edit or an old install can lose: the ArgoCD
+# and Harbor version pins (read from the scripts), the ArgoCD admin account, Harbor's private
+# projects (asked anonymously: a private project answers 401) and pgweb's NetworkPolicy.
+# Each item is only checked when its component is installed.
+check_hardening() {
+  require_api "hardening" || return
+  local issues=() checked=0 img v pin_v
+  pin() { sed -nE "s/^$1=\"\\\$\{$1:?-([^}]*)\}\"$/\1/p" "$REPO_ROOT/tools/k3s/$2" | head -1; }
+
+  img="$(kc get deploy argocd-server -n argocd -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  if [[ -n "$img" ]]; then
+    checked=$((checked + 1))
+    pin_v="$(pin ARGOCD_IMAGE_TAG argocd.sh)"
+    [[ -n "$pin_v" && "${img##*:}" != "$pin_v" ]] && issues+=("argocd ${img##*:} (pin ${pin_v})")
+    v="$(kc get cm argocd-cm -n argocd -o jsonpath='{.data.admin\.enabled}')"
+    [[ "$v" != "false" ]] && issues+=("argocd admin account enabled")
+  fi
+
+  img="$(kc get deploy harbor-core -n harbor -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  if [[ -n "$img" ]]; then
+    checked=$((checked + 1))
+    pin_v="$(pin HARBOR_IMAGE_TAG harbor.sh)"
+    [[ -n "$pin_v" && "${img##*:}" != "$pin_v" ]] && issues+=("harbor ${img##*:} (pin ${pin_v})")
+    kc get secret harbor-node-pull -n harbor >/dev/null 2>&1 || issues+=("no harbor/harbor-node-pull robot")
+    local host project code
+    host="$(kc get ingress harbor-ingress -n harbor -o jsonpath='{.spec.rules[0].host}')"
+    if [[ -n "$host" ]] && command -v curl >/dev/null 2>&1; then
+      for project in library dockerhub-proxy; do
+        code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://${host}/api/v2.0/projects/${project}" 2>/dev/null)"
+        [[ "$code" == "200" ]] && issues+=("harbor ${project} is public")
+      done
+    fi
+  fi
+
+  if kc get deploy pgweb -n postgres >/dev/null 2>&1; then
+    checked=$((checked + 1))
+    kc get networkpolicy pgweb-from-pomerium-only -n postgres >/dev/null 2>&1 || issues+=("pgweb has no pgweb-from-pomerium-only NetworkPolicy")
+    kc get deploy pgweb -n postgres -o jsonpath='{.spec.template.spec.containers[0].env[*].name}' | grep -qw PGWEB_PASS \
+      && issues+=("pgweb pod env carries PGWEB_PASS")
+  fi
+
+  if [[ "$checked" -eq 0 ]]; then
+    record "hardening" "SKIP" "no ArgoCD, Harbor or pgweb installed" ""
+  elif [[ ${#issues[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${issues[@]}")"
+    record "hardening" "WARN" "${joined%; }" \
+      "re-run the provisioning script of each component (argocd.sh, harbor.sh, postgres.sh); see docs/GITOPS.md"
+  else
+    record "hardening" "OK" "pins, admin account, private projects, pgweb policy as provisioned ($checked component(s))" ""
+  fi
+}
+
 # --- Run all checks --------------------------------------------------------
 check_cluster
 check_pods
@@ -422,6 +478,7 @@ check_tailscale_key
 check_releases
 check_scanning
 check_floating_images
+check_hardening
 
 # --- Output ----------------------------------------------------------------
 json_escape() { python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"; }
