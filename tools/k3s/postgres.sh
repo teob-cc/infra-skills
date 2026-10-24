@@ -1105,6 +1105,24 @@ SQL
   fi
 }
 
+# A running cluster keeps its pg_hba: say so when it still has md5 lines (INFRA-65), and
+# print the patch (every md5 line becomes scram-sha-256, other lines unchanged). pg_hba is
+# reloaded, not restarted, but a role whose stored password is still an MD5 hash can no
+# longer log in afterwards: check first (docs/POSTGRES-BACKUP.md, "md5 to SCRAM").
+warn_pg_hba_md5() {
+  local hba
+  hba=$(kubectl -n "$NAMESPACE_POSTGRES" get cluster postgres-cluster -o json 2>/dev/null | \
+          jq -c '.spec.postgresql.pg_hba // []') || return 0
+  jq -e 'any(.[]; test("\\smd5\\s*$"))' <<< "$hba" >/dev/null || return 0
+  local patch
+  patch=$(jq -c '{spec: {postgresql: {pg_hba: map(sub("\\smd5\\s*$"; " scram-sha-256"))}}}' <<< "$hba")
+  warn "postgres-cluster pg_hba still has md5 lines; new clusters get scram-sha-256. Not changing it here."
+  warn "  First check no login role has an MD5-hashed password (docs/POSTGRES-BACKUP.md, \"md5 to SCRAM\"):"
+  warn "  kubectl -n ${NAMESPACE_POSTGRES} exec postgres-cluster-1 -c postgres -- psql -U postgres -Atc \"select rolname from pg_authid where rolpassword like 'md5%'\""
+  warn "  If that prints nothing (a reload, no restart):"
+  warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '${patch}'"
+}
+
 # ============================================================================
 # Phase 2: Create PostgreSQL Cluster
 # ============================================================================
@@ -1131,6 +1149,7 @@ create_postgres_cluster() {
       warn "  Back up, then (restarts the instance; same major only, a major upgrade needs its own plan):"
       warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '{\"spec\":{\"imageName\":\"${POSTGRES_IMAGE}\"}}'"
     fi
+    warn_pg_hba_md5
 
     # Ensure required secrets exist (CloudNativePG operator should create them but sometimes doesn't)
     if ! kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser >/dev/null 2>&1; then
@@ -1212,10 +1231,14 @@ ${managed_block}
       work_mem: "4MB"
       min_wal_size: "1GB"
       max_wal_size: "4GB"
+    # SCRAM only (INFRA-65). CNPG appends "host all all all scram-sha-256" itself (PG >= 14);
+    # these private-range lines spell the method out. "md5" here would also accept roles
+    # whose stored password is still an MD5 hash (password_encryption is scram-sha-256 by
+    # default since PG 14, so new passwords never are).
     pg_hba:
-      - host all all 10.0.0.0/8 md5
-      - host all all 172.16.0.0/12 md5
-      - host all all 192.168.0.0/16 md5
+      - host all all 10.0.0.0/8 scram-sha-256
+      - host all all 172.16.0.0/12 scram-sha-256
+      - host all all 192.168.0.0/16 scram-sha-256
   
   # Bootstrap configuration
   bootstrap:
