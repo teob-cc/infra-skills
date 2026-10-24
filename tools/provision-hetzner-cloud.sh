@@ -1286,8 +1286,9 @@ if skip_if_done "14-k3s-install" "k3s installation"; then
   :
 else
   if [[ "@WORKER_MODE@" != "true" ]]; then
-    echo "[postinstall] Installing k3s server ..."
-    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh - >/root/k3s-install.log 2>&1 || true
+    echo "[postinstall] Installing k3s server @K3S_VERSION@ ..."
+    # An empty INSTALL_K3S_VERSION means the stable channel of the day (env.properties K3S_VERSION pins it).
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="@K3S_VERSION@" INSTALL_K3S_SKIP_START=true sh - >/root/k3s-install.log 2>&1 || true
   else
     echo "[postinstall] Worker mode detected; skipping k3s server installation"
   fi
@@ -1687,6 +1688,7 @@ if $PROVISION_SERVER; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@EXTERNAL_IP@/${EXTERNAL_IP}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@MASTER_PRIVATE_IP@/${MASTER_PRIVATE_IP:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@WORKER_MODE@/${WORKER_MODE}}
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@K3S_VERSION@/${K3S_VERSION:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
     TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TRAEFIK_CONFIG_YAML@/${TRAEFIK_CONFIG_YAML}}
@@ -1793,7 +1795,7 @@ fi
 echo "Using flannel interface: \$CLOUD_NET_IFACE"
 export K3S_URL="https://${MASTER_PRIVATE_IP}:6443"
 export K3S_TOKEN="${MASTER_NODE_TOKEN}"
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="agent \
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${K3S_VERSION:-}" INSTALL_K3S_EXEC="agent \
   --node-ip ${PRIVATE_IP_ADDR} \
   --node-external-ip ${EXTERNAL_IP} \
   --flannel-iface \$CLOUD_NET_IFACE" sh -

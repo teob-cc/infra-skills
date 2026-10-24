@@ -57,6 +57,9 @@ ACME_EMAIL=<acme-email>
 # Optional — Let's Encrypt staging (untrusted certs, no rate limits) for throwaway envs that
 # get wiped and rebuilt often; leave unset for anything people will use in a browser:
 # ACME_STAGING=true
+# Optional — pin the k3s version the provisioners install on servers and agents (default: the stable
+# channel of the day). Pin it for a reprovision, to the version a sibling env runs well:
+# K3S_VERSION=v1.36.4+k3s1
 # Optional — Hetzner image name prefix for bare-metal (default Ubuntu-2404-noble):
 # BASE_OS_IMAGE=Ubuntu-2604-resolute
 # Optional — CI runner pod sizing (defaults fit JVM builds on a 64 GiB node; two runners):

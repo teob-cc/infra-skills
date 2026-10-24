@@ -1662,8 +1662,9 @@ else
   # Only install k3s server on master nodes
   # Worker nodes will have k3s agent installed later via the provisioning script
   if [[ "@WORKER_MODE@" != "true" ]]; then
-    echo "[postinstall] Installing k3s server (skip auto-start); logging to /root/k3s-install.log ..."
-    curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true sh - >/root/k3s-install.log 2>&1 || true
+    echo "[postinstall] Installing k3s server @K3S_VERSION@ (skip auto-start); logging to /root/k3s-install.log ..."
+    # An empty INSTALL_K3S_VERSION means the stable channel of the day (env.properties K3S_VERSION pins it).
+    curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="@K3S_VERSION@" INSTALL_K3S_SKIP_START=true sh - >/root/k3s-install.log 2>&1 || true
   else
     echo "[postinstall] Worker mode detected; skipping k3s server installation (agent will be installed later)"
   fi
@@ -2790,6 +2791,7 @@ if $RUN_FOLLOWUP; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_IP@/${TAILSCALE_IP:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@MASTER_VLAN_IP@/${MASTER_VLAN_IP:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@WORKER_MODE@/${WORKER_MODE}}
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@K3S_VERSION@/${K3S_VERSION:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
     TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TRAEFIK_CONFIG_YAML@/${TRAEFIK_CONFIG_YAML}}
@@ -3059,7 +3061,7 @@ if $DEFAULT_RUN_ALL; then
 set -euo pipefail
 export K3S_URL="https://${MASTER_VLAN_IP}:6443"
 export K3S_TOKEN="${MASTER_NODE_TOKEN}"
-curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="agent \
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="${K3S_VERSION:-}" INSTALL_K3S_EXEC="agent \
   --node-ip ${VLAN_IP_ADDR} \
   --node-external-ip ${EXTERNAL_IP}" sh -
 
