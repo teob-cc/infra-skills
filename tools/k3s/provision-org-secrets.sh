@@ -458,12 +458,10 @@ if [[ "$SKIP_ENVIRONMENTS" != "true" ]]; then
     warn "The GitHub App needs repository access and 'Secrets'/'Environments' permissions"
   else
     for repo in $all_repos; do
-      # Does this repo have an environment named after the target env?
-      if ! gh api "repos/${github_org}/${repo}/environments/${ENV_NAME}" >/dev/null 2>&1; then
-        continue
-      fi
-
-      # Which of our candidate secrets already exist there?
+      # Which of our candidate secrets already exist in the repo's environment named after the
+      # target env? No separate "does the environment exist" probe: GET environments/<env> needs
+      # the App's Environments permission (403 without it), which made this step skip every repo;
+      # the secrets listing needs only Secrets and returns nothing when there is no such env.
       existing=$(gh api --paginate "repos/${github_org}/${repo}/environments/${ENV_NAME}/secrets" \
         --jq '.secrets[].name' 2>/dev/null || true)
       [[ -z "$existing" ]] && continue
