@@ -290,6 +290,15 @@ tools/k3s/provision-org-secrets.sh <env>
 tools/backup.sh <env>              # nightly rdiff-backup of /data to your backup host (BACKUP_* in env.properties)
 tools/backup.sh <env> --run-now    # first run, then verify on the backup host
 ```
+`backup.sh` owns a marked block in root's crontab (other entries are kept). At 05:45 it snapshots
+the k3s server state into `/data/users/k3s-server-state/<date>` (root-only, newest
+`BACKUP_K3S_STATE_KEEP`=3 kept): a consistent datastore copy (`sqlite3 .backup` of kine's
+`state.db`, or `k3s etcd-snapshot save`), `server/token`, `server/tls/`, `server/cred/`,
+`server/manifests/` and `/etc/rancher/k3s/`; the 06:00 rdiff carries it off the node. That puts
+the **cluster CA private keys and the secrets-encryption key on the backup host**: without them a
+datastore restore can read no Secret and every kubeconfig and node must be re-issued, so guard
+the backup host's repo and the backup SSH key like the cluster itself. A failed snapshot shows
+up as `NasBackupStale` for repo `<env>-k3s-server-state`.
 
 ### Step 12 — Environment-specific post-provision items
 Anything the generic stack does not cover lives in the environment's own `CLAUDE.md` under

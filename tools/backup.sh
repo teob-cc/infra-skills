@@ -8,9 +8,24 @@ set -euo pipefail
 # 1. Optionally creates a per-app user with home under /data/users
 #    (see BACKUP_APP_USER below)
 # 2. Creates backup-user (UID 11002) with SSH key for remote backups
-# 3. Installs rdiff-backup
+# 3. Installs rdiff-backup and sqlite3
 # 4. Installs the k3s-storage sweep, which leaves out every CloudNativePG volume
-# 5. Sets up daily cron: backup at 06:00, increment cleanup (${BACKUP_RETENTION:-30D}) at 06:30
+# 5. Installs the k3s server-state snapshot (see below)
+# 6. Sets up daily cron: server state 05:45, backup 06:00, k3s-storage 06:15, increment
+#    cleanup (${BACKUP_RETENTION:-30D}) 06:30/06:35. These live in a marked block of
+#    root's crontab; any other entries in it are kept.
+#
+# k3s server state (/usr/local/bin/k3s-server-state-snapshot, 05:45): a consistent copy of
+# the datastore (sqlite .backup of kine's state.db, or k3s etcd-snapshot save on embedded
+# etcd) plus server/token, server/tls/, server/cred/, server/manifests/ and /etc/rancher/k3s/,
+# in a root-only (0700) dated dir under /data/users/k3s-server-state, the newest
+# ${BACKUP_K3S_STATE_KEEP:-3} kept. The 06:00 rdiff takes it to the backup host.
+# SECURITY: this puts the cluster CA private keys, the join token, the admin kubeconfig and
+# the secrets-encryption key on the backup host. Anyone who can read the backup repo there
+# can impersonate the cluster's API server and read every Secret in the datastore copy.
+# That is the point (without server/cred/ an encrypted datastore restore cannot read a
+# single Secret, and without tls/ every node and kubeconfig must be re-issued), so guard
+# the backup host and its SSH key accordingly.
 #
 # The backup runs over your VPN directly to the backup host (no SSH tunnel).
 #
@@ -28,6 +43,7 @@ set -euo pipefail
 #   BACKUP_APP_UID       #   if unset (e.g. 1002)
 #   BACKUP_K3S_EXCLUDES  # further PVC-dir globs to leave out of the k3s-storage
 #                        # sweep, space-separated, e.g. "*_observability_prometheus-server"
+#   BACKUP_K3S_STATE_KEEP  # dated k3s server-state copies kept on the node (default: 3)
 #
 # Every variable may also be set in the environment's env.properties, which wins
 # over the shell environment.
@@ -129,6 +145,14 @@ REMOTE_K3S_BACKUP_DIR="${REMOTE_BACKUP_BASE}/${ENV_NAME}-k3s-storage"
 
 RDIFF_SCHEMA="ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 %s ${REMOTE_RDIFF_BIN} --server"
 K3S_SWEEP="/usr/local/bin/nas-backup-k3s-storage"
+# k3s server state (see the header): snapshot script, its root-only target under DATA_DIR.
+K3S_STATE_SNAPSHOT="/usr/local/bin/k3s-server-state-snapshot"
+K3S_STATE_DIR="${DATA_DIR}/k3s-server-state"
+K3S_STATE_KEEP="${BACKUP_K3S_STATE_KEEP:-3}"
+[[ "$K3S_STATE_KEEP" =~ ^[1-9][0-9]*$ ]] || { echo "BACKUP_K3S_STATE_KEEP must be a positive integer" >&2; exit 1; }
+# Marks the part of root's crontab this script owns; everything outside it is left alone.
+CRON_BEGIN="# BEGIN infra-skills backup.sh (managed block, re-run tools/backup.sh to change)"
+CRON_END="# END infra-skills backup.sh"
 
 log()  { echo "[backup] $*"; }
 info() { echo "[backup:info] $*"; }
@@ -175,6 +199,9 @@ if $SHOW_STATUS; then
     echo
     echo \"=== Backup SSH key ===\"
     ls -la ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 2>/dev/null || echo \"no SSH key\"
+    echo
+    echo \"=== k3s server state (${K3S_STATE_DIR}) ===\"
+    ls -la ${K3S_STATE_DIR}/ 2>/dev/null || echo \"not present\"
   '"
   exit 0
 fi
@@ -182,6 +209,12 @@ fi
 # --- Run backup now ---
 if $RUN_NOW; then
   log "Running backup now for ${ENV_NAME} ..."
+  if remote "test -x ${K3S_STATE_SNAPSHOT}"; then
+    log "  k3s server state -> ${K3S_STATE_DIR}"
+    remote "${K3S_STATE_SNAPSHOT}" || err "k3s server-state snapshot failed; continuing with the rdiff"
+  else
+    warn "${K3S_STATE_SNAPSHOT} is not installed; run $0 ${ENV_NAME} first."
+  fi
   log "  /data/users -> ${REMOTE_BACKUP_DIR}"
   remote "rdiff-backup --remote-schema '${RDIFF_SCHEMA}' ${DATA_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}"
   if ! remote "test -x ${K3S_SWEEP}"; then
@@ -276,6 +309,8 @@ if ! $SKIP_RDIFF; then
 else
   info "Skipping rdiff-backup installation."
 fi
+# sqlite3 takes the consistent copy of kine's state.db (Step 3d); not skippable with the above.
+remote bash -c "'command -v sqlite3 >/dev/null || { apt-get update -qq && apt-get install -y -qq sqlite3; }'"
 
 # --- Step 3b: Install the NAS-sync success-stamp helper ---
 # Each successful rdiff cron stamps a timestamp metric into node-exporter's
@@ -339,13 +374,78 @@ remote "cat > ${K3S_SWEEP} && chmod 755 ${K3S_SWEEP}" < "$SWEEP_TMP"
 rm -f "$SWEEP_TMP"
 info "Sweep installed; excluded now: $(remote "k3s kubectl get pvc -A -l cnpg.io/cluster -o name | wc -l") CNPG volume(s) plus ${#K3S_STORAGE_EXCLUDES[@]} glob(s)."
 
+# --- Step 3d: Install the k3s server-state snapshot ---
+# See the header: the datastore, CA keys, token and secrets-encryption key, into a root-only
+# dir the 06:00 rdiff picks up. The datastore is never copied as a live file: sqlite's online
+# backup (or an etcd snapshot) gives a consistent point in time, a plain cp of state.db plus
+# its -wal does not. A failure stamps nothing, so NasBackupStale fires for the repo
+# <env>-k3s-server-state after 26h.
+log "Step 3d: Installing k3s server-state snapshot ${K3S_STATE_SNAPSHOT} ..."
+STATE_TMP=$(mktemp)
+state_script=$(cat << 'STATE'
+#!/bin/sh
+# k3s-server-state-snapshot — consistent copy of the k3s server state for the nightly rdiff.
+# Installed by infra-skills/tools/backup.sh; run by root's crontab at 05:45.
+# The copy holds the cluster CA private keys (tls/), the join token, the admin kubeconfig
+# (etc-rancher-k3s/k3s.yaml) and the secrets-encryption key (cred/encryption-config.json):
+# it is root-only here and must be guarded on the backup host as well.
+# Restore outline: stop k3s; put tls/, cred/, token back under /var/lib/rancher/k3s/server/,
+# the datastore back as db/state.db (gunzip) or via k3s server --cluster-reset
+# --cluster-reset-restore-path=<snapshot> (etcd); config from etc-rancher-k3s/; start k3s.
+set -eu
+umask 077
+srv=/var/lib/rancher/k3s/server
+dest='@DEST@'
+keep='@KEEP@'
+[ -d "$srv" ] || { echo "$srv not present (not a k3s server), nothing to snapshot"; exit 0; }
+mkdir -p "$dest"
+chmod 700 "$dest"
+day=$(date +%Y-%m-%d)
+work="$dest/.partial-$day"
+rm -rf "$work"
+mkdir "$work"
+if [ -d "$srv/db/etcd/member" ]; then
+  k3s etcd-snapshot save --dir "$work" --name k3s-state >/dev/null
+elif [ -f "$srv/db/state.db" ]; then
+  sqlite3 "$srv/db/state.db" ".backup '$work/state.db'"
+  # The copy inherits WAL mode; switch it to a single self-contained file before checking it.
+  check=$(sqlite3 "$work/state.db" 'PRAGMA journal_mode=DELETE; PRAGMA integrity_check;' | tail -n 1)
+  rm -f "$work/state.db-wal" "$work/state.db-shm"
+  [ "$check" = ok ] || { echo "integrity_check of the copy failed: $check" >&2; exit 1; }
+  gzip -1 "$work/state.db"
+else
+  echo "no datastore under $srv/db (neither etcd/member nor state.db)" >&2
+  exit 1
+fi
+cp -a "$srv/token" "$srv/tls" "$srv/cred" "$srv/manifests" "$work/"
+[ -d /etc/rancher/k3s ] && cp -a /etc/rancher/k3s "$work/etc-rancher-k3s"
+rm -rf "${dest:?}/$day"
+mv "$work" "$dest/$day"
+ls -1d "$dest"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] | sort -r | tail -n +"$((keep + 1))" | while read -r old; do
+  rm -rf "$old"
+done
+/usr/local/bin/nas-backup-stamp '@REPO@'
+STATE
+)
+state_script=${state_script//@DEST@/$K3S_STATE_DIR}
+state_script=${state_script//@KEEP@/$K3S_STATE_KEEP}
+state_script=${state_script//@REPO@/${ENV_NAME}-k3s-server-state}
+printf '%s\n' "$state_script" > "$STATE_TMP"
+remote "cat > ${K3S_STATE_SNAPSHOT} && chmod 700 ${K3S_STATE_SNAPSHOT}" < "$STATE_TMP"
+rm -f "$STATE_TMP"
+info "Snapshot installed: ${K3S_STATE_DIR}/<date>, newest ${K3S_STATE_KEEP} kept (holds the cluster CA keys and the secrets-encryption key)."
+
 # --- Step 4: Configure cron ---
 log "Step 4: Setting up cron jobs ..."
 
 # In crontab, % means newline — must be escaped as \%
 RDIFF_SCHEMA_CRON="${RDIFF_SCHEMA//%/\\%}"
 
-remote bash -c "\"cat > /tmp/backup-crontab.txt << 'CRON'
+# The schedule, as the block this script owns in root's crontab.
+CRON_BLOCK="${CRON_BEGIN}
+# k3s server state (datastore, CA keys, token, secrets-encryption key) into ${K3S_STATE_DIR} at 05:45
+45 5 * * * ${K3S_STATE_SNAPSHOT}
+
 # Backup ${DATA_DIR} to the backup host over the VPN at 06:00
 0 6 * * * rdiff-backup --remote-schema '${RDIFF_SCHEMA_CRON}' ${DATA_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}
 
@@ -356,8 +456,32 @@ remote bash -c "\"cat > /tmp/backup-crontab.txt << 'CRON'
 # Remove increments older than ${BACKUP_RETENTION} at 06:30
 30 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
 35 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR}
-CRON
-crontab /tmp/backup-crontab.txt && rm /tmp/backup-crontab.txt\""
+${CRON_END}"
+
+# Merge it into root's crontab instead of replacing the crontab: the old block is swapped
+# for the new one, every other entry stays. Lines an older backup.sh wrote without markers
+# (they name the backup target or the sweep, or carry its comments) are dropped once, so
+# the first run with markers does not double the schedule.
+CRON_MERGE_TMP=$(mktemp)
+{
+  printf '%s\n' "set -eu" "block=\$(cat <<'CRON_BLOCK_EOF'"
+  printf '%s\n' "$CRON_BLOCK"
+  printf '%s\n' "CRON_BLOCK_EOF" ")"
+  printf "begin='%s' end='%s' target='%s' sweep='%s'\n" "$CRON_BEGIN" "$CRON_END" \
+    "${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_BASE}" "$K3S_SWEEP"
+  cat <<'MERGE'
+kept=$( (crontab -l 2>/dev/null || true) | awk -v b="$begin" -v e="$end" -v t="$target" -v s="$sweep" '
+  $0 == b { skip = 1; next }
+  $0 == e { skip = 0; next }
+  skip { next }
+  index($0, t) || index($0, s) { next }
+  /^# (Backup \/data\/|Excludes live PGDATA|Remove increments older than)/ { next }
+  { print }' | cat -s | sed '/./,$!d')
+{ if [ -n "$kept" ]; then printf '%s\n\n' "$kept"; fi; printf '%s\n' "$block"; } | crontab -
+MERGE
+} > "$CRON_MERGE_TMP"
+remote "bash -s" < "$CRON_MERGE_TMP"
+rm -f "$CRON_MERGE_TMP"
 
 info "Cron jobs installed."
 remote crontab -l
@@ -374,10 +498,10 @@ fi
 echo
 log "Backup provisioning complete for ${ENV_NAME}."
 log "  Backup user:    ${BACKUP_USER} (UID ${BACKUP_UID})"
-log "  Sources:        ${DATA_DIR}, ${K3S_STORAGE_DIR} (excl. live PGDATA, Loki, Trivy)"
+log "  Sources:        ${DATA_DIR} (incl. ${K3S_STATE_DIR}), ${K3S_STORAGE_DIR} (excl. live PGDATA, Loki, Trivy)"
 log "  Remote (users): ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_BACKUP_DIR}"
 log "  Remote (k3s):   ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_K3S_BACKUP_DIR}"
-log "  Schedule:       daily 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup ${BACKUP_RETENTION})"
+log "  Schedule:       daily 05:45 (k3s server state), 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup ${BACKUP_RETENTION})"
 log ""
 log "To run a backup now:  $0 ${ENV_NAME} --run-now"
 log "To check status:      $0 ${ENV_NAME} --show-status"
