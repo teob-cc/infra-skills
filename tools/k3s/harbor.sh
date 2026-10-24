@@ -12,6 +12,15 @@ set -euo pipefail
 # Usage:
 #   tools/k3s/harbor.sh <env-name> [--skip-node-auth]
 #
+# Who logs in how: people use SSO (Dex OIDC; members of <org>:admins are Harbor admins), CI and
+# the nodes use robot accounts (robot$runner for push, robot$node-pull for pull). Nobody uses
+# the local `admin` account: it exists only for this script's API bootstrap (registry endpoint,
+# projects, robots, retention, OIDC switch). Its password is random, generated at first install,
+# and kept only in the cluster (Secret harbor/harbor-core, key HARBOR_ADMIN_PASSWORD, which each
+# re-run reads back): never in env.properties, secrets.plain/ or secrets.sops/, and never on a
+# command line (Helm gets it from a 0600 values file, curl from a -K config on a pipe). A
+# reprovision generates a new one. With OIDC on, the Harbor UI refuses it anyway.
+#
 # Pull credentials and private projects (Phase 4b): the `library` and `dockerhub-proxy`
 # projects are private by default. Before they turn private, a pull-only robot
 # (robot$node-pull) is created and its credential lands in:
@@ -78,6 +87,14 @@ info() { echo "[registry:info] $*"; }
 warn() { echo "[registry:warn] $*" >&2; }
 err() { echo "[registry:error] $*" >&2; }
 
+# curl as Harbor's admin: admin_curl PASSWORD [curl args...]. The credential reaches curl as a
+# config on a file descriptor (-K), never on argv, where any local user could read it in ps.
+admin_curl() {
+  local pw="$1"
+  shift
+  curl -K <(provision::curl_user_cfg admin "$pw") "$@"
+}
+
 # --- Config defaults ---
 NAMESPACE_HARBOR="${NAMESPACE_HARBOR:-harbor}"
 NAMESPACE_ARGOCD="${NAMESPACE_ARGOCD:-argocd}"
@@ -134,7 +151,14 @@ fi
 # harborAdminPassword only seeds the admin account when Harbor's database is created; setting a
 # new one on an upgrade changes the harbor-core Secret but not the account, and every API call
 # this script makes afterwards (it reads the Secret) is refused. So a re-run keeps the
-# installed value unless HARBOR_ADMIN_PASSWORD is given explicitly.
+# installed value unless HARBOR_ADMIN_PASSWORD is given explicitly (shell environment only).
+# The password lives in the cluster alone (harbor/harbor-core and the Helm release); see the
+# header. env.properties is committed, so a password there is refused.
+if grep -qE '^[[:space:]]*(export[[:space:]]+)?HARBOR_ADMIN_PASSWORD=' "${ENVS_ROOT}/${ENV_NAME}/env.properties" 2>/dev/null; then
+  err "HARBOR_ADMIN_PASSWORD is set in ${ENV_NAME}/env.properties. Remove it: the admin password is"
+  err "generated at first install and kept only in the cluster (harbor/harbor-core)."
+  exit 1
+fi
 if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" ]]; then
   HARBOR_ADMIN_PASSWORD=$(kubectl -n "$NAMESPACE_HARBOR" get secret harbor-core \
     -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
@@ -290,6 +314,14 @@ install_harbor() {
   fi
   info "  Chart harbor ${HARBOR_CHART_VERSION}, image ${HARBOR_IMAGE_TAG:-<chart appVersion>}, TLS from secret ${tls_secret_name}"
 
+  # The admin password goes to Helm in a values file only this user can read (mktemp: 0600),
+  # removed when the script exits; --set would put it on helm's argv. JSON is valid YAML, and
+  # jq -R reads the password from stdin, so it is on no command line here either.
+  ADMIN_VALUES_FILE=$(mktemp)
+  trap 'rm -f "$ADMIN_VALUES_FILE"' EXIT
+  printf '%s' "$HARBOR_ADMIN_PASSWORD" | jq -Rs '{harborAdminPassword: .}' > "$ADMIN_VALUES_FILE"
+  common_args+=(-f "$ADMIN_VALUES_FILE")
+
   # Storage configuration with defaults
   local registry_size="${REGISTRY_SIZE:-50Gi}"
   local chartmuseum_size="${CHARTMUSEUM_SIZE:-5Gi}"
@@ -312,7 +344,6 @@ install_harbor() {
       --timeout 15m \
       --reuse-values \
       "${common_args[@]}" \
-      --set harborAdminPassword="$HARBOR_ADMIN_PASSWORD" \
       --set persistence.enabled=true \
       --set persistence.resourcePolicy=keep
     
@@ -336,7 +367,6 @@ install_harbor() {
       --set-string expose.ingress.annotations."acme\.cert-manager\.io/http01-edit-in-place"="true" \
       "${common_args[@]}" \
       --set externalURL="https://$HARBOR_HOST" \
-      --set harborAdminPassword="$HARBOR_ADMIN_PASSWORD" \
       --set persistence.enabled=true \
       --set persistence.resourcePolicy=keep \
       --set persistence.imageChartStorage.type=filesystem \
@@ -443,8 +473,7 @@ EOF
 )
   
   local registry_response registry_http_code registry_body registry_id
-  registry_response=$(curl "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
-    -u "admin:${admin_password}" \
+  registry_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST \
     -d "${registry_payload}" \
@@ -464,8 +493,7 @@ EOF
   fi
 
   # Always resolve registry_id via GET to avoid relying on POST response body
-  registry_id=$(curl "${curl_args[@]}" --max-time 10 \
-    -u "admin:${admin_password}" \
+  registry_id=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 \
     "${api_url}/registries?page_size=100" 2>/dev/null | jq -r '.[] | select(.name == "dockerhub") | .id' 2>/dev/null || true)
   if [[ -n "$registry_id" && "$registry_id" != "null" ]]; then
     info "  Resolved dockerhub registry ID: ${registry_id}"
@@ -501,8 +529,7 @@ EOF
     info "  Project payload: ${proxy_payload}"
     
     local proxy_response proxy_http_code proxy_body
-    proxy_response=$(curl "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
-      -u "admin:${admin_password}" \
+    proxy_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
       -H "Content-Type: application/json" \
       -X POST \
       -d "${proxy_payload}" \
@@ -517,8 +544,7 @@ EOF
       info "✓ Docker Hub proxy cache project already exists"
       # Verify it's configured as proxy cache and patch if necessary
       local project_info project_id project_registry_id
-      project_info=$(curl "${curl_args[@]}" --max-time 10 \
-        -u "admin:${admin_password}" \
+      project_info=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 \
         "${api_url}/projects?name=dockerhub-proxy" 2>/dev/null || true)
       project_id=$(echo "$project_info" | jq -r '.[0].project_id // empty' 2>/dev/null || true)
       project_registry_id=$(echo "$project_info" | jq -r '.[0].registry_id // empty' 2>/dev/null || true)
@@ -538,8 +564,7 @@ EOF
 EOF
 )
         info "  Patch payload: ${patch_payload}"
-        patch_response=$(curl "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
-          -u "admin:${admin_password}" \
+        patch_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
           -H "Content-Type: application/json" \
           -X PUT \
           -d "${patch_payload}" \
@@ -561,7 +586,8 @@ EOF
       err "Response: ${proxy_body}"
       err ""
       err "Manual recovery - run this command:"
-      err "  curl -u admin:PASSWORD -H 'Content-Type: application/json' -X POST \\"
+      err "  curl -K <(printf 'user = \"admin:%s\"\\n' \"\$(kubectl -n harbor get secret harbor-core -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)\") \\"
+      err "    -H 'Content-Type: application/json' -X POST \\"
       err "    -d '{\"project_name\":\"dockerhub-proxy\",\"metadata\":{\"public\":\"true\"},\"registry_id\":${registry_id},\"storage_limit\":-1}' \\"
       err "    https://${HARBOR_HOST}/api/v2.0/projects"
     fi
@@ -594,8 +620,7 @@ EOF
 )
   
   local robot_response robot_http_code robot_body
-  robot_response=$(curl "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
-    -u "admin:${admin_password}" \
+  robot_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
     -H "Content-Type: application/json" \
     -X POST \
     -d "${robot_payload}" \
@@ -612,10 +637,10 @@ EOF
     info "✓ Robot account created: ${robot_name}"
     
     # Store credentials in Kubernetes secret
-    kubectl -n "$NAMESPACE_HARBOR" create secret generic harbor-robot-runner \
-      --from-literal=username="${robot_name}" \
-      --from-literal=password="${robot_secret}" \
-      --dry-run=client -o yaml | kubectl apply -f -
+    # Built with printf (a builtin) and piped, so the secret is on no command line.
+    printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: harbor-robot-runner\n  namespace: %s\ntype: Opaque\ndata:\n  username: %s\n  password: %s\n' \
+      "$NAMESPACE_HARBOR" "$(printf '%s' "$robot_name" | base64 | tr -d '\n')" \
+      "$(printf '%s' "$robot_secret" | base64 | tr -d '\n')" | kubectl apply -f -
     
     info "  Robot credentials stored in harbor/harbor-robot-runner secret"
     info "  Username: ${robot_name}"
@@ -649,7 +674,7 @@ configure_harbor_retention_gc() {
 
   # --- Tag-retention policy on the default `library` project ---
   local lib_meta lib_project_id lib_retention_id
-  lib_meta=$(curl "${curl_args[@]}" --max-time 10 -u "admin:${admin_password}" \
+  lib_meta=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 \
     "${api_url}/projects/library" 2>/dev/null || true)
   lib_project_id=$(echo "$lib_meta" | jq -r '.project_id // empty' 2>/dev/null || true)
   lib_retention_id=$(echo "$lib_meta" | jq -r '.metadata.retention_id // empty' 2>/dev/null || true)
@@ -678,8 +703,8 @@ configure_harbor_retention_gc() {
 EOF
 )
     local rt_response rt_code
-    rt_response=$(curl "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
-      -u "admin:${admin_password}" -H "Content-Type: application/json" \
+    rt_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
+      -H "Content-Type: application/json" \
       -X POST -d "${retention_payload}" "${api_url}/retentions" 2>&1 || echo -e "\n000")
     rt_code=$(echo "$rt_response" | tail -n 1)
     if [[ "$rt_code" == "201" ]]; then
@@ -692,13 +717,13 @@ EOF
   # --- Weekly garbage collection (purges blobs of deleted/untagged artifacts) ---
   local gc_payload gc_response gc_code
   gc_payload='{"schedule":{"type":"Weekly","cron":"0 0 3 * * 0"},"parameters":{"delete_untagged":true,"dry_run":false,"workers":2}}'
-  gc_response=$(curl "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
-    -u "admin:${admin_password}" -H "Content-Type: application/json" \
+  gc_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
+    -H "Content-Type: application/json" \
     -X POST -d "${gc_payload}" "${api_url}/system/gc/schedule" 2>&1 || echo -e "\n000")
   gc_code=$(echo "$gc_response" | tail -n 1)
   if [[ "$gc_code" == "409" || "$gc_code" == "400" ]]; then
-    gc_response=$(curl "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
-      -u "admin:${admin_password}" -H "Content-Type: application/json" \
+    gc_response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 15 -w "\n%{http_code}" \
+      -H "Content-Type: application/json" \
       -X PUT -d "${gc_payload}" "${api_url}/system/gc/schedule" 2>&1 || echo -e "\n000")
     gc_code=$(echo "$gc_response" | tail -n 1)
   fi
@@ -750,11 +775,10 @@ EOF
   info "  Admin group: ${github_org_for_harbor}:admins"
   
   local response http_code
-  response=$(curl "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
-    -u "admin:${admin_password}" \
+  response=$(admin_curl "$admin_password" "${curl_args[@]}" --max-time 10 -w "\n%{http_code}" \
     -H "Content-Type: application/json" \
     -X PUT \
-    -d "${config_payload}" \
+    --data-binary @<(printf '%s' "${config_payload}") \
     "${api_url}/configurations" 2>&1 || echo -e "\n000")
   
   http_code=$(echo "$response" | tail -n 1)
@@ -794,8 +818,8 @@ configure_harbor() {
   local harbor_ready=false
   for i in {1..120}; do
     local http_code
-    http_code=$(curl "${curl_args[@]}" --max-time 5 -w "%{http_code}" -o /dev/null \
-      -u "admin:${actual_harbor_password}" "${base_api}/systeminfo" 2>/dev/null || echo "000")
+    http_code=$(admin_curl "$actual_harbor_password" "${curl_args[@]}" --max-time 5 -w "%{http_code}" -o /dev/null \
+      "${base_api}/systeminfo" 2>/dev/null || echo "000")
     
     if [[ "$http_code" == "200" ]]; then
       harbor_ready=true
@@ -824,8 +848,7 @@ configure_harbor() {
   
   # Check if Harbor is already configured with OIDC
   local current_config
-  current_config=$(curl "${curl_args[@]}" --max-time 10 \
-    -u "admin:${actual_harbor_password}" \
+  current_config=$(admin_curl "$actual_harbor_password" "${curl_args[@]}" --max-time 10 \
     "${base_api}/systeminfo" 2>/dev/null || true)
   
   local current_auth_mode
@@ -878,8 +901,9 @@ curl_cfg_quote() { local s="${1//\\/\\\\}"; printf '%s' "${s//\"/\\\"}"; }
 harbor_api() {
   local method="$1" path="$2" data="${3:-}"
   local args=(-sS --max-time 20 -X "$method" -H "Content-Type: application/json" -w '\n%{http_code}')
-  [[ -n "$data" ]] && args+=(-d "$data")
-  curl "${args[@]}" -K <(printf 'user = "admin:%s"\n' "$(curl_cfg_quote "$HARBOR_API_PASSWORD")") \
+  # The body can carry a secret (a robot's new one), so it goes in on stdin, not on argv.
+  [[ -n "$data" ]] && args+=(--data-binary @-)
+  printf '%s' "$data" | curl "${args[@]}" -K <(provision::curl_user_cfg admin "$HARBOR_API_PASSWORD") \
     "https://${HARBOR_HOST}/api/v2.0${path}" 2>/dev/null || printf '\n000'
 }
 http_code() { printf '%s' "${1##*$'\n'}"; }
@@ -964,7 +988,7 @@ ensure_node_pull_credentials() {
     # upper + lower + digit). Whatever used the old secret must take the new one.
     local secret
     secret="Np1$(openssl rand -hex 20)"
-    out=$(harbor_api PATCH "/robots/${robot_id}" "$(jq -cn --arg s "$secret" '{secret: $s}')")
+    out=$(harbor_api PATCH "/robots/${robot_id}" "$(printf '%s' "$secret" | jq -Rc '{secret: .}')")
     if [[ "$(http_code "$out")" != "200" ]]; then
       err "Could not refresh the secret of robot id ${robot_id} (HTTP $(http_code "$out"))"
       return 1

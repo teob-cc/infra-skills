@@ -169,6 +169,12 @@ the projects stay as they are until each agent has been (re)joined with `join-wo
 script is re-run with `HARBOR_PRIVATE_PROJECTS=force`. Pins: `HARBOR_CHART_VERSION`,
 `HARBOR_IMAGE_TAG` (docs/GITOPS.md).
 
+People log in with SSO, CI and the nodes with robot accounts. The local `admin` account is only
+the script's API bootstrap: its random password is generated at first install and lives only in
+the cluster (`harbor/harbor-core`, key `HARBOR_ADMIN_PASSWORD`), never in env.properties or the
+secrets dirs (the script refuses it in env.properties), and a reprovision makes a new one. Do not
+copy it anywhere.
+
 ### Step 5 — Harbor Credentials + GitHub Actions Runners
 The custom runner image is built by **your envs repo**, through a thin caller workflow that
 runs the public reusable `build-runner-image.yml` on your own runners (`/new-env` scaffolds it;
