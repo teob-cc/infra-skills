@@ -248,6 +248,25 @@ reachable only through Pomerium (NetworkPolicy `pgweb-from-pomerium-only`); it i
 log in with a database role. Supports `--provision-credentials <app-id>` for per-app DB users.
 `PG_READONLY_ROLE=claude_ro` in `env.properties` adds a read-only login (CNPG managed role,
 `pg_read_all_data`, read-only sessions; password SOPS-encrypted into the envs repo).
+New clusters get `scram-sha-256` pg_hba lines. On an existing cluster that still has `md5` lines,
+the script prints the patch and a check query; do not apply the patch until that query returns no
+rows (docs/POSTGRES-BACKUP.md, "md5 to SCRAM").
+
+**Point-in-time recovery** (opt-in): set `PG_WAL_ARCHIVE=minio` and put `minio` in
+`UP_OPTIONAL_STEPS`. up.sh always runs minio before postgres, or you can run `tools/k3s/minio.sh <env>`
+first by hand. postgres.sh then sets up four things:
+- it installs the Barman Cloud plugin next to the operator;
+- it creates a MinIO bucket, plus an access key that can reach only that bucket (SOPS-encrypted into
+  the envs repo);
+- it creates the ObjectStore (`PG_BACKUP_RETENTION`, default 7d);
+- it adds the WAL archiver to a **new** cluster, plus a daily ScheduledBackup at 02:00 UTC
+  (`PG_BACKUP_SCHEDULE`), which finishes before the 06:15 NAS sweep.
+
+On an existing cluster the script prints the plugin patch and applies nothing; applying it restarts
+the instance. Once the cluster is up, run the restore drill in docs/POSTGRES-BACKUP.md and record the
+result. That doc also covers recovery after losing the node: restore the MinIO volume from the NAS,
+then run postgres.sh with `PG_RECOVER_FROM=postgres-cluster` and a new `PG_BACKUP_SERVER_NAME`, and it
+bootstraps the cluster from its backups instead of initdb.
 
 **Redpanda + ScyllaDB** (Kafka-style journal persistence stack) — only for environments running
 apps that need it:

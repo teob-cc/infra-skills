@@ -34,6 +34,18 @@ set -euo pipefail
 #                                route; default: <github-org>:admins. pgweb has no login of its
 #                                own, so a NetworkPolicy (pgweb-from-pomerium-only) also keeps
 #                                every in-cluster client but Pomerium away from it.
+#   PG_WAL_ARCHIVE=minio         Continuous backup with point-in-time recovery (off when unset):
+#                                the Barman Cloud plugin archives WAL and takes base backups to
+#                                the env's MinIO (tools/k3s/minio.sh, in-cluster endpoint), see
+#                                "Continuous backup" below and docs/POSTGRES-BACKUP.md
+#   PG_BACKUP_RETENTION=7d       Recovery window kept in the object store (Nd, Nw or Nm)
+#   PG_BACKUP_SCHEDULE="0 0 2 * * *"
+#                                Base backup schedule (CNPG cron, with seconds, operator time = UTC);
+#                                the default finishes before the 06:15 k3s-storage NAS sweep
+#   PG_RECOVER_FROM=postgres-cluster  PG_BACKUP_SERVER_NAME=postgres-cluster-20261024
+#                                A new cluster is recovered from its backups instead of initdb
+#                                (rebuilt node; optional PG_RECOVER_TARGET_TIME), and archives into
+#                                a new folder of the bucket
 # ============================================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
@@ -169,8 +181,9 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 # PostgreSQL operand image (CNPG postgres-containers). Use the immutable
 # MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
 # "system" images on Debian bullseye, slated for removal upstream. "standard" = minimal +
-# pgvector, pgaudit, pg_failover_slots, all locales; it needs no Barman binaries
-# because these clusters back up with pg_dump CronJobs, not barmanObjectStore.
+# pgvector, pgaudit, pg_failover_slots, all locales. It carries no Barman binaries and needs
+# none: continuous backup (PG_WAL_ARCHIVE) runs barman-cloud in the Barman Cloud plugin's
+# sidecar, not in the operand image (the in-tree barmanObjectStore would need them).
 # 16.15-202610190958-standard-trixie = sha256:f105e137d731f6ac4f69667383f2373345ce8b72dadcc10ab6d385a7a32d6e7f
 # (pgvector 0.8.7, glibc 2.41). Like the operator, a running cluster keeps its image;
 # a changed POSTGRES_IMAGE only warns (see create_postgres_cluster).
@@ -204,6 +217,95 @@ if [[ -n "$PG_READONLY_ROLE" ]]; then
   fi
   PG_READONLY_SECRET="${PG_READONLY_SECRET:-${PG_READONLY_ROLE//_/-}-pg}"
   PG_READONLY_SOPS_FILE="${PG_READONLY_SOPS_FILE:-${PG_READONLY_SECRET}-postgres-cluster.yaml}"
+fi
+
+# Continuous backup (point-in-time recovery), opt-in: PG_WAL_ARCHIVE=minio in env.properties.
+# Unset (or "off") = nothing of it is installed, created or patched, and the cluster
+# manifest renders without a plugins block.
+#   BARMAN_PLUGIN_CHART_VERSION  Helm chart of the Barman Cloud plugin (CNPG-I), installed next
+#                                to the operator in $CNPG_NAMESPACE. Chart 0.8.1 = plugin v0.15.1,
+#                                which needs CloudNativePG >= 1.26 and cert-manager (identity.sh
+#                                installs it). Like the operator, a running plugin is never
+#                                upgraded here: a new plugin version changes the sidecar image
+#                                and so restarts every instance.
+#   PG_BACKUP_BUCKET             MinIO bucket (default cnpg-backups); objects land under
+#                                s3://<bucket>/<cluster name>/{base,wals}
+#   PG_BACKUP_OBJECTSTORE        name of the ObjectStore CR in $NAMESPACE_POSTGRES
+#   PG_BACKUP_S3_USER            MinIO access key the plugin uses; its policy reaches that
+#                                bucket only. The MinIO root key never leaves the minio namespace.
+#   PG_BACKUP_S3_SECRET          Secret in $NAMESPACE_POSTGRES with ACCESS_KEY_ID/ACCESS_SECRET_KEY,
+#                                kept, restored from secrets.sops, or generated and SOPS-encrypted
+#   PG_BACKUP_ENDPOINT           S3 endpoint (default: the MinIO Service, plain HTTP inside the
+#                                cluster; not the public s3.<HOSTNAME> ingress)
+PG_WAL_ARCHIVE="${PG_WAL_ARCHIVE:-}"
+[[ "$PG_WAL_ARCHIVE" == "off" ]] && PG_WAL_ARCHIVE=""
+if [[ -n "$PG_WAL_ARCHIVE" && "$PG_WAL_ARCHIVE" != "minio" ]]; then
+  err "PG_WAL_ARCHIVE='${PG_WAL_ARCHIVE}' is not supported (use minio, or leave it unset)"
+  exit 1
+fi
+BARMAN_PLUGIN_CHART_VERSION="${BARMAN_PLUGIN_CHART_VERSION:-0.8.1}"
+BARMAN_PLUGIN_NAME="barman-cloud.cloudnative-pg.io"
+NAMESPACE_MINIO="${NAMESPACE_MINIO:-minio}"
+PG_BACKUP_BUCKET="${PG_BACKUP_BUCKET:-cnpg-backups}"
+PG_BACKUP_OBJECTSTORE="${PG_BACKUP_OBJECTSTORE:-postgres-cluster-minio}"
+PG_BACKUP_S3_USER="${PG_BACKUP_S3_USER:-cnpg-backup}"
+PG_BACKUP_S3_SECRET="${PG_BACKUP_S3_SECRET:-postgres-cluster-backup-s3}"
+PG_BACKUP_SOPS_FILE="${PG_BACKUP_SOPS_FILE:-${PG_BACKUP_S3_SECRET}.yaml}"
+PG_BACKUP_ENDPOINT="${PG_BACKUP_ENDPOINT:-http://minio.${NAMESPACE_MINIO}.svc.cluster.local:9000}"
+PG_BACKUP_RETENTION="${PG_BACKUP_RETENTION:-7d}"
+PG_BACKUP_SCHEDULE="${PG_BACKUP_SCHEDULE:-0 0 2 * * *}"
+#   PG_BACKUP_SERVER_NAME        folder of this cluster's backups in the bucket (default: the
+#                                cluster name, postgres-cluster). A cluster recovered from backup
+#                                needs a new one: the plugin refuses to archive into a folder that
+#                                already holds another cluster's WAL.
+#   PG_RECOVER_FROM              only when the cluster does not exist yet (a rebuilt node): bootstrap
+#                                it from the backups in folder PG_RECOVER_FROM (e.g. postgres-cluster)
+#                                instead of an empty initdb; PG_RECOVER_TARGET_TIME (e.g.
+#                                "2026-10-24 09:00:00+00") stops the replay there, unset = replay all.
+PG_BACKUP_SERVER_NAME="${PG_BACKUP_SERVER_NAME:-}"
+PG_RECOVER_FROM="${PG_RECOVER_FROM:-}"
+PG_RECOVER_TARGET_TIME="${PG_RECOVER_TARGET_TIME:-}"
+if [[ -n "$PG_RECOVER_FROM" ]]; then
+  if [[ -z "$PG_WAL_ARCHIVE" ]]; then
+    err "PG_RECOVER_FROM needs PG_WAL_ARCHIVE=minio (the ObjectStore it reads the backups from)"
+    exit 1
+  fi
+  if [[ "${PG_BACKUP_SERVER_NAME:-postgres-cluster}" == "$PG_RECOVER_FROM" ]]; then
+    err "PG_RECOVER_FROM=${PG_RECOVER_FROM}: the recovered cluster must archive into a new folder."
+    err "  Set PG_BACKUP_SERVER_NAME too, e.g. PG_BACKUP_SERVER_NAME=postgres-cluster-$(date -u +%Y%m%d), and keep it in env.properties."
+    exit 1
+  fi
+fi
+for _name in "$PG_BACKUP_SERVER_NAME" "$PG_RECOVER_FROM"; do
+  if [[ -n "$_name" && ! "$_name" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    err "'${_name}' is not a valid backup folder name (PG_BACKUP_SERVER_NAME / PG_RECOVER_FROM)"
+    exit 1
+  fi
+done
+unset _name
+if [[ -n "$PG_RECOVER_TARGET_TIME" && ! "$PG_RECOVER_TARGET_TIME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[\ T][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}(:?[0-9]{2})?)$ ]]; then
+  err "PG_RECOVER_TARGET_TIME='${PG_RECOVER_TARGET_TIME}' must be a timestamp with a zone, e.g. 2026-10-24 09:00:00+00"
+  exit 1
+fi
+if [[ -n "$PG_WAL_ARCHIVE" ]]; then
+  if [[ ! "$PG_BACKUP_RETENTION" =~ ^[1-9][0-9]*[dwm]$ ]]; then
+    err "PG_BACKUP_RETENTION='${PG_BACKUP_RETENTION}' must look like 7d, 2w or 1m"
+    exit 1
+  fi
+  if [[ ! "$PG_BACKUP_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+    err "PG_BACKUP_BUCKET='${PG_BACKUP_BUCKET}' is not a valid S3 bucket name"
+    exit 1
+  fi
+  if [[ ! "$PG_BACKUP_S3_USER" =~ ^[A-Za-z0-9_-]{3,20}$ ]]; then
+    err "PG_BACKUP_S3_USER='${PG_BACKUP_S3_USER}' must be 3-20 characters of A-Z a-z 0-9 _ -"
+    exit 1
+  fi
+  read -r -a _sched_fields <<< "$PG_BACKUP_SCHEDULE"
+  if [[ ${#_sched_fields[@]} -ne 6 ]]; then
+    err "PG_BACKUP_SCHEDULE='${PG_BACKUP_SCHEDULE}' needs six fields (CNPG cron starts with seconds)"
+    exit 1
+  fi
+  unset _sched_fields
 fi
 
 # Derive hosts from HOSTNAME if not provided
@@ -485,6 +587,7 @@ EOF
       echo ""
       echo "=== CNPG objects (snapshot) ==="
       kubectl -n "$namespace" get cluster,backup,scheduledbackup,pooler 2>/dev/null || true
+      kubectl -n "$namespace" get objectstores.barmancloud.cnpg.io 2>/dev/null || true
       ;;
 
     pvc)
@@ -896,6 +999,252 @@ install_cnpg_operator() {
 install_cnpg_operator
 
 # ============================================================================
+# Continuous backup (PG_WAL_ARCHIVE=minio, optional)
+# ============================================================================
+# The Barman Cloud plugin (CNPG-I) replaces the in-tree spec.backup.barmanObjectStore,
+# which is deprecated and goes away after CNPG 1.31. Pieces, each idempotent:
+#   1b. the plugin itself, next to the operator (Helm, never upgraded here);
+#   1c. a MinIO bucket and an access key whose policy reaches that bucket only, the key in
+#       Secret $PG_BACKUP_S3_SECRET (SOPS copy in the envs repo), and the ObjectStore CR
+#       with the retention policy;
+#   2.  a new cluster gets spec.plugins (isWALArchiver: true) in its manifest; a running
+#       cluster without it is not patched: the script prints the patch, as for image drift;
+#   2b. a ScheduledBackup (method: plugin) once the cluster has the plugin.
+# Recovery and the restore drill: docs/POSTGRES-BACKUP.md.
+wal_archive_enabled() { [[ "$PG_WAL_ARCHIVE" == "minio" ]]; }
+
+# "1.30" from the operator's image (…/cloudnative-pg:1.30.1[@sha256:…]); empty if unknown.
+cnpg_operator_minor() {
+  local image tag
+  image=$(kubectl -n "$CNPG_NAMESPACE" get deploy cnpg-cloudnative-pg \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  tag="${image%%@*}"
+  tag="${tag##*:}"
+  [[ "$tag" =~ ^v?([0-9]+)\.([0-9]+) ]] && echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+}
+
+install_barman_plugin() {
+  wal_archive_enabled || return 0
+  log "=== Phase 1b: Barman Cloud plugin ==="
+
+  if ! kubectl get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    err "cert-manager is not installed; the Barman Cloud plugin needs it for its operator TLS."
+    err "Run tools/k3s/identity.sh ${ENV_NAME} first."
+    exit 1
+  fi
+  local minor
+  minor=$(cnpg_operator_minor)
+  if [[ -z "$minor" ]]; then
+    warn "Could not read the CloudNativePG operator version; the plugin needs 1.26 or later"
+  elif (( ${minor%%.*} == 1 && ${minor#*.} < 26 )); then
+    err "CloudNativePG operator ${minor} is too old for the Barman Cloud plugin (needs 1.26+)."
+    err "Upgrade the operator first (see the CNPG_VERSION note above), or unset PG_WAL_ARCHIVE."
+    exit 1
+  fi
+
+  local live_chart
+  live_chart=$(kubectl -n "$CNPG_NAMESPACE" get deploy plugin-barman-cloud \
+                 -o jsonpath='{.metadata.labels.helm\.sh/chart}' 2>/dev/null || true)
+  if [[ -n "$live_chart" ]]; then
+    info "Barman Cloud plugin already installed (${live_chart})"
+    if [[ "$live_chart" != "plugin-barman-cloud-${BARMAN_PLUGIN_CHART_VERSION}" ]]; then
+      warn "Barman Cloud plugin runs ${live_chart}; BARMAN_PLUGIN_CHART_VERSION is ${BARMAN_PLUGIN_CHART_VERSION}. Not upgrading it here."
+      warn "  A new plugin version changes the sidecar image, so every instance restarts. Read the"
+      warn "  plugin's upgrade notes (0.8.x renamed its RBAC objects), then:"
+      warn "  helm upgrade plugin-barman-cloud cnpg/plugin-barman-cloud -n ${CNPG_NAMESPACE} --version ${BARMAN_PLUGIN_CHART_VERSION} --wait"
+    fi
+    return 0
+  fi
+
+  if ! helm repo list 2>/dev/null | grep -q cloudnative-pg; then
+    helm repo add cnpg https://cloudnative-pg.github.io/charts
+  fi
+  helm repo update cnpg >/dev/null
+  info "Installing the Barman Cloud plugin (chart ${BARMAN_PLUGIN_CHART_VERSION}) into ${CNPG_NAMESPACE}..."
+  helm upgrade --install plugin-barman-cloud cnpg/plugin-barman-cloud \
+    --namespace "$CNPG_NAMESPACE" \
+    --version "$BARMAN_PLUGIN_CHART_VERSION" \
+    --wait \
+    --timeout 5m
+  kubectl -n "$CNPG_NAMESPACE" rollout status deployment/plugin-barman-cloud --timeout=120s
+  info "✓ Barman Cloud plugin installed"
+}
+
+# The plugin's S3 key. Kept when the cluster has it; applied from the envs repo's SOPS copy
+# when there is one (a rebuilt node, whose MinIO data came back from the NAS with this very
+# key in it); otherwise generated, applied, and encrypted into envs/<env>/secrets.sops.
+# The secret key is never printed.
+ensure_backup_s3_secret() {
+  local ns="$NAMESPACE_POSTGRES" secret="$PG_BACKUP_S3_SECRET" f sops_copy=""
+  if kubectl -n "$ns" get secret "$secret" >/dev/null 2>&1; then
+    info "Backup S3 key: keeping the existing secret ${ns}/${secret}"
+    return 0
+  fi
+  for f in "${ENVS_ROOT}/${ENV_NAME}/secrets.sops/"*.yaml; do
+    [[ -f "$f" ]] || continue
+    if [[ -n "$(NS="$ns" NAME="$secret" yq eval 'select(.kind == "Secret" and .metadata.name == strenv(NAME) and .metadata.namespace == strenv(NS)) | .metadata.name' "$f" 2>/dev/null)" ]]; then
+      sops_copy="$f"
+      break
+    fi
+  done
+  if [[ -n "$sops_copy" ]]; then
+    info "Backup S3 key: applying ${secret} from ${sops_copy#"${ENVS_ROOT}/"}"
+    if ! command -v sops >/dev/null 2>&1 || ! sops -d "$sops_copy" | kubectl apply -f - >/dev/null; then
+      err "Could not decrypt ${sops_copy#"${ENVS_ROOT}/"} (sops and the age key are needed);"
+      err "apply the env's secrets first: tools/sops/apply.sh ${ENV_NAME}"
+      return 1
+    fi
+    return 0
+  fi
+
+  local plain="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/${PG_BACKUP_SOPS_FILE}" key
+  provision::assert_plaintext_ignored "$plain" || return 1
+  key="$(openssl rand -base64 48 | tr -d '/+=\n' | cut -c1-40)"
+  ( umask 077
+    mkdir -p "$(dirname "$plain")"
+    cat > "$plain" <<YAML
+# The MinIO access key of the Barman Cloud plugin (WAL archive and base backups of
+# postgres-cluster in ${ns}); its MinIO policy reaches bucket ${PG_BACKUP_BUCKET} only.
+# Written by infra-skills tools/k3s/postgres.sh; never commit.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${secret}
+  namespace: ${ns}
+type: Opaque
+stringData:
+  ACCESS_KEY_ID: ${PG_BACKUP_S3_USER}
+  ACCESS_SECRET_KEY: "${key}"
+YAML
+  )
+  unset key
+  kubectl apply -f "$plain" >/dev/null
+  info "Backup S3 key: generated a key into secret ${ns}/${secret}"
+  if command -v sops >/dev/null 2>&1 && \
+     "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$PG_BACKUP_SOPS_FILE" >/dev/null && \
+     grep -q 'ACCESS_SECRET_KEY: ENC\[' "${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${PG_BACKUP_SOPS_FILE}"; then
+    rm -f "$plain"
+    info "  encrypted to ${ENV_NAME}/secrets.sops/${PG_BACKUP_SOPS_FILE} - commit it in the envs repo"
+  else
+    warn "  could not SOPS-encrypt it; the plaintext stays (git-ignored) at ${plain#"${ENVS_ROOT}/"}:"
+    warn "  tools/sops/encrypt.sh ${ENV_NAME} ${PG_BACKUP_SOPS_FILE}, then delete the plaintext"
+  fi
+}
+
+# Bucket, bucket-scoped policy and the plugin's user, made with the mc that ships in the
+# MinIO image, inside the MinIO pod: the root credentials stay in that pod's environment,
+# and the plugin's key goes in over stdin, not on any command line on this machine.
+# Every step is a no-op when it is already in place (user add re-sets the same key).
+ensure_minio_bucket_and_user() {
+  local ns="$NAMESPACE_MINIO" access secret_key
+  access=$(kubectl -n "$NAMESPACE_POSTGRES" get secret "$PG_BACKUP_S3_SECRET" \
+             -o jsonpath='{.data.ACCESS_KEY_ID}' | base64 -d)
+  secret_key=$(kubectl -n "$NAMESPACE_POSTGRES" get secret "$PG_BACKUP_S3_SECRET" \
+             -o jsonpath='{.data.ACCESS_SECRET_KEY}' | base64 -d)
+  if [[ -z "$access" || -z "$secret_key" ]]; then
+    err "Secret ${NAMESPACE_POSTGRES}/${PG_BACKUP_S3_SECRET} lacks ACCESS_KEY_ID or ACCESS_SECRET_KEY"
+    return 1
+  fi
+  local out
+  if ! out=$(printf '%s\n%s\n' "$access" "$secret_key" | \
+       kubectl -n "$ns" exec -i deploy/minio -c minio -- sh -c '
+set -eu
+IFS= read -r ACCESS
+IFS= read -r SECRET
+BUCKET="$1"; POLICY="$2"
+export MC_CONFIG_DIR="/tmp/.mc-cnpg-$$"
+trap "rm -rf \"$MC_CONFIG_DIR\"" EXIT
+mkdir -p "$MC_CONFIG_DIR"
+export MC_HOST_local="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:9000"
+mc --quiet mb --ignore-existing "local/${BUCKET}" >/dev/null
+cat > "$MC_CONFIG_DIR/policy.json" <<EOF
+{"Version":"2012-10-17","Statement":[
+ {"Effect":"Allow","Action":["s3:GetBucketLocation","s3:ListBucket","s3:ListBucketMultipartUploads"],
+  "Resource":["arn:aws:s3:::${BUCKET}"]},
+ {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],
+  "Resource":["arn:aws:s3:::${BUCKET}/*"]}]}
+EOF
+mc --quiet admin policy create local "$POLICY" "$MC_CONFIG_DIR/policy.json" >/dev/null
+mc --quiet admin user add local "$ACCESS" "$SECRET" >/dev/null
+# (the image has no grep) attach only when not attached yet: a second attach is an error
+USERINFO=$(mc --quiet admin user info local "$ACCESS" --json)
+case "$USERINFO" in
+  *"\"$POLICY\""*) ;;
+  *) mc --quiet admin policy attach local "$POLICY" --user "$ACCESS" >/dev/null ;;
+esac
+echo "bucket ${BUCKET}, user ${ACCESS}, policy ${POLICY}"
+' sh "$PG_BACKUP_BUCKET" "${PG_BACKUP_BUCKET}-rw" 2>&1); then
+    unset secret_key
+    # mc may echo the alias URL, root credentials included: mask user:password@.
+    err "Could not set up the MinIO bucket and user: $(sed -E 's#//[^/@[:space:]]*@#//***@#g' <<< "$out")"
+    return 1
+  fi
+  unset secret_key
+  info "✓ MinIO: ${out}"
+}
+
+ensure_backup_object_store() {
+  wal_archive_enabled || return 0
+  log "=== Phase 1c: Backup object store (MinIO) ==="
+
+  if ! kubectl -n "$NAMESPACE_MINIO" get deploy minio >/dev/null 2>&1; then
+    err "PG_WAL_ARCHIVE=minio, but there is no MinIO in namespace ${NAMESPACE_MINIO}."
+    err "Run tools/k3s/minio.sh ${ENV_NAME} first (tools/up.sh: add minio to UP_OPTIONAL_STEPS)."
+    exit 1
+  fi
+  kubectl -n "$NAMESPACE_MINIO" rollout status deploy/minio --timeout=180s >/dev/null || {
+    err "MinIO in ${NAMESPACE_MINIO} is not ready"; exit 1; }
+
+  kubectl get ns "$NAMESPACE_POSTGRES" >/dev/null 2>&1 || kubectl create ns "$NAMESPACE_POSTGRES"
+  ensure_backup_s3_secret || { err "No S3 key for the plugin; continuous backup not set up"; exit 1; }
+  ensure_minio_bucket_and_user || exit 1
+
+  # The ObjectStore is the plugin's own CR, not the Cluster spec: applying it on a re-run
+  # only carries PG_BACKUP_RETENTION and the endpoint over. An instanceSidecarConfiguration
+  # change would roll the instances, so there is none here.
+  cat <<YAML | kubectl apply -f -
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: ${PG_BACKUP_OBJECTSTORE}
+  namespace: ${NAMESPACE_POSTGRES}
+spec:
+  # Recovery window: base backups older than the newest one before (now - window) go,
+  # with their WAL, after the next backup completes.
+  retentionPolicy: "${PG_BACKUP_RETENTION}"
+  configuration:
+    destinationPath: s3://${PG_BACKUP_BUCKET}/
+    endpointURL: ${PG_BACKUP_ENDPOINT}
+    s3Credentials:
+      accessKeyId:
+        name: ${PG_BACKUP_S3_SECRET}
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: ${PG_BACKUP_S3_SECRET}
+        key: ACCESS_SECRET_KEY
+    wal:
+      compression: gzip
+      maxParallel: 2
+    data:
+      compression: gzip
+      jobs: 2
+YAML
+  info "✓ ObjectStore ${NAMESPACE_POSTGRES}/${PG_BACKUP_OBJECTSTORE} -> s3://${PG_BACKUP_BUCKET}/ at ${PG_BACKUP_ENDPOINT} (retention ${PG_BACKUP_RETENTION})"
+}
+
+install_barman_plugin
+ensure_backup_object_store
+
+# The spec.plugins entry of postgres-cluster, as one line of JSON (also valid YAML flow style).
+# serverName only when PG_BACKUP_SERVER_NAME is set (default: the cluster's name).
+barman_plugin_json() {
+  jq -cn --arg name "$BARMAN_PLUGIN_NAME" --arg store "$PG_BACKUP_OBJECTSTORE" \
+         --arg server "$PG_BACKUP_SERVER_NAME" \
+    '{name: $name, isWALArchiver: true,
+      parameters: ({barmanObjectName: $store} + (if $server == "" then {} else {serverName: $server} end))}'
+}
+
+# ============================================================================
 # Enable pgvector extension in PostgreSQL databases
 # ============================================================================
 enable_pgvector_extension() {
@@ -1123,6 +1472,100 @@ warn_pg_hba_md5() {
   warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '${patch}'"
 }
 
+# Continuous backup on the cluster (PG_WAL_ARCHIVE=minio): the plugin entry, the scheduled
+# base backup, and a look at the WAL archiver. A running cluster without the plugin entry
+# is not patched; the patch is printed, as for image drift.
+ensure_cluster_backup() {
+  local ns="$NAMESPACE_POSTGRES" cluster_json
+  cluster_json=$(kubectl -n "$ns" get cluster postgres-cluster -o json 2>/dev/null) || return 0
+
+  if ! wal_archive_enabled; then
+    if jq -e --arg p "$BARMAN_PLUGIN_NAME" '.spec.plugins[]? | select(.name == $p)' <<< "$cluster_json" >/dev/null; then
+      info "postgres-cluster has the Barman Cloud plugin but PG_WAL_ARCHIVE is unset - leaving it as it is"
+    fi
+    return 0
+  fi
+  log "=== Phase 2b: Continuous backup on postgres-cluster ==="
+
+  if jq -e '.spec.backup.barmanObjectStore' <<< "$cluster_json" >/dev/null; then
+    warn "postgres-cluster also has the in-tree spec.backup.barmanObjectStore; two archivers must not"
+    warn "  run at once. Follow the plugin's migration guide before relying on either:"
+    warn "  https://cloudnative-pg.io/plugin-barman-cloud/docs/migration/"
+  fi
+
+  local entry
+  entry=$(jq -c --arg p "$BARMAN_PLUGIN_NAME" '[.spec.plugins[]? | select(.name == $p)][0] // empty' <<< "$cluster_json")
+  if [[ -z "$entry" ]]; then
+    local value patch
+    value=$(barman_plugin_json)
+    if jq -e '.spec.plugins' <<< "$cluster_json" >/dev/null; then
+      patch="[{\"op\":\"add\",\"path\":\"/spec/plugins/-\",\"value\":${value}}]"
+    else
+      patch="[{\"op\":\"add\",\"path\":\"/spec/plugins\",\"value\":[${value}]}]"
+    fi
+    warn "postgres-cluster has no WAL archiver; PG_WAL_ARCHIVE=minio wants the Barman Cloud plugin. Not changing it here."
+    warn "  Adding it injects the plugin sidecar, so the instance restarts (a single instance: a short outage):"
+    warn "  kubectl -n ${ns} patch cluster postgres-cluster --type=json -p '${patch}'"
+    warn "  Then re-run this script: it creates the ScheduledBackup once the plugin is on the cluster."
+    return 0
+  fi
+  local store archiver
+  store=$(jq -r '.parameters.barmanObjectName // ""' <<< "$entry")
+  archiver=$(jq -r '.isWALArchiver // false' <<< "$entry")
+  if [[ "$store" != "$PG_BACKUP_OBJECTSTORE" ]]; then
+    warn "postgres-cluster's Barman Cloud plugin uses ObjectStore '${store}', not ${PG_BACKUP_OBJECTSTORE}. Leaving it."
+  fi
+  local live_server
+  live_server=$(jq -r '.parameters.serverName // "postgres-cluster"' <<< "$entry")
+  if [[ "$live_server" != "${PG_BACKUP_SERVER_NAME:-postgres-cluster}" ]]; then
+    warn "postgres-cluster archives into folder '${live_server}', PG_BACKUP_SERVER_NAME says '${PG_BACKUP_SERVER_NAME:-postgres-cluster}'."
+    warn "  Leaving it; set PG_BACKUP_SERVER_NAME=${live_server} in env.properties so the two agree."
+  fi
+  if [[ "$archiver" != "true" ]]; then
+    warn "postgres-cluster's Barman Cloud plugin is not the WAL archiver (isWALArchiver is not true):"
+    warn "  base backups alone give no point-in-time recovery. Not changing it here."
+  fi
+
+  # The ScheduledBackup is its own object; applying it changes no Cluster spec. immediate:
+  # the first base backup runs now, not at the first scheduled time, so the recovery
+  # window starts today.
+  cat <<YAML | kubectl apply -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: postgres-cluster-daily
+  namespace: ${ns}
+spec:
+  # CNPG cron: seconds first; the operator runs in UTC. Done before the 06:15 NAS sweep
+  # (tools/backup.sh), which copies the MinIO volume off the node.
+  schedule: "${PG_BACKUP_SCHEDULE}"
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: postgres-cluster
+  method: plugin
+  pluginConfiguration:
+    name: ${BARMAN_PLUGIN_NAME}
+YAML
+  info "✓ ScheduledBackup ${ns}/postgres-cluster-daily (${PG_BACKUP_SCHEDULE}, UTC)"
+
+  # WAL archiving shows as the ContinuousArchiving condition; give a fresh plugin a minute.
+  local i status=""
+  for i in {1..12}; do
+    status=$(kubectl -n "$ns" get cluster postgres-cluster -o json 2>/dev/null | \
+               jq -r '(.status.conditions // [])[] | select(.type == "ContinuousArchiving") | "\(.status) \(.reason // "") \(.message // "")"' || true)
+    [[ "$status" == True* ]] && break
+    sleep 5
+  done
+  if [[ "$status" == True* ]]; then
+    info "✓ WAL archiving works (ContinuousArchiving: ${status})"
+  else
+    warn "WAL archiving not confirmed yet (ContinuousArchiving: ${status:-no condition}). Check:"
+    warn "  kubectl -n ${ns} get cluster postgres-cluster -o jsonpath='{.status.conditions}'"
+    warn "  kubectl -n ${ns} logs postgres-cluster-1 -c plugin-barman-cloud --tail=50"
+  fi
+}
+
 # ============================================================================
 # Phase 2: Create PostgreSQL Cluster
 # ============================================================================
@@ -1150,6 +1593,8 @@ create_postgres_cluster() {
       warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '{\"spec\":{\"imageName\":\"${POSTGRES_IMAGE}\"}}'"
     fi
     warn_pg_hba_md5
+    [[ -n "$PG_RECOVER_FROM" ]] && \
+      warn "PG_RECOVER_FROM=${PG_RECOVER_FROM} ignored: postgres-cluster exists (it only bootstraps a new cluster); remove it from env.properties"
 
     # Ensure required secrets exist (CloudNativePG operator should create them but sometimes doesn't)
     if ! kubectl -n "$NAMESPACE_POSTGRES" get secret postgres-cluster-superuser >/dev/null 2>&1; then
@@ -1192,6 +1637,46 @@ create_postgres_cluster() {
       - $(pg_readonly_role_json)
 "
     fi
+    # Continuous backup: the plugin archives WAL from the first segment on, so the
+    # ScheduledBackup (immediate) has a complete archive to pair its first base backup with.
+    local plugins_block=""
+    if wal_archive_enabled; then
+      plugins_block="
+  # Continuous backup (PG_WAL_ARCHIVE=minio): WAL archive + base backups to ObjectStore
+  # ${PG_BACKUP_OBJECTSTORE}; docs/POSTGRES-BACKUP.md
+  plugins:
+    - $(barman_plugin_json)
+"
+    fi
+    # Bootstrap: an empty database (initdb), or - PG_RECOVER_FROM, a rebuilt node - the
+    # cluster's own backups in the ObjectStore, replayed to the end of the archive or to
+    # PG_RECOVER_TARGET_TIME. docs/POSTGRES-BACKUP.md, "Losing the node".
+    local bootstrap_block
+    if [[ -n "$PG_RECOVER_FROM" ]]; then
+      info "Bootstrapping from backup: server ${PG_RECOVER_FROM} in ObjectStore ${PG_BACKUP_OBJECTSTORE}${PG_RECOVER_TARGET_TIME:+, target time ${PG_RECOVER_TARGET_TIME}}"
+      bootstrap_block="  bootstrap:
+    recovery:
+      source: origin
+      database: app
+      owner: app${PG_RECOVER_TARGET_TIME:+
+      recoveryTarget:
+        targetTime: \"${PG_RECOVER_TARGET_TIME}\"}
+  externalClusters:
+    - name: origin
+      plugin:
+        name: ${BARMAN_PLUGIN_NAME}
+        parameters:
+          barmanObjectName: ${PG_BACKUP_OBJECTSTORE}
+          serverName: ${PG_RECOVER_FROM}"
+    else
+      # CloudNativePG generates the superuser and app credentials (secrets
+      # postgres-cluster-superuser and postgres-cluster-app); no pre-existing secret is
+      # referenced, so nothing can fail to mount.
+      bootstrap_block="  bootstrap:
+    initdb:
+      database: app
+      owner: app"
+    fi
     cat <<YAML | kubectl apply -f -
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
@@ -1201,13 +1686,13 @@ metadata:
 spec:
   description: "PostgreSQL cluster for ${ENV_NAME}"
   imageName: ${POSTGRES_IMAGE}
-  
+
   # Single master, no replicas
   instances: ${POSTGRES_INSTANCES}
-  
+
   # Enable superuser access (creates postgres-cluster-superuser secret)
   enableSuperuserAccess: true
-${managed_block}
+${managed_block}${plugins_block}
   # Primary update strategy
   primaryUpdateStrategy: unsupervised
   
@@ -1239,24 +1724,13 @@ ${managed_block}
       - host all all 10.0.0.0/8 scram-sha-256
       - host all all 172.16.0.0/12 scram-sha-256
       - host all all 192.168.0.0/16 scram-sha-256
-  
+
   # Bootstrap configuration
-  bootstrap:
-    initdb:
-      database: app
-      owner: app
-      # Let CloudNativePG auto-generate credentials for the superuser and app user.
-      # This will create the following secrets automatically:
-      #   - postgres-cluster-superuser
-      #   - postgres-cluster-app
-      # We intentionally do not reference a pre-existing secret here to avoid
-      # mount failures when the secret does not exist yet.
-  
-  # Backup configuration (optional - can be enabled later)
-  # backup:
-  #   barmanObjectStore:
-  #     ...
-  
+${bootstrap_block}
+
+  # Backups: PG_WAL_ARCHIVE=minio adds spec.plugins above (Barman Cloud plugin). Not the
+  # in-tree spec.backup.barmanObjectStore: deprecated, removed after CNPG 1.31.
+
   # Monitoring
   monitoring:
     enablePodMonitor: false
@@ -1323,6 +1797,7 @@ YAML
 
 create_postgres_cluster
 ensure_pg_readonly_role
+ensure_cluster_backup
 
 # ============================================================================
 # Phase 3: Deploy PostgreSQL Exporter for Prometheus Metrics
@@ -1779,6 +2254,11 @@ info "  Image:      ${POSTGRES_IMAGE}"
 info "  Instances:  ${POSTGRES_INSTANCES} (single master)"
 info "  Storage:    ${POSTGRES_STORAGE_SIZE} (${POSTGRES_STORAGE_CLASS})"
 info "  Extensions: pgvector (enabled)"
+if wal_archive_enabled; then
+  info "  Backup:     WAL archive + ${PG_BACKUP_SCHEDULE} (UTC) base backups to s3://${PG_BACKUP_BUCKET}/ (MinIO), retention ${PG_BACKUP_RETENTION}"
+else
+  info "  Backup:     no continuous backup (PG_WAL_ARCHIVE unset); see docs/POSTGRES-BACKUP.md"
+fi
 info ""
 info "Internal Connection (cluster):"
 info "  Host:       postgres-cluster-rw.${NAMESPACE_POSTGRES}.svc.cluster.local"
