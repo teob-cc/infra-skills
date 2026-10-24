@@ -2369,6 +2369,9 @@ if $DEFAULT_RUN_ALL; then
 fi
 
 # Detect rescue vs installed
+# --run-installimage / --run-followup skip the auto-detection above, which is where
+# ACTIVE_SSH_PORT is set; both phases start on the public IP's port 22.
+ACTIVE_SSH_PORT="${ACTIVE_SSH_PORT:-22}"
 remote_state="${REMOTE_STATE:-}"
 if [[ -z "$remote_state" ]]; then
   remote_state=$(ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export TERM=xterm; if hostname | grep -qi rescue || grep -qi rescue /etc/issue; then echo rescue; else echo installed; fi" 2>/dev/null || true)
@@ -2644,7 +2647,10 @@ REMOTE_BOOTSTRAP
   info "Base OS image: ${BASE_OS_IMAGE:-Ubuntu-2404-noble} (BASE_OS_IMAGE in env.properties)"
   ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "cat >/root/installimage-bootstrap.sh && chmod +x /root/installimage-bootstrap.sh" <<< "$BOOTSTRAP_CONTENT"
   ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export HOSTNAME_ENV='${HOSTNAME}'; export TERM=dumb; /root/installimage-bootstrap.sh"
-  ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export TERM=dumb; ./run-installimage.sh && reboot"
+  ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "export TERM=dumb; ./run-installimage.sh"
+  # The reboot drops the session, so ssh exits 255 even when it worked; under set -e that
+  # ended the whole run right after "INSTALLATION COMPLETE", before the follow-up phase.
+  ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "reboot" || true
 
   # Wait for rescue to go away and new system to come back (SSH expected on port ${SSH_PORT_FINAL} after post-install)
   info "Waiting for host to reboot into fresh system..."
