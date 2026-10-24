@@ -22,6 +22,10 @@ set -euo pipefail
 #   --skip-dns           Skip DNS record creation
 #   --skip-sso           Skip GitHub SSO configuration
 #   --sync-dashboards    Only upsert dashboards from envs/shared/dashboards into Grafana
+#   --rules-only         Only upgrade the prometheus release (rules, scrape jobs,
+#                        Alertmanager config) with the full rendered values
+#   --dry-run            With --rules-only semantics: render server-side, print the
+#                        ConfigMap diff against the live release, change nothing
 #
 # env.properties (optional):
 #   GRAFANA_ADMIN_PASSWORD  Grafana admin password; unset = keep the one in
@@ -57,6 +61,9 @@ Options:
   --skip-grafana       Skip Grafana installation
   --skip-dns           Skip DNS record creation
   --skip-sso           Skip GitHub SSO configuration
+  --sync-dashboards    Only upsert dashboards into Grafana
+  --rules-only         Only upgrade the prometheus release (rules, scrape, Alertmanager)
+  --dry-run            Like --rules-only, but only print the ConfigMap diff
 
 Available environments:
 EOF
@@ -85,6 +92,8 @@ SKIP_GRAFANA=false
 SKIP_DNS=false
 SKIP_SSO=false
 SYNC_DASHBOARDS=false
+RULES_ONLY=false
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -95,9 +104,26 @@ while [[ $# -gt 0 ]]; do
     --skip-dns) SKIP_DNS=true; shift ;;
     --skip-sso) SKIP_SSO=true; shift ;;
     --sync-dashboards) SYNC_DASHBOARDS=true; shift ;;
+    --rules-only) RULES_ONLY=true; shift ;;
+    --dry-run) DRY_RUN=true; RULES_ONLY=true; shift ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
+
+# --rules-only upgrades the prometheus release alone (alert rules, scrape jobs,
+# Alertmanager routing), always with the full values this script renders, never a
+# partial object. Loki, Promtail/Alloy, Grafana, DNS, SSO, the operator CRDs and the
+# blackbox exporter are left as they are, so a rules change cannot touch Grafana's
+# admin password or SSO. --dry-run implies it: helm renders the upgrade server-side,
+# the script prints the diff of the prometheus-server and alertmanager ConfigMaps
+# against the live ones, and nothing is written.
+if [[ "$RULES_ONLY" == "true" ]]; then
+  if [[ "$SKIP_PROMETHEUS" == "true" ]]; then
+    echo "--rules-only/--dry-run and --skip-prometheus contradict each other" >&2
+    exit 1
+  fi
+  SKIP_LOKI=true; SKIP_PROMTAIL=true; SKIP_GRAFANA=true; SKIP_DNS=true; SKIP_SSO=true
+fi
 
 # --- Validation ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 1; }; }
@@ -987,7 +1013,7 @@ fi
 # ============================================================================
 # Phase 3a: Install Prometheus Operator CRDs (for ServiceMonitor support)
 # ============================================================================
-if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
+if [[ "$SKIP_PROMETHEUS" != "true" && "$RULES_ONLY" != "true" ]]; then
   log "=== Phase 3a: Installing Prometheus Operator CRDs (ServiceMonitor support) ==="
   
   # Install Prometheus Operator CRDs to enable ServiceMonitor resources
@@ -1092,15 +1118,28 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
   # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
   NAMESPACE_MYSQL="${NAMESPACE_MYSQL:-mysql}"
+  # Platform namespaces for the platform-workloads alerts: a Deployment or
+  # StatefulSet here with no ready replica is an outage of the platform (ingress,
+  # DNS, certificates, identity, registry, GitOps, the Postgres operator), so it
+  # pages at p1. App namespaces get the generic p2 rules in infra-workloads only.
+  PLATFORM_NAMESPACES_RE="kube-system|${NAMESPACE_CERT_MANAGER:-cert-manager}|${NAMESPACE_SSO}|${NAMESPACE_HARBOR:-harbor}|${NAMESPACE_ARGOCD}|${CNPG_NAMESPACE:-cnpg-system}"
+  # Traefik names a Kubernetes backend '<namespace>-<service>-<port>@kubernetes';
+  # this selects the platform UIs and APIs behind the edge (Pomerium, Dex, Harbor,
+  # Argo CD, Nexus, Grafana) for PlatformServiceErrorsHigh.
+  PLATFORM_TRAEFIK_SERVICES_RE="(${NAMESPACE_SSO}|${NAMESPACE_HARBOR:-harbor}|${NAMESPACE_ARGOCD}|${NAMESPACE_NEXUS:-nexus}|${NAMESPACE_OBSERVABILITY})-.*@kubernetes"
 
   # Dead-man's switch (see ALERTMANAGER_DEADMAN_URL above). The Secret must exist
   # before the chart mounts it, so this runs ahead of the values file.
   DEADMAN_ENABLED=false
   if [[ -n "$ALERTMANAGER_DEADMAN_URL" ]]; then
-    info "Writing ALERTMANAGER_DEADMAN_URL into Secret ${NAMESPACE_OBSERVABILITY}/alertmanager-deadman"
-    kubectl -n "$NAMESPACE_OBSERVABILITY" create secret generic alertmanager-deadman \
-      --from-literal=url="$ALERTMANAGER_DEADMAN_URL" --dry-run=client -o yaml \
-      | kubectl apply -f - >/dev/null
+    if [[ "$DRY_RUN" == "true" ]]; then
+      info "Dry run: would write ALERTMANAGER_DEADMAN_URL into Secret ${NAMESPACE_OBSERVABILITY}/alertmanager-deadman"
+    else
+      info "Writing ALERTMANAGER_DEADMAN_URL into Secret ${NAMESPACE_OBSERVABILITY}/alertmanager-deadman"
+      kubectl -n "$NAMESPACE_OBSERVABILITY" create secret generic alertmanager-deadman \
+        --from-literal=url="$ALERTMANAGER_DEADMAN_URL" --dry-run=client -o yaml \
+        | kubectl apply -f - >/dev/null
+    fi
     DEADMAN_ENABLED=true
   elif kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-deadman >/dev/null 2>&1; then
     DEADMAN_ENABLED=true
@@ -1302,6 +1341,71 @@ ${BLACKBOX_SCRAPE_JOB_POST}
       - source_labels: [__meta_kubernetes_endpoint_port_name]
         action: keep
         regex: http
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+  # CloudNativePG instance metrics (cnpg_*: collector up, replication lag, WAL
+  # archiver, backups, connections). The operator would create a PodMonitor, which
+  # the plain prometheus chart cannot read, so this is the pod-role equivalent: every
+  # instance pod in every namespace (label cnpg.io/podRole=instance), port 'metrics'
+  # (:9187). Feeds the infra-cnpg alert group.
+  - job_name: 'cnpg'
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_cnpg_io_podRole]
+        action: keep
+        regex: instance
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_cnpg_io_cluster]
+        target_label: cluster
+      - source_labels: [__meta_kubernetes_pod_label_cnpg_io_instanceRole]
+        target_label: role
+  # Argo CD component metrics (argocd_app_info, argocd_app_sync_total). The install
+  # carries no metrics Services or scrape annotations, so scrape the pods' 'metrics'
+  # container ports: application-controller :8082, server :8083, repo-server :8084,
+  # applicationset :8080, notifications :9001. Feeds the platform-argocd group.
+  - job_name: 'argocd'
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names:
+            - ${NAMESPACE_ARGOCD}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: drop
+        regex: Succeeded|Failed
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        target_label: component
+  # Dex telemetry (Service dex, port 'telemetry' :5558): http_requests_total by
+  # handler and code. Feeds the platform-identity group.
+  - job_name: 'dex'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - ${NAMESPACE_SSO}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: dex
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: telemetry
       - source_labels: [__meta_kubernetes_namespace]
         target_label: namespace
       - source_labels: [__meta_kubernetes_pod_name]
@@ -1664,6 +1768,45 @@ serverFiles:
                 A file under /var/lib/node_exporter/textfile is malformed, so the stamp metrics
                 it carries (NAS backups, Scylla snapshots) are missing or stale. Check the
                 node-exporter log for the file name.
+          # Disk latency, per physical device (md/dm layers inherit it). A failing NVMe
+          # or SATA disk usually slows down long before mdadm drops it. The IOPS floor
+          # keeps an idle disk's single slow flush from counting; on the reference cluster (2026-10)
+          # neither threshold held for 30 minutes in 3 days, including an 80 GB restore.
+          - alert: NodeDiskReadLatencyHigh
+            expr: |
+              (
+                rate(node_disk_read_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
+                  / rate(node_disk_reads_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
+              ) > 0.1
+              and rate(node_disk_reads_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1
+            for: 30m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Disk {{ \$labels.device }} on {{ \$labels.instance }} reads take {{ \$value | humanizeDuration }} on average"
+              description: |
+                Average read latency on {{ \$labels.device }} has been above 100 ms for 30 minutes
+                (healthy NVMe: under 1 ms). Either the disk is failing (check dmesg for I/O
+                errors and resets, and smartctl -a /dev/{{ \$labels.device }}) or it is saturated
+                (see NodeIOStalled). Compare with the other RAID member: one slow member is a
+                disk to replace.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#hardware"
+          - alert: NodeDiskWriteLatencyHigh
+            expr: |
+              (
+                rate(node_disk_write_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
+                  / rate(node_disk_writes_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
+              ) > 0.5
+              and rate(node_disk_writes_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1
+            for: 30m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Disk {{ \$labels.device }} on {{ \$labels.instance }} writes take {{ \$value | humanizeDuration }} on average"
+              description: |
+                Average write latency on {{ \$labels.device }} has been above 500 ms for 30 minutes.
+                Bulk writes (a restore, a backup) push it up briefly; half an hour is a failing
+                or worn-out disk, or sustained saturation. Check dmesg, smartctl and the other
+                RAID member; Postgres commits and etcd/kine writes stall behind this.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#hardware"
 
       # Alerting-pipeline watchdog. Without these, a Telegram outage, a message
       # Telegram rejects, or a dead Alertmanager looks exactly like "nothing firing".
@@ -1770,6 +1913,1063 @@ serverFiles:
                 At least one rule in {{ \$labels.rule_group }} errors on every evaluation (often a
                 many-to-many match after a label change), so it can never fire. Check the
                 Prometheus /rules page.
+          - alert: PrometheusConfigReloadFailed
+            expr: prometheus_config_last_reload_successful == 0
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Prometheus failed to load its configuration"
+              description: |
+                Prometheus runs on its previous scrape and rule configuration; the latest change
+                (a new rule, a new scrape job) is not in effect. The prometheus-server log, or
+                promtool check config on the prometheus-server ConfigMap, names the error.
+          - alert: PrometheusTSDBFailing
+            expr: |
+              increase(prometheus_tsdb_compactions_failed_total[3h]) > 0
+              or increase(prometheus_tsdb_head_truncations_failed_total[3h]) > 0
+              or increase(prometheus_tsdb_wal_corruptions_total[3h]) > 0
+            for: 0m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Prometheus storage errors (compaction, head truncation or WAL)"
+              description: |
+                Prometheus could not compact or truncate its TSDB, or found a corrupt WAL. Disk
+                use grows and queries slow down until it is fixed; a full volume stops all
+                alerting. Check the prometheus-server log and free space on its PVC.
+          # Catch-all for scrape targets without a dedicated alert below. A dead target is
+          # a blind spot: every rule over its metrics goes quiet instead of firing.
+          - alert: ScrapeTargetDown
+            expr: |
+              up{job!~"alertmanager|mysql-exporter|redpanda|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Scrape target {{ \$labels.job }} {{ \$labels.instance }} down for >15m"
+              description: |
+                Prometheus cannot scrape {{ \$labels.instance }} (job {{ \$labels.job }},
+                namespace {{ \$labels.namespace }}). Rules over its metrics cannot fire while it
+                is down. The Prometheus /targets page shows the scrape error.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#alerting-pipeline"
+
+      # Node golden signals: saturation (CPU, memory, I/O, conntrack, file
+      # descriptors), errors (NIC errors, OOM kills, clock) and the exporter that
+      # every node and hardware rule depends on. Disk space lives in infra-disk, disk
+      # health in infra-hardware. Thresholds sit well above what the reference cluster (12 cores, one
+      # node, ~75 pods) reached in the 3 days before 2026-10-24: CPU 65%, CPU PSI 0.26,
+      # memory PSI 0.007, I/O PSI 0.2, 44% memory available at the low point.
+      - name: infra-node
+        interval: 1m
+        rules:
+          - alert: NodeExporterDown
+            expr: |
+              kube_node_info unless on (node) (up{service=~".*node-exporter"} == 1)
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "No node-exporter metrics from node {{ \$labels.node }}"
+              description: |
+                Prometheus gets nothing from node-exporter on {{ \$labels.node }}, so every disk,
+                RAID, NVMe, memory and backup alert for that node is blind. Check the
+                prometheus-prometheus-node-exporter DaemonSet pod on the node and the
+                Prometheus /targets page.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeCPUSaturated
+            expr: rate(node_pressure_cpu_waiting_seconds_total[5m]) > 0.5
+            for: 30m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Runnable tasks on {{ \$labels.instance }} wait for CPU {{ \$value | humanizePercentage }} of the time"
+              description: |
+                CPU pressure (PSI 'some') has been above 50% for 30 minutes: work queues for
+                CPU and every request on the node gets slower. Find the consumer with
+                kubectl top pods -A --sort-by=cpu; a scraper flood shows up as the web-tier pods.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeCPUUtilisationHigh
+            expr: |
+              1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) > 0.9
+            for: 1h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "CPU on {{ \$labels.instance }} {{ \$value | humanizePercentage }} busy for an hour"
+              description: |
+                The node has had less than 10% idle CPU for an hour. No headroom is left for a
+                rollout, a CI build or a traffic spike. kubectl top pods -A --sort-by=cpu.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeMemoryLow
+            expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.instance }} has {{ \$value | humanizePercentage }} memory available"
+              description: |
+                Less than 10% of RAM is available. The kernel OOM killer and kubelet eviction
+                (MemoryPressure) come next. kubectl top pods -A --sort-by=memory; check for a
+                leaking pod or a missing memory limit.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeMemoryCritical
+            expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.05
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "{{ \$labels.instance }} has only {{ \$value | humanizePercentage }} memory available"
+              description: |
+                Under 5% of RAM is available: OOM kills of Postgres, Traefik or k3s itself are
+                imminent. Scale down or restart the largest consumer now
+                (kubectl top pods -A --sort-by=memory).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeMemoryPressureStalls
+            expr: rate(node_pressure_memory_stalled_seconds_total[5m]) > 0.1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "All tasks on {{ \$labels.instance }} stall on memory {{ \$value | humanizePercentage }} of the time"
+              description: |
+                Memory PSI 'full' above 10% for 15 minutes: the node is reclaiming page cache or
+                thrashing, and everything on it is slow. Usually precedes NodeMemoryLow or OOM
+                kills; find the consumer with kubectl top pods -A --sort-by=memory.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeOOMKills
+            expr: increase(node_vmstat_oom_kill[30m]) > 0
+            for: 0m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Kernel OOM killer fired {{ \$value | printf \"%.0f\" }} time(s) on {{ \$labels.instance }} in 30m"
+              description: |
+                The kernel killed processes for memory, either a container hitting its limit
+                (KubeContainerOOMKilled names it) or the whole node running out. dmesg -T | grep
+                -i 'killed process' on the node shows the victim.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeIOStalled
+            expr: rate(node_pressure_io_stalled_seconds_total[5m]) > 0.3
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "All tasks on {{ \$labels.instance }} stall on I/O {{ \$value | humanizePercentage }} of the time"
+              description: |
+                I/O PSI 'full' above 30% for 15 minutes: the disks cannot keep up. Postgres,
+                Prometheus and the k3s datastore all slow down. Look for a backup, restore or
+                compaction (iotop on the node) and at NodeDiskRead/WriteLatencyHigh for a
+                failing disk.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeNetworkErrors
+            expr: |
+              (
+                rate(node_network_receive_errs_total{device!~"lo|veth.*"}[5m])
+                  / rate(node_network_receive_packets_total{device!~"lo|veth.*"}[5m]) > 0.01
+              )
+              or
+              (
+                rate(node_network_transmit_errs_total{device!~"lo|veth.*"}[5m])
+                  / rate(node_network_transmit_packets_total{device!~"lo|veth.*"}[5m]) > 0.01
+              )
+            for: 30m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Interface {{ \$labels.device }} on {{ \$labels.instance }} has {{ \$value | humanizePercentage }} packet errors"
+              description: |
+                More than 1% of packets on {{ \$labels.device }} fail with errors for 30 minutes:
+                a bad cable or switch port, a NIC fault, or an MTU mismatch on the VLAN or
+                WireGuard/Tailscale link. ip -s link show {{ \$labels.device }} and ethtool -S on
+                the node; for a provider-side fault, open a ticket with the hosting provider.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeClockSkew
+            expr: |
+              (node_timex_offset_seconds > 0.05 and deriv(node_timex_offset_seconds[5m]) >= 0)
+              or
+              (node_timex_offset_seconds < -0.05 and deriv(node_timex_offset_seconds[5m]) <= 0)
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Clock on {{ \$labels.instance }} is {{ \$value | humanizeDuration }} off"
+              description: |
+                The system clock is more than 50 ms off and not converging. TLS, OIDC tokens
+                (Dex/Pomerium), certificate checks and multi-node k3s all depend on time.
+                timedatectl timesync-status / chronyc tracking on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeClockNotSynchronising
+            expr: |
+              min_over_time(node_timex_sync_status[5m]) == 0
+              and node_timex_maxerror_seconds >= 16
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Clock on {{ \$labels.instance }} is not synchronised with NTP"
+              description: |
+                The kernel reports the clock as unsynchronised and its error bound has grown
+                to 16 s. systemd-timesyncd or chrony is stopped or cannot reach its servers
+                (outbound UDP 123). systemctl status systemd-timesyncd on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeConntrackNearLimit
+            expr: node_nf_conntrack_entries / node_nf_conntrack_entries_limit > 0.75
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "conntrack table on {{ \$labels.instance }} {{ \$value | humanizePercentage }} full"
+              description: |
+                When the table is full the kernel drops new connections ("nf_conntrack: table
+                full" in dmesg), which looks like random timeouts on every service. A connection
+                flood (scrapers) is the usual cause; raise net.netfilter.nf_conntrack_max only
+                after finding it.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+          - alert: NodeFileDescriptorsNearLimit
+            expr: node_filefd_allocated / node_filefd_maximum > 0.8
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.instance }} uses {{ \$value | humanizePercentage }} of its file descriptors"
+              description: |
+                The kernel-wide file handle limit is nearly reached; opening files and sockets
+                will fail with EMFILE/ENFILE. Find the process with the most open files
+                (ls /proc/*/fd | wc -l per pid) on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
+
+      # k3s control plane: the API server (availability, 5xx, latency, throttling),
+      # its datastore (kine/SQLite on every env here; the same apiserver-side etcd_*
+      # metrics cover embedded etcd), the kubelet and the node objects. k3s serves
+      # the apiserver and kubelet metrics from one process, so each series appears in
+      # both the kubernetes-api-servers and kubernetes-nodes jobs; every rule pins one
+      # job to avoid double counting.
+      - name: infra-k8s-control-plane
+        interval: 1m
+        rules:
+          - alert: KubeAPIServerDown
+            expr: absent(up{job="kubernetes-api-servers"} == 1)
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Kubernetes API server unreachable for >5m"
+              description: |
+                Prometheus cannot scrape the API server. Nothing can be deployed or rescheduled
+                and controllers (cert-manager, ArgoCD, CNPG) stall; running pods keep serving.
+                On the node: systemctl status k3s, journalctl -u k3s -n 200. A full disk or a
+                locked/corrupt /var/lib/rancher/k3s/server/db/state.db are the usual causes.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeAPIServerErrorsHigh
+            expr: |
+              sum(rate(apiserver_request_total{job="kubernetes-api-servers",code=~"5.."}[5m]))
+                / sum(rate(apiserver_request_total{job="kubernetes-api-servers"}[5m])) > 0.05
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$value | humanizePercentage }} of API server requests fail with 5xx"
+              description: |
+                More than 5% of API requests return a server error for 15 minutes (the reference cluster peaked
+                at 1.2% in the day before 2026-10-24). Usually the datastore (see
+                K3sDatastoreLatencyHigh) or a broken aggregated API/webhook. Break it down with
+                sum by (resource, verb, code) (rate(apiserver_request_total{code=~"5.."}[5m])).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeAPIServerLatencyHigh
+            expr: |
+              histogram_quantile(0.99, sum by (le, verb) (rate(apiserver_request_duration_seconds_bucket{job="kubernetes-api-servers",verb=~"GET|POST|PUT|PATCH|DELETE|APPLY",subresource!~"log|exec|portforward|attach|proxy"}[5m]))) > 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "API server p99 {{ \$labels.verb }} latency {{ \$value | humanizeDuration }}"
+              description: |
+                99th-percentile latency for single-object {{ \$labels.verb }} requests has been
+                above 1 s for 15 minutes (normal here: under 0.2 s). The datastore is the usual
+                bottleneck (disk latency, a huge SQLite file); also check CPU saturation.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeAPIServerListLatencyHigh
+            expr: |
+              histogram_quantile(0.99, sum by (le) (rate(apiserver_request_duration_seconds_bucket{job="kubernetes-api-servers",verb="LIST"}[5m]))) > 5
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "API server p99 LIST latency {{ \$value | humanizeDuration }}"
+              description: |
+                99th-percentile LIST latency above 5 s for 15 minutes (normal here: about 1 s).
+                Controllers resync slowly and kubectl feels stuck. Often a client listing a
+                large resource in a loop; apiserver_request_total by (resource, client) finds it.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeAPIServerThrottling
+            expr: |
+              sum(rate(apiserver_flowcontrol_rejected_requests_total{job="kubernetes-api-servers"}[5m])) > 0
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "API server rejects requests (priority and fairness)"
+              description: |
+                The API server is shedding load with 429s for 15 minutes. Some client is
+                flooding it; apiserver_flowcontrol_rejected_requests_total by (flow_schema)
+                says which flow schema.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: K3sDatastoreLatencyHigh
+            expr: |
+              histogram_quantile(0.99, sum by (le, operation) (rate(etcd_request_duration_seconds_bucket{job="kubernetes-api-servers"}[5m]))) > 0.5
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "k3s datastore p99 {{ \$labels.operation }} latency {{ \$value | humanizeDuration }}"
+              description: |
+                The API server waits more than 0.5 s (p99) on the datastore for
+                {{ \$labels.operation }} for 15 minutes (normal: under 0.1 s). With kine/SQLite
+                that is disk latency or a bloated state.db; check NodeIOStalled, disk latency and
+                ls -lh /var/lib/rancher/k3s/server/db/ on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: K3sDatastoreErrors
+            expr: |
+              sum by (operation) (rate(etcd_request_errors_total{job="kubernetes-api-servers"}[5m])) > 0.1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "k3s datastore {{ \$labels.operation }} requests failing"
+              description: |
+                The API server gets errors back from its datastore (kine/SQLite or etcd). Writes
+                and watches are unreliable; journalctl -u k3s on the server shows the kine or
+                etcd error (disk full, database locked, corruption).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: K3sDatastoreLarge
+            expr: max(apiserver_storage_size_bytes{job="kubernetes-api-servers"}) > 2 * 1024 * 1024 * 1024
+            for: 1h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "k3s datastore is {{ \$value | humanize1024 }}B"
+              description: |
+                The k3s database passed 2 GiB (typical: under 100 MiB). SQLite slows down as it grows;
+                usually an object kind is being created in a loop (Events, Jobs, ReplicaSets).
+                kubectl get --raw /metrics | grep apiserver_storage_objects lists counts by kind.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeletDown
+            expr: |
+              kube_node_info unless on (node) label_replace(up{job="kubernetes-nodes"} == 1, "node", "\$1", "instance", "(.*)")
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "kubelet on {{ \$labels.node }} unreachable for >5m"
+              description: |
+                Prometheus cannot scrape the kubelet on {{ \$labels.node }}. If KubeNodeNotReady
+                fires too, the node or k3s/k3s-agent is down: systemctl status k3s (or k3s-agent)
+                and journalctl on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeletPLEGSlow
+            expr: |
+              histogram_quantile(0.99, sum by (le, instance) (rate(kubelet_pleg_relist_duration_seconds_bucket{job="kubernetes-nodes"}[5m]))) >= 10
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "kubelet on {{ \$labels.instance }}: PLEG relist p99 {{ \$value | humanizeDuration }}"
+              description: |
+                The kubelet takes over 10 s to list containers (normal: under 0.2 s); at 3
+                minutes the node goes NotReady. containerd is overloaded or wedged:
+                journalctl -u k3s | grep -i pleg, and crictl ps on the node.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeletTooManyPods
+            expr: |
+              max by (node) (kubelet_running_pods{job="kubernetes-nodes"})
+                / on (node) max by (node) (kube_node_status_capacity{resource="pods"}) > 0.9
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Node {{ \$labels.node }} runs {{ \$value | humanizePercentage }} of its pod capacity"
+              description: |
+                Past the max-pods limit (110 by default) new pods stay Pending. Clean up
+                finished Jobs (failedJobsHistoryLimit) and stray pods, or raise --max-pods in the
+                k3s config.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeNodeNotReady
+            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Node {{ \$labels.node }} NotReady for >5m"
+              description: |
+                The kubelet on {{ \$labels.node }} stopped reporting ready. Its pods are not
+                rescheduled on a single-node cluster, and are evicted after 5 minutes on a
+                multi-node one. kubectl describe node {{ \$labels.node }}; on the node,
+                systemctl status k3s (or k3s-agent).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeNodePressure
+            expr: |
+              kube_node_status_condition{condition=~"MemoryPressure|DiskPressure|PIDPressure",status="true"} == 1
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Node {{ \$labels.node }} reports {{ \$labels.condition }}"
+              description: |
+                The kubelet has started evicting pods and refuses new ones. DiskPressure means
+                the root filesystem or the image store passed the eviction threshold (see
+                infra-disk); MemoryPressure, NodeMemoryLow; PIDPressure, a fork bomb or a
+                thread leak.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeNodeUnschedulable
+            expr: kube_node_spec_unschedulable == 1
+            for: 2h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Node {{ \$labels.node }} has been cordoned for >2h"
+              description: |
+                A cordon left behind after maintenance. kubectl uncordon {{ \$labels.node }}
+                once the work is done.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          - alert: KubeStateMetricsDown
+            expr: absent(up{service=~".*kube-state-metrics"} == 1)
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "kube-state-metrics is not scraped"
+              description: |
+                Every node, pod, workload, PVC and Job alert reads kube-state-metrics; while it
+                is down they all stay silent. Check the prometheus-kube-state-metrics Deployment
+                in the observability namespace.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+
+      # Workload health across all namespaces: errors (crash loops, OOM kills, failed
+      # Jobs and CronJobs), availability (Deployments, StatefulSets, DaemonSets) and
+      # saturation (unschedulable pods, PVCs filling). PodNotReady and
+      # PodContainerRestarting in infra-pods stay the generic backstop; these name the
+      # cause. CronJob-owned Jobs are judged by their CronJob only: a failed run stays
+      # in the Job history (failedJobsHistoryLimit) long after the next run succeeded.
+      - name: infra-workloads
+        interval: 1m
+        rules:
+          - alert: KubePodCrashLooping
+            expr: |
+              max_over_time(kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}[5m]) >= 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} ({{ \$labels.container }}) in CrashLoopBackOff"
+              description: |
+                The container keeps exiting. kubectl -n {{ \$labels.namespace }} logs
+                {{ \$labels.pod }} -c {{ \$labels.container }} --previous shows why; a missing
+                Secret key or a failed DB connection are the usual causes after a deploy.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubePodImagePullFailing
+            expr: |
+              kube_pod_container_status_waiting_reason{reason=~"ImagePullBackOff|ErrImagePull|InvalidImageName|CreateContainerConfigError"} == 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} cannot start: {{ \$labels.reason }}"
+              description: |
+                The container never starts. For pull errors: the tag does not exist in Harbor,
+                the pull secret is wrong, or Harbor is down (PlatformWorkloadDown). For
+                CreateContainerConfigError: a referenced Secret or ConfigMap key is missing.
+                kubectl -n {{ \$labels.namespace }} describe pod {{ \$labels.pod }}.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeContainerOOMKilled
+            expr: |
+              (kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1)
+              and on (namespace, pod, container)
+              (increase(kube_pod_container_status_restarts_total[30m]) > 0)
+            for: 0m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} ({{ \$labels.container }}) was OOMKilled"
+              description: |
+                The container exceeded its memory limit and was killed in the last 30 minutes.
+                Raise the limit in its chart values, or find the leak; kubectl top pod and the
+                Grafana pod dashboards show the memory curve before the kill.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubePodUnschedulable
+            expr: kube_pod_status_unschedulable == 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} cannot be scheduled"
+              description: |
+                No node fits the pod: requests exceed what is left, a node selector or affinity
+                matches nothing, or its PVC is bound to another node (local-path). kubectl -n
+                {{ \$labels.namespace }} describe pod {{ \$labels.pod }} shows the scheduler event.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeDeploymentReplicasUnavailable
+            expr: |
+              kube_deployment_status_replicas_unavailable > 0
+              and on (namespace, deployment) kube_deployment_spec_replicas > 0
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Deployment {{ \$labels.namespace }}/{{ \$labels.deployment }} has {{ \$value }} unavailable replica(s)"
+              description: |
+                Fewer replicas are available than desired for 15 minutes. kubectl -n
+                {{ \$labels.namespace }} rollout status deploy/{{ \$labels.deployment }} and
+                describe its newest pod.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeDeploymentRolloutStuck
+            expr: |
+              kube_deployment_status_condition{condition="Progressing",status="false"} == 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Rollout of {{ \$labels.namespace }}/{{ \$labels.deployment }} exceeded its progress deadline"
+              description: |
+                The new ReplicaSet does not become ready; the old pods keep serving if there are
+                any. kubectl -n {{ \$labels.namespace }} rollout status
+                deploy/{{ \$labels.deployment }}; roll back through Git (ArgoCD), not by hand.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeStatefulSetReplicasNotReady
+            expr: |
+              kube_statefulset_status_replicas_ready < kube_statefulset_replicas
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "StatefulSet {{ \$labels.namespace }}/{{ \$labels.statefulset }} has {{ \$value }} ready replica(s)"
+              description: |
+                Fewer replicas are ready than desired for 15 minutes. StatefulSets roll one pod
+                at a time, so a single stuck pod blocks the rest. kubectl -n
+                {{ \$labels.namespace }} describe sts {{ \$labels.statefulset }}.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeDaemonSetUnavailable
+            expr: |
+              kube_daemonset_status_number_unavailable > 0
+              or (kube_daemonset_status_desired_number_scheduled - kube_daemonset_status_current_number_scheduled) > 0
+              or kube_daemonset_status_number_misscheduled > 0
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "DaemonSet {{ \$labels.namespace }}/{{ \$labels.daemonset }} not running on every node"
+              description: |
+                At least one node lacks a ready pod of {{ \$labels.daemonset }} (node-exporter,
+                promtail, svclb-traefik). That node loses its metrics, logs or ingress.
+                kubectl -n {{ \$labels.namespace }} get pods -o wide -l for the DaemonSet.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeJobFailed
+            expr: |
+              kube_job_failed{condition="true"} == 1
+              unless on (namespace, job_name) kube_job_owner{owner_kind="CronJob"}
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Job {{ \$labels.namespace }}/{{ \$labels.job_name }} failed"
+              description: |
+                A one-off Job (a migration, a seed, a restore) ran out of retries. kubectl -n
+                {{ \$labels.namespace }} logs job/{{ \$labels.job_name }}. Delete the Job once
+                handled; this alert lasts as long as the failed Job object.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubeCronJobLastRunFailed
+            expr: |
+              (
+                (kube_cronjob_status_last_schedule_time - kube_cronjob_status_last_successful_time) > 0
+                or
+                (kube_cronjob_status_last_schedule_time unless on (namespace, cronjob) kube_cronjob_status_last_successful_time)
+              )
+              and on (namespace, cronjob) kube_cronjob_status_active == 0
+              and on (namespace, cronjob) kube_cronjob_spec_suspend == 0
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "CronJob {{ \$labels.namespace }}/{{ \$labels.cronjob }}: latest run did not succeed"
+              description: |
+                The most recent scheduled run of {{ \$labels.cronjob }} finished without success
+                (or none ever succeeded) and nothing is running now. Backups and dumps are
+                CronJobs, so this can mean no fresh backup. kubectl -n {{ \$labels.namespace }}
+                get jobs --sort-by=.status.startTime, then logs of the newest one. Rerun with
+                kubectl create job --from=cronjob/{{ \$labels.cronjob }} <name>.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          # local-path volumes report the host filesystem, not the PVC (the provisioner
+          # does not enforce sizes), so they are left to NodeFilesystemSpace* in
+          # infra-disk; these cover every other storage class.
+          - alert: KubePersistentVolumeFillingUp
+            expr: |
+              (
+                max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_available_bytes{job="kubernetes-nodes"})
+                  / max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes"})
+              ) < 0.10
+              and on (namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info{storageclass!="local-path"}
+            for: 30m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "PVC {{ \$labels.namespace }}/{{ \$labels.persistentvolumeclaim }} has {{ \$value | humanizePercentage }} free"
+              description: |
+                The volume is over 90% full. Expand the PVC (if the storage class allows it),
+                or prune the data (Postgres: check bloat and WAL; Redpanda: retention).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubePersistentVolumeFull
+            expr: |
+              (
+                max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_available_bytes{job="kubernetes-nodes"})
+                  / max by (namespace, persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes"})
+              ) < 0.03
+              and on (namespace, persistentvolumeclaim) kube_persistentvolumeclaim_info{storageclass!="local-path"}
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "PVC {{ \$labels.namespace }}/{{ \$labels.persistentvolumeclaim }} almost full ({{ \$value | humanizePercentage }} free)"
+              description: |
+                Writes to this volume fail within minutes. Free space or expand it now.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          - alert: KubePersistentVolumeClaimPending
+            expr: kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "PVC {{ \$labels.namespace }}/{{ \$labels.persistentvolumeclaim }} Pending for >15m"
+              description: |
+                No volume binds to the claim, so its pod cannot start. kubectl -n
+                {{ \$labels.namespace }} describe pvc {{ \$labels.persistentvolumeclaim }}: a
+                wrong storage class, a static local PV that does not match, or the
+                local-path-provisioner pod is down.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+
+      # CoreDNS: availability, errors (SERVFAIL, broken upstreams), latency and
+      # saturation (forwarder concurrency limit). A DNS outage looks like every
+      # service failing at once.
+      - name: infra-dns
+        interval: 1m
+        rules:
+          - alert: CoreDNSDown
+            expr: absent(up{service="kube-dns"} == 1)
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "CoreDNS is not answering metrics scrapes"
+              description: |
+                Cluster DNS is down or unscraped. Pods cannot resolve Services or external
+                hosts (Postgres, Harbor, Let's Encrypt, GitHub). kubectl -n kube-system get pods
+                -l k8s-app=kube-dns and its logs.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#dns"
+          - alert: CoreDNSErrorsHigh
+            expr: |
+              sum(rate(coredns_dns_responses_total{rcode="SERVFAIL"}[5m]))
+                / sum(rate(coredns_dns_responses_total[5m])) > 0.05
+              and sum(rate(coredns_dns_responses_total[5m])) > 0.1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$value | humanizePercentage }} of DNS answers are SERVFAIL"
+              description: |
+                CoreDNS fails over 5% of queries for 15 minutes. Usually the upstream resolver
+                (the node's /etc/resolv.conf) is unreachable or slow. kubectl -n kube-system
+                logs deploy/coredns.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#dns"
+          - alert: CoreDNSLatencyHigh
+            expr: |
+              histogram_quantile(0.99, sum by (le) (rate(coredns_dns_request_duration_seconds_bucket[5m]))) > 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "CoreDNS p99 latency {{ \$value | humanizeDuration }}"
+              description: |
+                99th-percentile DNS latency above 1 s for 15 minutes (normal: under 50 ms).
+                Upstream resolver trouble or CPU throttling of the CoreDNS pod.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#dns"
+          - alert: CoreDNSForwardFailing
+            expr: |
+              increase(coredns_forward_healthcheck_broken_total[10m]) > 0
+              or increase(coredns_forward_max_concurrent_rejects_total[10m]) > 0
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "CoreDNS cannot forward to its upstream resolvers"
+              description: |
+                Every upstream failed its health check, or CoreDNS hit its forward concurrency
+                limit and is refusing queries. External names (Let's Encrypt, GitHub, Harbor's
+                upstreams) stop resolving. Check the node's resolvers (resolvectl status).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#dns"
+
+      # Certificates: cert-manager Certificates (ingress TLS, webhooks, operator certs)
+      # and the k3s-managed certificates (apiserver, kubelet, controller and client
+      # certs, from k3s_certificate_expiration_seconds). Let's Encrypt certificates
+      # renew 30 days before expiry, so under 14 days means renewal is failing. k3s
+      # renews its own leaf certificates on start when they are within 120 days of
+      # expiry, so a server that is never restarted lets them run out after a year.
+      - name: infra-certificates
+        interval: 5m
+        rules:
+          - alert: CertManagerCertificateNotReady
+            expr: |
+              max by (namespace, name, issuer_name) (certmanager_certificate_ready_status{condition=~"False|Unknown"}) == 1
+            for: 1h
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Certificate {{ \$labels.namespace }}/{{ \$labels.name }} not Ready for >1h"
+              description: |
+                cert-manager cannot issue or renew {{ \$labels.name }} (issuer
+                {{ \$labels.issuer_name }}). kubectl -n {{ \$labels.namespace }} describe
+                certificate {{ \$labels.name }}, then the pending Order and Challenge. For DNS-01:
+                the Cloudflare token and the zone; for HTTP-01: DNS must point at this cluster.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: CertManagerCertificateExpiringSoon
+            expr: |
+              (min by (namespace, name) (certmanager_certificate_expiration_timestamp_seconds) - time()) < 14 * 86400
+              and min by (namespace, name) (certmanager_certificate_expiration_timestamp_seconds) > 0
+            for: 1h
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Certificate {{ \$labels.namespace }}/{{ \$labels.name }} expires in {{ \$value | humanizeDuration }}"
+              description: |
+                Renewal should have happened at 30 days left. Find out why cert-manager is not
+                renewing (CertManagerCertificateNotReady, cert-manager logs) and force it with
+                cmctl renew -n {{ \$labels.namespace }} {{ \$labels.name }}.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: CertManagerCertificateExpiryCritical
+            expr: |
+              (min by (namespace, name) (certmanager_certificate_expiration_timestamp_seconds) - time()) < 3 * 86400
+              and min by (namespace, name) (certmanager_certificate_expiration_timestamp_seconds) > 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Certificate {{ \$labels.namespace }}/{{ \$labels.name }} expires in {{ \$value | humanizeDuration }}"
+              description: |
+                Browsers and clients reject the host within days. Fix issuance now (see
+                CertManagerCertificateExpiringSoon); Let's Encrypt rate limits leave little
+                room for retries.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: CertManagerAbsent
+            expr: |
+              absent(up{app_kubernetes_io_name="cert-manager",app_kubernetes_io_component="controller"} == 1)
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "cert-manager controller is not scraped"
+              description: |
+                No metrics from the cert-manager controller: it is down (no renewals happen) or
+                lost its prometheus.io/scrape annotation, which blinds the certificate alerts.
+                kubectl -n cert-manager get pods.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: K3sCertificateExpiringSoon
+            expr: |
+              min by (subject) (k3s_certificate_expiration_seconds{job="kubernetes-api-servers",usages!="CertSign"}) < 30 * 86400
+            for: 1h
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "k3s certificate {{ \$labels.subject }} expires in {{ \$value | humanizeDuration }}"
+              description: |
+                A k3s-managed certificate (apiserver, kubelet, controller or a client cert) has
+                under 30 days left. k3s renews leaf certificates when it starts within 120 days
+                of expiry: systemctl restart k3s on the server (k3s-agent on workers), or
+                k3s certificate rotate. When they expire the API server and kubelets stop
+                talking to each other.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: K3sCertificateExpiryCritical
+            expr: |
+              min by (subject) (k3s_certificate_expiration_seconds{job="kubernetes-api-servers",usages!="CertSign"}) < 7 * 86400
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "k3s certificate {{ \$labels.subject }} expires in {{ \$value | humanizeDuration }}"
+              description: |
+                Restart k3s on the server now (systemctl restart k3s) so it renews its
+                certificates; then check K3sCertificateExpiringSoon has cleared.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+          - alert: K3sCACertificateExpiring
+            expr: |
+              min by (subject) (k3s_certificate_expiration_seconds{job="kubernetes-api-servers",usages="CertSign"}) < 180 * 86400
+            for: 1h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "k3s CA {{ \$labels.subject }} expires in {{ \$value | humanizeDuration }}"
+              description: |
+                A k3s CA (10-year lifetime) is within 6 months of expiry. Rotating a CA is a
+                planned operation (k3s certificate rotate-ca); every kubeconfig and node join
+                token changes.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#certificates"
+
+      # Edge (Traefik): traffic, errors and latency per entrypoint, and the platform
+      # backends behind it. Pomerium has no metrics listener configured, so its
+      # errors are read from Traefik's per-service counters (sso-pomerium-proxy-*).
+      # Traffic floors keep a quiet env (a handful of probes an hour) from paging on
+      # one failed request.
+      - name: platform-edge
+        interval: 1m
+        rules:
+          - alert: TraefikMetricsMissing
+            expr: absent(up{app_kubernetes_io_name="traefik"} == 1)
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "No Traefik metrics"
+              description: |
+                Traefik is down (then PlatformWorkloadDown fires too, and every site is
+                unreachable) or lost its prometheus.io/scrape pod annotation, which blinds the
+                edge alerts. kubectl -n kube-system get pods -l app.kubernetes.io/name=traefik.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#edge"
+          - alert: TraefikHighErrorRate
+            expr: |
+              sum by (entrypoint) (rate(traefik_entrypoint_requests_total{code=~"5.."}[5m]))
+                / sum by (entrypoint) (rate(traefik_entrypoint_requests_total[5m])) > 0.05
+              and sum by (entrypoint) (rate(traefik_entrypoint_requests_total[5m])) > 0.1
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$value | humanizePercentage }} of requests on entrypoint {{ \$labels.entrypoint }} end in 5xx"
+              description: |
+                More than 5% of edge requests fail for 10 minutes (the reference cluster peaked at 2.7%). Find
+                the backend: sum by (service, code) (rate(traefik_service_requests_total{code=~"5.."}[5m])).
+                502/504 is a backend down or too slow, 503 a Service without ready endpoints.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#edge"
+          - alert: TraefikSlowRequests
+            expr: |
+              (
+                1 - sum by (entrypoint) (rate(traefik_entrypoint_request_duration_seconds_bucket{le="1.2"}[15m]))
+                  / sum by (entrypoint) (rate(traefik_entrypoint_request_duration_seconds_count[15m]))
+              ) > 0.25
+              and sum by (entrypoint) (rate(traefik_entrypoint_requests_total[15m])) > 0.5
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "{{ \$value | humanizePercentage }} of requests on {{ \$labels.entrypoint }} take over 1.2 s"
+              description: |
+                A quarter of edge requests are slow for 15 minutes. Long-lived streams (SSE,
+                websockets) count as slow too, so check per service first:
+                traefik_service_request_duration_seconds_bucket by (service). Then node
+                saturation (NodeCPUSaturated, NodeIOStalled) and the backend itself.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#edge"
+          - alert: TraefikTrafficStopped
+            expr: |
+              sum(rate(traefik_entrypoint_requests_total[15m])) == 0
+              and sum(rate(traefik_entrypoint_requests_total[15m] offset 1d)) > 0.05
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Traefik received no requests for 15 minutes (it did yesterday)"
+              description: |
+                The edge sees no traffic at all while there was some a day ago: DNS no longer
+                points here, the provider firewall or the svclb-traefik pod drops port 80/443,
+                or the public IP changed. Check from outside: curl -sI https://<a public host>.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#edge"
+          - alert: PlatformServiceErrorsHigh
+            expr: |
+              sum by (service) (rate(traefik_service_requests_total{service=~"${PLATFORM_TRAEFIK_SERVICES_RE}",code=~"5.."}[5m]))
+                / sum by (service) (rate(traefik_service_requests_total{service=~"${PLATFORM_TRAEFIK_SERVICES_RE}"}[5m])) > 0.1
+              and sum by (service) (rate(traefik_service_requests_total{service=~"${PLATFORM_TRAEFIK_SERVICES_RE}"}[5m])) > 0.02
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$value | humanizePercentage }} of requests to {{ \$labels.service }} fail with 5xx"
+              description: |
+                A platform service behind Traefik (Pomerium, Dex, Harbor, Argo CD, Nexus,
+                Grafana) answers more than 10% 5xx for 15 minutes. For sso-pomerium-proxy the
+                5xx may come from an app behind Pomerium: Pomerium's log names the upstream.
+                Otherwise check the service's pods and logs.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#edge"
+
+      # Platform services: workload availability in the platform namespaces (Traefik,
+      # CoreDNS, cert-manager, Pomerium, Dex, Harbor, Argo CD, the CNPG operator),
+      # Dex errors from its own telemetry, and Argo CD application state. Harbor and
+      # Pomerium expose no metrics as installed, so their "up" is their Deployments'
+      # readiness and their errors are in PlatformServiceErrorsHigh.
+      - name: platform-services
+        interval: 1m
+        rules:
+          - alert: PlatformWorkloadDown
+            expr: |
+              (
+                kube_deployment_status_replicas_available{namespace=~"${PLATFORM_NAMESPACES_RE}"} == 0
+                and on (namespace, deployment) kube_deployment_spec_replicas > 0
+              )
+              or
+              (
+                kube_statefulset_status_replicas_ready{namespace=~"${PLATFORM_NAMESPACES_RE}"} == 0
+                and on (namespace, statefulset) kube_statefulset_replicas > 0
+              )
+            for: 10m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Platform workload {{ \$labels.namespace }}/{{ \$labels.deployment }}{{ \$labels.statefulset }} has no ready replica"
+              description: |
+                {{ \$labels.deployment }}{{ \$labels.statefulset }} in {{ \$labels.namespace }} has
+                been completely down for 10 minutes. Depending on which: Traefik = every site
+                down; CoreDNS = cluster DNS down; pomerium-proxy/dex = every protected app and
+                login down; harbor-* = no image pulls or CI pushes; argocd-* = GitOps stopped;
+                cert-manager = no renewals; cnpg = Postgres failover and backups stopped.
+                kubectl -n {{ \$labels.namespace }} describe pods and logs --previous.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#platform-services"
+          - alert: DexErrors
+            expr: |
+              sum(increase(http_requests_total{job="dex",code=~"5.."}[15m])) > 5
+            for: 5m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Dex answered {{ \$value | printf \"%.0f\" }} requests with 5xx in 15m"
+              description: |
+                Logins through Dex fail (Grafana, Argo CD, Pomerium-protected apps). The
+                GitHub connector (OAuth App credentials, GitHub outage) or Dex's storage is the
+                usual cause: kubectl -n ${NAMESPACE_SSO} logs deploy/dex.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#platform-services"
+          - alert: DexMetricsMissing
+            expr: absent(up{job="dex"} == 1)
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "No Dex telemetry scraped"
+              description: |
+                The 'dex' scrape job finds no ready target (Service dex, port 'telemetry'), so
+                DexErrors cannot fire. Dex is down (PlatformWorkloadDown) or its Service changed.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#platform-services"
+          - alert: ArgoCDAppUnhealthy
+            expr: |
+              argocd_app_info{health_status=~"Degraded|Missing|Unknown"} == 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Argo CD app {{ \$labels.name }} is {{ \$labels.health_status }}"
+              description: |
+                Argo CD reports {{ \$labels.name }} (namespace {{ \$labels.dest_namespace }}) as
+                {{ \$labels.health_status }} for 15 minutes: a resource failed (Degraded), was
+                never created (Missing), or cannot be assessed. argocd app get {{ \$labels.name }}
+                or the Argo CD UI lists the failing resource.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#argocd"
+          - alert: ArgoCDAppSyncFailing
+            expr: |
+              sum by (name) (increase(argocd_app_sync_total{phase=~"Error|Failed"}[1h])) > 0
+              and on (name) argocd_app_info{sync_status!="Synced"} == 1
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Argo CD sync of {{ \$labels.name }} failed and the app is still not Synced"
+              description: |
+                A sync attempt failed in the last hour and the app has not converged since,
+                so the last Git change is not deployed. argocd app get {{ \$labels.name }} shows
+                the operation message (an invalid manifest, an immutable field, a webhook
+                rejecting the object).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#argocd"
+          - alert: ArgoCDAppOutOfSync
+            expr: |
+              argocd_app_info{sync_status="OutOfSync",autosync_enabled="true"} == 1
+            for: 6h
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Argo CD app {{ \$labels.name }} OutOfSync for >6h despite auto-sync"
+              description: |
+                Auto-sync is on but the live state still differs from Git after 6 hours. Either a
+                field is mutated by a controller (add ignoreDifferences for it), or sync is
+                failing quietly. argocd app diff {{ \$labels.name }} shows the drift.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#argocd"
+          - alert: ArgoCDMetricsMissing
+            expr: absent(up{job="argocd",component="argocd-application-controller"} == 1)
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "No Argo CD application-controller metrics"
+              description: |
+                The 'argocd' scrape job finds no ready application controller (port 'metrics'
+                :8082), so the Argo CD app alerts cannot fire. Check
+                argocd-application-controller-0 in the ${NAMESPACE_ARGOCD} namespace.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#argocd"
+
+      # CloudNativePG clusters (the 'cnpg' scrape job): instance up, replication,
+      # WAL archiving, backups, connection and transaction-ID saturation. Archiving and
+      # backup rules are inert until a cluster has a backup target (barman object
+      # store or the Barman Cloud plugin): without one CNPG's archive_command succeeds
+      # without storing anything, and the backup timestamps stay 0.
+      - name: infra-cnpg
+        interval: 1m
+        rules:
+          - alert: CNPGInstanceDown
+            expr: up{job="cnpg"} == 0 or cnpg_collector_up == 0
+            for: 5m
+            labels: { severity: p1, app: infra }
+            annotations:
+              summary: "Postgres instance {{ \$labels.namespace }}/{{ \$labels.pod }} is down"
+              description: |
+                The CNPG instance manager does not answer, or cannot reach its Postgres.
+                Single-instance clusters have no failover: the apps on {{ \$labels.cluster }}
+                are down. kubectl -n {{ \$labels.namespace }} get cluster,pods and
+                kubectl cnpg status {{ \$labels.cluster }} -n {{ \$labels.namespace }}.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGReplicationLagHigh
+            expr: |
+              cnpg_pg_replication_lag > 300
+              and on (namespace, pod) cnpg_pg_replication_in_recovery == 1
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Replica {{ \$labels.namespace }}/{{ \$labels.pod }} is {{ \$value | humanizeDuration }} behind"
+              description: |
+                A standby lags its primary by more than 5 minutes; a failover now loses that
+                much. Check the replica's disk latency and the network, and
+                cnpg_pg_replication_is_wal_receiver_up.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGArchivingFailing
+            expr: |
+              cnpg_pg_stat_archiver_last_failed_time > 0
+              and (cnpg_pg_stat_archiver_last_failed_time - cnpg_pg_stat_archiver_last_archived_time) > 1
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "WAL archiving fails on {{ \$labels.namespace }}/{{ \$labels.pod }}"
+              description: |
+                The latest archive_command attempt failed and none succeeded since: point-in-time
+                recovery stops at the last archived segment, and pg_wal grows until the volume
+                fills. kubectl -n {{ \$labels.namespace }} logs {{ \$labels.pod }} | grep -i
+                archive; usually object-store credentials or reachability.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGWALArchiveBacklog
+            expr: cnpg_collector_pg_wal_archive_status{value="ready"} > 50
+            for: 30m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$value }} WAL segments waiting to be archived on {{ \$labels.namespace }}/{{ \$labels.pod }}"
+              description: |
+                WAL is produced faster than it is archived, or archiving is stuck. Each segment
+                is 16 MiB on the Postgres volume. See CNPGArchivingFailing.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGBackupStale
+            expr: |
+              (time() - max by (namespace, cluster, pod) ({job="cnpg",__name__=~".*last_available_backup_timestamp"})) > 26 * 3600
+              and max by (namespace, cluster, pod) ({job="cnpg",__name__=~".*last_available_backup_timestamp"}) > 0
+            for: 1h
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Last base backup of {{ \$labels.namespace }}/{{ \$labels.cluster }} is {{ \$value | humanizeDuration }} old"
+              description: |
+                No successful base backup for over 26 hours, so a restore needs more WAL (or loses
+                data, if archiving is broken too). kubectl -n {{ \$labels.namespace }} get
+                backups,scheduledbackups.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGLastBackupFailed
+            expr: |
+              max by (namespace, cluster, pod) ({job="cnpg",__name__=~".*last_failed_backup_timestamp"})
+                > max by (namespace, cluster, pod) ({job="cnpg",__name__=~".*last_available_backup_timestamp"})
+            for: 15m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Latest base backup of {{ \$labels.namespace }}/{{ \$labels.cluster }} failed"
+              description: |
+                The most recent backup attempt failed after the last good one.
+                kubectl -n {{ \$labels.namespace }} describe backup (newest) shows the error.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGConnectionsNearLimit
+            expr: |
+              sum by (namespace, cluster, pod) (cnpg_backends_total)
+                / on (namespace, cluster, pod) max by (namespace, cluster, pod) (cnpg_pg_settings_setting{name="max_connections"}) > 0.8
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} uses {{ \$value | humanizePercentage }} of max_connections"
+              description: |
+                New connections fail with "too many clients" at 100%. Usually an app pool sized
+                above its share or leaking connections: cnpg_backends_total by (datname, usename,
+                application_name).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGTransactionIDAgeHigh
+            expr: max by (namespace, cluster, pod, datname) (cnpg_pg_database_xid_age) > 1000000000
+            for: 1h
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "Database {{ \$labels.datname }} on {{ \$labels.namespace }}/{{ \$labels.cluster }}: XID age {{ \$value | humanize }}"
+              description: |
+                Transaction-ID age passed 1 billion (autovacuum normally keeps it near 200
+                million). At about 2.1 billion Postgres stops accepting writes to prevent
+                wraparound. A long-running transaction or a stuck replication slot blocks
+                vacuum; run VACUUM (FREEZE) on the oldest tables.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGLongRunningTransaction
+            expr: |
+              cnpg_backends_max_tx_duration_seconds{application_name!~"pg_dump|pg_basebackup|.*barman.*"} > 3600
+            for: 15m
+            labels: { severity: p3, app: infra }
+            annotations:
+              summary: "Transaction open for {{ \$value | humanizeDuration }} on {{ \$labels.namespace }}/{{ \$labels.pod }} ({{ \$labels.datname }}, {{ \$labels.usename }})"
+              description: |
+                A transaction ({{ \$labels.state }}, application '{{ \$labels.application_name }}')
+                has been open for over an hour. It holds back vacuum and can hold locks.
+                SELECT pid, state, xact_start, query FROM pg_stat_activity ORDER BY xact_start;
+                pg_terminate_backend(pid) if it is abandoned.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
+          - alert: CNPGFenced
+            expr: cnpg_collector_fencing_on == 1 or cnpg_collector_manual_switchover_required == 1
+            for: 10m
+            labels: { severity: p2, app: infra }
+            annotations:
+              summary: "{{ \$labels.namespace }}/{{ \$labels.pod }} is fenced or waits for a manual switchover"
+              description: |
+                The instance is fenced (Postgres stopped on purpose) or the cluster needs a
+                manual switchover to finish an update. kubectl cnpg status {{ \$labels.cluster }}
+                -n {{ \$labels.namespace }}; kubectl cnpg fencing off, or kubectl cnpg promote.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#cnpg"
 
       # MySQL (Percona operator stack from tools/k3s/mysql.sh, scraped by the
       # 'mysql-exporter' job above). Inert in envs without the MySQL stack.
@@ -1916,7 +3116,13 @@ EOF
   # Alertmanager needs the resend-api-key secret in $NAMESPACE_OBSERVABILITY for SMTP auth.
   # The canonical secret lives in `default` (applied via SOPS; app workloads consume it
   # via envFrom); mirror it here so Alertmanager's extraSecretMounts can find it.
-  if kubectl -n default get secret resend-api-key >/dev/null 2>&1; then
+  # A dry run writes nothing: it only reports what is missing.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    for s in resend-api-key alertmanager-telegram; do
+      kubectl -n "$NAMESPACE_OBSERVABILITY" get secret "$s" >/dev/null 2>&1 \
+        || warn "Dry run: Secret ${NAMESPACE_OBSERVABILITY}/$s is missing; a real run creates a placeholder"
+    done
+  elif kubectl -n default get secret resend-api-key >/dev/null 2>&1; then
     if ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret resend-api-key >/dev/null 2>&1; then
       info "Mirroring resend-api-key from default → ${NAMESPACE_OBSERVABILITY} for Alertmanager SMTP"
       kubectl -n default get secret resend-api-key -o yaml \
@@ -1942,7 +3148,7 @@ EOF
   # missing one wedges the pod exactly like a missing resend-api-key. An env
   # provisioned without either has no Alertmanager at all — and nothing pages when
   # a public site goes down, which is exactly how such a gap gets discovered.
-  if ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-telegram >/dev/null 2>&1; then
+  if [[ "$DRY_RUN" != "true" ]] && ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-telegram >/dev/null 2>&1; then
     warn "alertmanager-telegram Secret not found in '${NAMESPACE_OBSERVABILITY}' namespace -- creating a PLACEHOLDER."
     warn "Telegram alert delivery is NOT configured. Apply the real Secret before relying on alerting:"
     warn "  sops -d \$INFRA_ENVS_ROOT/${ENV_NAME}/secrets.sops/alertmanager-telegram.yaml | kubectl apply -f -"
@@ -1966,7 +3172,12 @@ EOF
   # envs that opted into probing. Without it the shared 'uptime' alert group has no
   # series to evaluate and public endpoints go unwatched -- a public site can stay
   # down for many hours without anything firing.
-  if [[ -n "$PROBE_TARGETS" || -n "$PROBE_TARGETS_POST" ]]; then
+  if [[ "$RULES_ONLY" == "true" ]]; then
+    if [[ -n "$PROBE_TARGETS" || -n "$PROBE_TARGETS_POST" ]] \
+        && ! helm -n "$NAMESPACE_OBSERVABILITY" status prometheus-blackbox-exporter >/dev/null 2>&1; then
+      warn "--rules-only: blackbox exporter not installed although PROBE_TARGETS is set; run without --rules-only once"
+    fi
+  elif [[ -n "$PROBE_TARGETS" || -n "$PROBE_TARGETS_POST" ]]; then
     info "Installing blackbox exporter (GET: ${PROBE_TARGETS:-none}; POST: ${PROBE_TARGETS_POST:-none})"
     # http_2xx_post merges alongside the chart's stock modules (helm deep-merges maps).
     # 10s module timeout < 15s scrape_timeout on the blackbox-http-post job: a backend
@@ -1991,6 +3202,42 @@ BBEOF
     rm -f "$blackbox_values"
   else
     info "PROBE_TARGETS unset for ${ENV_NAME}; skipping blackbox exporter (no uptime probing)"
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    # Server-side render of the exact upgrade a real run performs, then a diff of the
+    # three ConfigMaps it changes against the live objects. The live prometheus.yml
+    # also carries the post-upgrade node-label patch below, so that relabel shows up
+    # as removed here and is re-added by a real run.
+    log "=== Dry run: helm upgrade prometheus --dry-run=server (nothing is applied) ==="
+    dry_dir=$(mktemp -d -t prometheus-dry-run-XXXX)
+    helm upgrade --install prometheus prometheus-community/prometheus \
+      --version "$PROMETHEUS_CHART_VERSION" \
+      --namespace "$NAMESPACE_OBSERVABILITY" \
+      --dry-run=server -o json \
+      -f "$prometheus_values" | jq -r '.manifest' > "$dry_dir/manifest.yaml"
+    dry_cm() { # <configmap> <key> <out>
+      yq "select(.kind == \"ConfigMap\" and .metadata.name == \"$1\") | .data.\"$2\"" "$dry_dir/manifest.yaml" > "$3.new"
+      kubectl -n "$NAMESPACE_OBSERVABILITY" get configmap "$1" -o json 2>/dev/null \
+        | jq -r --arg k "$2" '.data[$k] // ""' > "$3.live"
+    }
+    dry_cm prometheus-server alerting_rules.yml "$dry_dir/alerting_rules"
+    dry_cm prometheus-server prometheus.yml "$dry_dir/prometheus"
+    dry_cm prometheus-alertmanager alertmanager.yml "$dry_dir/alertmanager"
+    for f in alerting_rules prometheus alertmanager; do
+      # Normalise both sides through yq so key order and quoting do not show as changes.
+      yq -P 'sort_keys(..)' "$dry_dir/$f.live" > "$dry_dir/$f.live.n" 2>/dev/null || cp "$dry_dir/$f.live" "$dry_dir/$f.live.n"
+      yq -P 'sort_keys(..)' "$dry_dir/$f.new" > "$dry_dir/$f.new.n" 2>/dev/null || cp "$dry_dir/$f.new" "$dry_dir/$f.new.n"
+      log "--- diff ${f} (live -> rendered) ---"
+      diff -u "$dry_dir/$f.live.n" "$dry_dir/$f.new.n" || true
+    done
+    yq '.groups[].rules[].alert' "$dry_dir/alerting_rules.live" 2>/dev/null | sort -u > "$dry_dir/alerts.live" || true
+    yq '.groups[].rules[].alert' "$dry_dir/alerting_rules.new" | sort -u > "$dry_dir/alerts.new"
+    log "Alerts added:   $(comm -13 "$dry_dir/alerts.live" "$dry_dir/alerts.new" | wc -l | tr -d ' ')"
+    log "Alerts removed: $(comm -23 "$dry_dir/alerts.live" "$dry_dir/alerts.new" | tr '\n' ' ')"
+    log "Scrape jobs:    $(yq '.scrape_configs[].job_name' "$dry_dir/prometheus.new" | tr '\n' ' ')"
+    log "Rendered files kept in $dry_dir"
+    exit 0
   fi
 
   helm upgrade --install prometheus prometheus-community/prometheus \
