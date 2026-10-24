@@ -208,6 +208,42 @@ get_mysql_host() {
   echo "${MYSQL_CLUSTER_NAME}-mysql.${NAMESPACE_MYSQL}.svc.cluster.local"
 }
 
+# Helper: run the mysql client as root inside the MySQL pod.
+#   mysql_root <pod> [mysql args...]     SQL on stdin (keep secrets such as a new user's
+#                                        password in the SQL on stdin, not in -e)
+#   mysql_root_tty <pod>                 interactive session
+# The root password never leaves the pod: the operator mounts the users secret at
+# /etc/mysql/mysql-users-secret, and the in-pod shell reads it into MYSQL_PWD, so it is on no
+# argv (neither kubectl's here nor mysql's in the container).
+# shellcheck disable=SC2016  # expanded by the pod's shell
+MYSQL_ROOT_SH='f=/etc/mysql/mysql-users-secret/root
+[ -r "$f" ] || { echo "mysql_root: $f not readable in the pod" >&2; exit 1; }
+MYSQL_PWD=$(cat "$f") && export MYSQL_PWD && exec mysql -uroot "$@"'
+mysql_root() {
+  local pod="$1"
+  shift
+  kubectl -n "$NAMESPACE_MYSQL" exec -i "$pod" -c mysql -- sh -c "$MYSQL_ROOT_SH" mysql "$@"
+}
+mysql_root_tty() {
+  kubectl -n "$NAMESPACE_MYSQL" exec -it "$1" -c mysql -- sh -c "$MYSQL_ROOT_SH" mysql
+}
+
+# Helper: apply Secret NAME in NAMESPACE_MYSQL from KEY VALUE pairs. The manifest is built with
+# printf (a builtin) and piped to kubectl, so no value is on a command line (--from-literal
+# would put each one on kubectl's argv).
+#   apply_mysql_secret NAME KEY VALUE [KEY VALUE ...]
+apply_mysql_secret() {
+  local name="$1"
+  shift
+  {
+    printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: Opaque\ndata:\n' "$name" "$NAMESPACE_MYSQL"
+    while [[ $# -ge 2 ]]; do
+      printf '  %s: %s\n' "$1" "$(printf '%s' "$2" | base64 | tr -d '\n')"
+      shift 2
+    done
+  } | kubectl apply -f -
+}
+
 # ============================================================================
 # Show Credentials Mode
 # ============================================================================
@@ -432,7 +468,7 @@ EOF
       fi
 
       info "Opening mysql CLI as root in pod: ${mysql_pod}"
-      kubectl -n "$namespace" exec -it "$mysql_pod" -- mysql -uroot -p"${root_pass}"
+      mysql_root_tty "$mysql_pod"
       ;;
 
     exporter)
@@ -551,19 +587,20 @@ provision_credentials() {
   info "Creating database '${app_database}' and user '${app_username}'..."
 
   # Create database if not exists
-  kubectl -n "$namespace" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -e "CREATE DATABASE IF NOT EXISTS \`${app_database}\`;" || {
+  printf '%s\n' "CREATE DATABASE IF NOT EXISTS \`${app_database}\`;" | mysql_root "$mysql_pod" || {
     err "Failed to create database"
     exit 1
   }
 
   # Create user (or update password if exists)
-  kubectl -n "$namespace" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -e "CREATE USER IF NOT EXISTS '${app_username}'@'%' IDENTIFIED BY '${app_password}'; ALTER USER '${app_username}'@'%' IDENTIFIED BY '${app_password}';" || {
+  # The new password is in the SQL, so the SQL goes in on stdin.
+  printf '%s\n' "CREATE USER IF NOT EXISTS '${app_username}'@'%' IDENTIFIED BY '${app_password}'; ALTER USER '${app_username}'@'%' IDENTIFIED BY '${app_password}';" | mysql_root "$mysql_pod" || {
     err "Failed to create/update database user"
     exit 1
   }
 
   # Grant privileges
-  kubectl -n "$namespace" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -e "GRANT ALL PRIVILEGES ON \`${app_database}\`.* TO '${app_username}'@'%'; FLUSH PRIVILEGES;" || {
+  printf '%s\n' "GRANT ALL PRIVILEGES ON \`${app_database}\`.* TO '${app_username}'@'%'; FLUSH PRIVILEGES;" | mysql_root "$mysql_pod" || {
     warn "Failed to grant privileges (database may already have correct permissions)"
   }
 
@@ -686,10 +723,10 @@ dump_table() {
 
   # Verify table exists
   info "Verifying table exists: ${database}.${table_name}"
-  if ! kubectl -n "$namespace" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema = '${database}' AND table_name = '${table_name}'" | grep -q 1; then
+  if ! mysql_root "$mysql_pod" -N -e "SELECT 1 FROM information_schema.tables WHERE table_schema = '${database}' AND table_name = '${table_name}'" </dev/null | grep -q 1; then
     err "Table '${table_name}' not found in database '${database}'"
     err "Available tables:"
-    kubectl -n "$namespace" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -e "SHOW TABLES FROM \`${database}\`" 2>/dev/null || true
+    mysql_root "$mysql_pod" -e "SHOW TABLES FROM \`${database}\`" </dev/null 2>/dev/null || true
     exit 1
   fi
 
@@ -852,15 +889,11 @@ create_mysql_instance() {
     local root_pass
     root_pass=$(openssl rand -base64 24 | tr -d '\n')
 
-    kubectl -n "$NAMESPACE_MYSQL" create secret generic "${MYSQL_CLUSTER_NAME}-secrets" \
-      --from-literal=root="${root_pass}" \
-      --from-literal=operator="$(openssl rand -base64 24 | tr -d '\n')" \
-      --from-literal=monitor="$(openssl rand -base64 24 | tr -d '\n')" \
-      --from-literal=replication="$(openssl rand -base64 24 | tr -d '\n')" \
-      --from-literal=orchestrator="$(openssl rand -base64 24 | tr -d '\n')" \
-      --from-literal=heartbeat="$(openssl rand -base64 24 | tr -d '\n')" \
-      --from-literal=xtrabackup="$(openssl rand -base64 24 | tr -d '\n')" \
-      --dry-run=client -o yaml | kubectl apply -f -
+    local k extra=()
+    for k in operator monitor replication orchestrator heartbeat xtrabackup; do
+      extra+=("$k" "$(openssl rand -base64 24 | tr -d '\n')")
+    done
+    apply_mysql_secret "${MYSQL_CLUSTER_NAME}-secrets" root "$root_pass" "${extra[@]}"
 
     # Create the MySQL cluster
     info "Creating single-instance MySQL cluster..."
@@ -1015,8 +1048,8 @@ deploy_mysql_exporter() {
     exporter_pass=$(openssl rand -base64 16 | tr -d '\n')
 
     info "Creating mysqld-exporter user..."
-    kubectl -n "$NAMESPACE_MYSQL" exec "$mysql_pod" -- mysql -uroot -p"${root_pass}" -e \
-      "CREATE USER IF NOT EXISTS 'exporter'@'%' IDENTIFIED BY '${exporter_pass}' WITH MAX_USER_CONNECTIONS 3; GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%'; FLUSH PRIVILEGES;" 2>/dev/null || {
+    printf '%s\n' \
+      "CREATE USER IF NOT EXISTS 'exporter'@'%' IDENTIFIED BY '${exporter_pass}' WITH MAX_USER_CONNECTIONS 3; GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%'; FLUSH PRIVILEGES;" | mysql_root "$mysql_pod" 2>/dev/null || {
       warn "Failed to create exporter user (may already exist)"
       # Try to retrieve existing password from secret
       exporter_pass=$(kubectl -n "$NAMESPACE_MYSQL" get secret mysql-exporter-credentials -o jsonpath='{.data.MYSQL_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
@@ -1039,10 +1072,7 @@ host=${mysql_host}
 port=3306
 EOF
 )
-    kubectl -n "$NAMESPACE_MYSQL" create secret generic mysql-exporter-credentials \
-      --from-literal=.my.cnf="${my_cnf}" \
-      --from-literal=MYSQL_PASSWORD="${exporter_pass}" \
-      --dry-run=client -o yaml | kubectl apply -f -
+    apply_mysql_secret mysql-exporter-credentials .my.cnf "$my_cnf" MYSQL_PASSWORD "$exporter_pass"
   else
     warn "No MySQL pod found - skipping exporter user creation"
     return 0
