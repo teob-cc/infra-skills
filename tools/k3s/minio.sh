@@ -5,16 +5,29 @@ set -euo pipefail
 # Usage:
 #   tools/k3s/minio.sh <env-name> [--show-credentials]
 #
-# Serves the S3 API publicly at https://${MINIO_HOST} (default s3.${HOSTNAME}) through Traefik with a
-# cert-manager certificate. The web console is NOT exposed — reach it with
+# Serves the S3 API inside the cluster at http://minio.${NAMESPACE_MINIO}.svc.cluster.local:9000 and, by
+# default, publicly at https://${MINIO_HOST} (default s3.${HOSTNAME}) through Traefik with a cert-manager
+# certificate. The web console is NOT exposed — reach it with
 #   kubectl -n minio port-forward svc/minio 9001:9001
 #
 # Root credentials are generated once and kept in the `minio-root` secret (namespace minio); re-running the
-# script reuses them. Data lives on a local-path PVC (single node, no replication) — this is a test/review
-# store, not a durable backup target.
+# script reuses them. Data lives on a local-path PVC (single node, no replication). It is the target of
+# postgres.sh's continuous backup (PG_WAL_ARCHIVE=minio), so it holds the only on-node copy of the WAL archive:
+# tools/backup.sh's nightly k3s-storage sweep copies the volume to the backup host, which is what survives a lost
+# node. local-path does not enforce MINIO_STORAGE; size /data for the base backups the retention window keeps.
 #
 # Options:
 #   --show-credentials    Print the root credentials and exit
+#
+# env.properties (optional):
+#   MINIO_STORAGE=20Gi             PVC request
+#   MINIO_PUBLIC_INGRESS=true      false: no public S3 endpoint (in-cluster only); a re-run removes the
+#                                  Ingress and its allowlist. Only for envs with no client outside the cluster.
+#   MINIO_ALLOWED_CIDRS="203.0.113.7/32 198.51.100.0/24"
+#                                  Restrict the public endpoint to these source ranges (plus the private and
+#                                  Tailscale ranges) with a Traefik ipAllowList; unset = open to the Internet
+#                                  (S3 auth still applies). Needs the real client IP at Traefik, which the
+#                                  provisioners give it (traefik Service externalTrafficPolicy=Local).
 #
 # Requires: cert-manager with a ClusterIssuer (${CLUSTER_ISSUER:-letsencrypt-prod}), Traefik, DNS for
 # ${MINIO_HOST} pointing at the node (a *.${HOSTNAME} wildcard covers it).
@@ -58,6 +71,11 @@ err() { echo "[minio:error] $*" >&2; }
 : "${MINIO_STORAGE:=20Gi}"
 : "${CLUSTER_ISSUER:=letsencrypt-prod}"
 : "${INGRESS_CLASS:=traefik}"
+: "${MINIO_PUBLIC_INGRESS:=true}"
+: "${MINIO_ALLOWED_CIDRS:=}"
+if [[ "$MINIO_PUBLIC_INGRESS" != true && "$MINIO_PUBLIC_INGRESS" != false ]]; then
+  err "MINIO_PUBLIC_INGRESS='${MINIO_PUBLIC_INGRESS}' must be true or false"; exit 1
+fi
 if [[ -z "${MINIO_HOST:-}" ]]; then
   [[ -n "${HOSTNAME:-}" ]] || { err "Set HOSTNAME in env.properties or MINIO_HOST explicitly."; exit 1; }
   MINIO_HOST="s3.${HOSTNAME}"
@@ -147,13 +165,58 @@ spec:
   ports:
     - { name: api, port: 9000, targetPort: api }
     - { name: console, port: 9001, targetPort: console }
----
+EOF
+
+log "waiting for the deployment"
+kubectl -n "$NS" rollout status deploy/minio --timeout=180s
+
+if [[ "$MINIO_PUBLIC_INGRESS" != true ]]; then
+  # In-cluster only: take the public endpoint down if an earlier run put it up.
+  kubectl -n "$NS" delete ingress minio-api --ignore-not-found >/dev/null
+  kubectl -n "$NS" delete middleware.traefik.io minio-api-allowlist --ignore-not-found >/dev/null 2>&1 || true
+  log "done. S3 endpoint (in-cluster only, MINIO_PUBLIC_INGRESS=false): http://minio.${NS}.svc.cluster.local:9000"
+  log "root credentials: $0 ${ENV_NAME} --show-credentials"
+  exit 0
+fi
+
+# Optional source allowlist on the public endpoint (MINIO_ALLOWED_CIDRS). Without it the endpoint is open
+# to the Internet and only S3 request signing keeps strangers out.
+middleware_annotation=""
+if [[ -n "$MINIO_ALLOWED_CIDRS" ]]; then
+  ranges=""
+  for cidr in ${MINIO_ALLOWED_CIDRS//,/ }; do
+    [[ "$cidr" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || { err "MINIO_ALLOWED_CIDRS: '${cidr}' is not an IP or CIDR"; exit 1; }
+    ranges+="      - \"${cidr}\""$'\n'
+  done
+  kubectl -n "$NS" apply -f - <<MIDDLEWARE
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: minio-api-allowlist
+spec:
+  ipAllowList:
+    sourceRange:
+      # in-cluster and node networks, Tailscale
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+      - "100.64.0.0/10"
+${ranges}
+MIDDLEWARE
+  middleware_annotation="traefik.ingress.kubernetes.io/router.middlewares: ${NS}-minio-api-allowlist@kubernetescrd"
+  log "public S3 endpoint restricted to ${MINIO_ALLOWED_CIDRS} (plus private and Tailscale ranges)"
+else
+  kubectl -n "$NS" delete middleware.traefik.io minio-api-allowlist --ignore-not-found >/dev/null 2>&1 || true
+fi
+
+kubectl -n "$NS" apply -f - <<INGRESS
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: minio-api
   annotations:
     cert-manager.io/cluster-issuer: ${CLUSTER_ISSUER}
+    ${middleware_annotation}
 spec:
   ingressClassName: ${INGRESS_CLASS}
   tls:
@@ -167,11 +230,10 @@ spec:
             pathType: Prefix
             backend:
               service: { name: minio, port: { name: api } }
-EOF
+INGRESS
 
-log "waiting for the deployment"
-kubectl -n "$NS" rollout status deploy/minio --timeout=180s
 log "waiting for the TLS certificate (minio-api-tls)"
 kubectl -n "$NS" wait --for=condition=Ready certificate/minio-api-tls --timeout=300s \
   || err "certificate not ready yet — check: kubectl -n $NS describe certificate minio-api-tls"
-log "done. S3 endpoint: https://${MINIO_HOST}  (root credentials: $0 ${ENV_NAME} --show-credentials)"
+log "done. S3 endpoint: https://${MINIO_HOST} (in-cluster: http://minio.${NS}.svc.cluster.local:9000)"
+log "root credentials: $0 ${ENV_NAME} --show-credentials"
