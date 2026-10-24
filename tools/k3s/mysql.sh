@@ -839,10 +839,14 @@ install_percona_operator() {
 
   # Install Percona PS operator
   info "Installing Percona PS operator v${PERCONA_PS_OPERATOR_VERSION}..."
+  # disableTelemetry: the operator otherwise reports to Percona's version service
+  # (check.percona.com:443) on a loop, even with upgradeOptions unset. Changing it
+  # restarts only the operator pod, not MySQL.
   helm upgrade --install ps-operator percona/ps-operator \
     --namespace "$PERCONA_NAMESPACE" \
     --create-namespace \
     --version "$PERCONA_PS_OPERATOR_VERSION" \
+    --set disableTelemetry=true \
     --wait \
     --timeout 5m
 
