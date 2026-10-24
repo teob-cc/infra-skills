@@ -68,6 +68,11 @@ ACME_EMAIL=<acme-email>
 # Recommended — the repos allowed on this org's privileged runners (root on the node); every env
 # sharing the GitHub org carries the same list (github-action-runner.sh, Phase 3b):
 # RUNNER_GROUP_REPOS="<envs-repo> <app-repo> ..."
+# Optional, with "backup" below — the host the nightly rdiff of /data/users and /data/k3s-storage
+# goes to over the VPN (tools/backup.sh; CNPG volumes are always left out, dump them instead):
+# BACKUP_TARGET_HOST=<vpn-ip>  BACKUP_TARGET_PORT=22  BACKUP_TARGET_USER=<ssh-user>
+# BACKUP_REMOTE_BASE=/volume1/remote_backups  BACKUP_REMOTE_RDIFF=/opt/bin/rdiff-backup
+# BACKUP_K3S_EXCLUDES="*_observability_prometheus-server"   # further PVC-dir globs to skip
 # Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
 ```

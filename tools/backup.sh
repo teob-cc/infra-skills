@@ -9,7 +9,8 @@ set -euo pipefail
 #    (see BACKUP_APP_USER below)
 # 2. Creates backup-user (UID 11002) with SSH key for remote backups
 # 3. Installs rdiff-backup
-# 4. Sets up daily cron: backup at 06:00, increment cleanup (${BACKUP_RETENTION:-30D}) at 06:30
+# 4. Installs the k3s-storage sweep, which leaves out every CloudNativePG volume
+# 5. Sets up daily cron: backup at 06:00, increment cleanup (${BACKUP_RETENTION:-30D}) at 06:30
 #
 # The backup runs over your VPN directly to the backup host (no SSH tunnel).
 #
@@ -25,6 +26,11 @@ set -euo pipefail
 #                        #  install it at e.g. /opt/bin/rdiff-backup)
 #   BACKUP_APP_USER      # per-app user to create (e.g. "myapp"); skipped
 #   BACKUP_APP_UID       #   if unset (e.g. 1002)
+#   BACKUP_K3S_EXCLUDES  # further PVC-dir globs to leave out of the k3s-storage
+#                        # sweep, space-separated, e.g. "*_observability_prometheus-server"
+#
+# Every variable may also be set in the environment's env.properties, which wins
+# over the shell environment.
 #
 # Usage:
 #   tools/backup.sh <env-name> [options]
@@ -54,26 +60,14 @@ DATA_DIR="/data/users"
 K3S_STORAGE_DIR="/data/k3s-storage"
 # Glob fragments matched against PVC dir names under $K3S_STORAGE_DIR.
 # rdiff-backup --exclude takes shell globs against the source root.
+# CloudNativePG volumes (live PGDATA) are not listed here: the sweep looks them up
+# by their cnpg.io/cluster label at run time, whatever the cluster is called. A name
+# glob covered only postgres-cluster and swept every other CNPG cluster's PGDATA.
 K3S_STORAGE_EXCLUDES=(
-  "${K3S_STORAGE_DIR}/*_postgres_postgres-cluster-*"  # live PGDATA — use pg_dump
   "${K3S_STORAGE_DIR}/*_observability_storage-loki-*" # logs are recreatable
   "${K3S_STORAGE_DIR}/*_harbor_data-harbor-trivy-*"   # CVE-DB cache
   "${K3S_STORAGE_DIR}/*_harbor_harbor-registry*"      # images rebuild from source in CI
 )
-
-# How long increments are kept on the backup target. rdiff-backup stores a full
-# mirror plus reverse increments, so this bounds the increment tree, not the mirror:
-# the latest state is always present regardless. Raise it if your recovery window
-# is longer; at 90 days the increments can dwarf the mirror they serve.
-BACKUP_RETENTION="${BACKUP_RETENTION:-30D}"
-# --- Backup target (required; set these in your environment) ---
-BACKUP_TARGET_HOST="${BACKUP_TARGET_HOST:-}"    # your NAS/backup host reachable over your VPN
-BACKUP_TARGET_PORT="${BACKUP_TARGET_PORT:-22}"  # SSH port on the backup host
-BACKUP_TARGET_USER="${BACKUP_TARGET_USER:-}"    # SSH user on the backup host
-REMOTE_BACKUP_BASE="${BACKUP_REMOTE_BASE:-}"    # base dir for backup repos, e.g. /volume1/remote_backups
-# rdiff-backup binary on the backup host; NAS appliances often install it
-# outside the default PATH (e.g. /opt/bin/rdiff-backup).
-REMOTE_RDIFF_BIN="${BACKUP_REMOTE_RDIFF:-rdiff-backup}"
 
 # --- Parse arguments ---
 if [[ -z "${1:-}" ]]; then
@@ -105,6 +99,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Read after load_env, so the values in env.properties take effect (read before it,
+# they were silently ignored and only an exported shell variable worked).
+# How long increments are kept on the backup target. rdiff-backup stores a full
+# mirror plus reverse increments, so this bounds the increment tree, not the mirror:
+# the latest state is always present regardless. Raise it if your recovery window
+# is longer; at 90 days the increments can dwarf the mirror they serve.
+BACKUP_RETENTION="${BACKUP_RETENTION:-30D}"
+# --- Backup target (required; set these in your environment) ---
+BACKUP_TARGET_HOST="${BACKUP_TARGET_HOST:-}"    # your NAS/backup host reachable over your VPN
+BACKUP_TARGET_PORT="${BACKUP_TARGET_PORT:-22}"  # SSH port on the backup host
+BACKUP_TARGET_USER="${BACKUP_TARGET_USER:-}"    # SSH user on the backup host
+REMOTE_BACKUP_BASE="${BACKUP_REMOTE_BASE:-}"    # base dir for backup repos, e.g. /volume1/remote_backups
+# rdiff-backup binary on the backup host; NAS appliances often install it
+# outside the default PATH (e.g. /opt/bin/rdiff-backup).
+REMOTE_RDIFF_BIN="${BACKUP_REMOTE_RDIFF:-rdiff-backup}"
+read -r -a extra_excludes <<< "${BACKUP_K3S_EXCLUDES:-}"   # read -a splits without globbing
+for pattern in ${extra_excludes[@]+"${extra_excludes[@]}"}; do
+  K3S_STORAGE_EXCLUDES+=("${K3S_STORAGE_DIR}/${pattern}")
+done
+
 # --- Resolve SSH target ---
 # Prefer Tailscale IP from env.properties, fall back to EXTERNAL_IP
 SSH_HOST="${TAILSCALE_IP:-${EXTERNAL_IP}}"
@@ -113,11 +127,8 @@ SECRETS_PLAIN="${ENV_DIR}/secrets.plain"
 REMOTE_BACKUP_DIR="${REMOTE_BACKUP_BASE}/${ENV_NAME}"
 REMOTE_K3S_BACKUP_DIR="${REMOTE_BACKUP_BASE}/${ENV_NAME}-k3s-storage"
 
-# Build the rdiff-backup --exclude flags for the k3s-storage sweep.
-RDIFF_EXCLUDES=""
-for pattern in "${K3S_STORAGE_EXCLUDES[@]}"; do
-  RDIFF_EXCLUDES+=" --exclude '${pattern}'"
-done
+RDIFF_SCHEMA="ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 %s ${REMOTE_RDIFF_BIN} --server"
+K3S_SWEEP="/usr/local/bin/nas-backup-k3s-storage"
 
 log()  { echo "[backup] $*"; }
 info() { echo "[backup:info] $*"; }
@@ -170,16 +181,15 @@ fi
 
 # --- Run backup now ---
 if $RUN_NOW; then
-  RDIFF_SCHEMA="ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 %s ${REMOTE_RDIFF_BIN} --server"
   log "Running backup now for ${ENV_NAME} ..."
   log "  /data/users -> ${REMOTE_BACKUP_DIR}"
   remote "rdiff-backup --remote-schema '${RDIFF_SCHEMA}' ${DATA_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}"
-  if remote "test -d ${K3S_STORAGE_DIR}"; then
-    log "  ${K3S_STORAGE_DIR} -> ${REMOTE_K3S_BACKUP_DIR}"
-    remote "rdiff-backup ${RDIFF_EXCLUDES} --remote-schema '${RDIFF_SCHEMA}' ${K3S_STORAGE_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}-k3s-storage"
-  else
-    warn "${K3S_STORAGE_DIR} not present on host — skipping k3s-storage backup."
+  if ! remote "test -x ${K3S_SWEEP}"; then
+    err "${K3S_SWEEP} is not installed; run $0 ${ENV_NAME} first."
+    exit 1
   fi
+  log "  ${K3S_STORAGE_DIR} -> ${REMOTE_K3S_BACKUP_DIR}"
+  remote "${K3S_SWEEP}"
   log "Backup complete."
   exit 0
 fi
@@ -293,10 +303,45 @@ remote "cat > /usr/local/bin/nas-backup-stamp && chmod 755 /usr/local/bin/nas-ba
 rm -f "$STAMP_HELPER_TMP"
 info "Stamp helper installed; metrics dir ${TEXTFILE_DIR}."
 
+# --- Step 3c: Install the k3s-storage sweep ---
+# The CNPG volumes are looked up when the sweep runs, not when this script runs, so
+# a Postgres cluster created later is left out as well. A failed lookup fails the
+# sweep (and the NasBackupStale alert fires) rather than shipping live PGDATA.
+log "Step 3c: Installing k3s-storage sweep ${K3S_SWEEP} ..."
+static_excludes=""
+for pattern in "${K3S_STORAGE_EXCLUDES[@]}"; do
+  static_excludes+=" '${pattern}'"
+done
+SWEEP_TMP=$(mktemp)
+sweep=$(cat << 'SWEEP'
+#!/bin/sh
+# nas-backup-k3s-storage — rdiff the k3s PVC root to the backup host.
+# Installed by infra-skills/tools/backup.sh; run by root's crontab.
+set -euf
+src="@SRC@"
+[ -d "$src" ] || { echo "$src not present, nothing to back up"; exit 0; }
+cnpg=$(k3s kubectl get pvc -A -l cnpg.io/cluster \
+  -o jsonpath='{range .items[*]}{.spec.volumeName}_{.metadata.namespace}_{.metadata.name}{"\n"}{end}')
+set --
+for d in $cnpg; do set -- "$@" --exclude "$src/$d"; done
+for g in @EXCLUDES@; do set -- "$@" --exclude "$g"; done
+rdiff-backup "$@" --remote-schema '@SCHEMA@' "$src" '@DEST@'
+/usr/local/bin/nas-backup-stamp '@REPO@'
+SWEEP
+)
+sweep=${sweep//@SRC@/$K3S_STORAGE_DIR}
+sweep=${sweep//@EXCLUDES@/$static_excludes}
+sweep=${sweep//@SCHEMA@/$RDIFF_SCHEMA}
+sweep=${sweep//@DEST@/${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR}}
+sweep=${sweep//@REPO@/${ENV_NAME}-k3s-storage}
+printf '%s\n' "$sweep" > "$SWEEP_TMP"
+remote "cat > ${K3S_SWEEP} && chmod 755 ${K3S_SWEEP}" < "$SWEEP_TMP"
+rm -f "$SWEEP_TMP"
+info "Sweep installed; excluded now: $(remote "k3s kubectl get pvc -A -l cnpg.io/cluster -o name | wc -l") CNPG volume(s) plus ${#K3S_STORAGE_EXCLUDES[@]} glob(s)."
+
 # --- Step 4: Configure cron ---
 log "Step 4: Setting up cron jobs ..."
 
-RDIFF_SCHEMA="ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 %s ${REMOTE_RDIFF_BIN} --server"
 # In crontab, % means newline — must be escaped as \%
 RDIFF_SCHEMA_CRON="${RDIFF_SCHEMA//%/\\%}"
 
@@ -304,9 +349,9 @@ remote bash -c "\"cat > /tmp/backup-crontab.txt << 'CRON'
 # Backup ${DATA_DIR} to the backup host over the VPN at 06:00
 0 6 * * * rdiff-backup --remote-schema '${RDIFF_SCHEMA_CRON}' ${DATA_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}
 
-# Backup ${K3S_STORAGE_DIR} (Harbor blobs, Nexus, Grafana, etc.) at 06:15.
+# Backup ${K3S_STORAGE_DIR} (Nexus, Grafana, app volumes, etc.) at 06:15.
 # Excludes live PGDATA (use pg_dump), Loki logs, Trivy cache, and Harbor blobs.
-15 6 * * * [ -d ${K3S_STORAGE_DIR} ] && rdiff-backup ${RDIFF_EXCLUDES} --remote-schema '${RDIFF_SCHEMA_CRON}' ${K3S_STORAGE_DIR} ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR} && /usr/local/bin/nas-backup-stamp ${ENV_NAME}-k3s-storage
+15 6 * * * ${K3S_SWEEP}
 
 # Remove increments older than ${BACKUP_RETENTION} at 06:30
 30 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
