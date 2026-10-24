@@ -471,8 +471,18 @@ YAML
 
   # Check if Argo CD is already installed to avoid updating ingress
   if helm list -n "$NAMESPACE_ARGOCD" 2>/dev/null | grep -q "^argocd"; then
+    # --reuse-values also carries the old chart's *defaults*, so an upgrade across chart versions
+    # renders the new templates with values the old chart never had and fails (9.4.2 -> 9.4.15:
+    # "deepCopy .Values.global.statefulsetLabels ... zero Value"). --reset-then-reuse-values
+    # (Helm >= 3.14) takes the new chart's defaults and keeps the release's user-supplied values.
+    local values_mode=(--reset-then-reuse-values)
+    if ! helm upgrade --help 2>/dev/null | grep -q -- '--reset-then-reuse-values'; then
+      warn "This Helm ($(helm version --short 2>/dev/null)) has no --reset-then-reuse-values (Helm >= 3.14);"
+      warn "falling back to --reuse-values, which fails when the chart version changes."
+      values_mode=(--reuse-values)
+    fi
     info "Argo CD already installed - upgrading (release values reused, script values on top)..."
-    if ! helm upgrade --install argocd argo-cd/argo-cd "${helm_args[@]}" --reuse-values -f "$values_file"; then
+    if ! helm upgrade --install argocd argo-cd/argo-cd "${helm_args[@]}" "${values_mode[@]}" -f "$values_file"; then
       err "helm upgrade of argocd failed. A 'conflict' on argocd-secret means a field Helm sets was"
       err "changed by another manager (kubectl patch/edit); see the comment above the values in"
       err "this script, then re-run with ARGOCD_FORCE_CONFLICTS=true."
