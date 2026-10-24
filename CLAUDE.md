@@ -15,6 +15,9 @@ Hetzner account, their domain, their secrets. The scripts never phone home.
   secret templates, SOPS setup).
 - `/provision` — the full provisioning sequence for an existing environment config, in dependency
   order, with validation steps.
+- `/migrate-apps` — move running apps with their Postgres data, secrets, images, routes and DNS
+  to another environment (also across envs repos and orgs), with a short write freeze;
+  `tools/migrate-apps.sh` does the data, freeze and DNS phases from a plan file.
 
 ## How environment configs are discovered
 

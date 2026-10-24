@@ -49,6 +49,9 @@ Then say:
   you can create.
 - **`/provision <env>`** — the agent runs the full provisioning sequence in dependency order,
   asking before anything destructive, and validates the result.
+- **`/migrate-apps <from> <to>`** — the agent moves running apps and their data to another
+  environment: a full copy while they keep serving, then a short freeze for the delta, a
+  verified row-for-row match, and the DNS switch.
 
 The skills can also be installed globally from the plugin marketplace, without being inside the
 checkout:
@@ -71,7 +74,7 @@ bash and take `<env-name>` as their first argument.
 | `images/` | Docker images (CI runner, base builder) |
 | `.github/workflows/` | Reusable CI/CD workflows |
 | `docs/` | Getting started, GitOps delivery, verticals, operations runbooks |
-| `.claude/` | Agent instructions and skills (`/onboard`, `/new-env`, `/provision`) |
+| `.claude/` | Agent instructions and skills (`/onboard`, `/new-env`, `/provision`, `/migrate-apps`) |
 | `.claude-plugin/`, `plugins/` | Plugin marketplace (`/plugin marketplace add teob-cc/infra-skills`) |
 | `.sops.yaml` | SOPS encryption rules template |
 
