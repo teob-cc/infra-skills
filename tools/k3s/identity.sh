@@ -423,12 +423,20 @@ provision_dex() {
       warn "  Dex pod may not be running - checking status..."
       kubectl -n "$NAMESPACE_SSO" get pods -l app.kubernetes.io/name=dex
     fi
-    
+
+    # shellcheck disable=SC2086 # space-separated org list
+    provision::dex_ensure_github_orgs "$NAMESPACE_SSO" ${DEX_GITHUB_EXTRA_ORGS:-}
     return 0
   fi
-  
+
   info "Installing Dex via Helm chart (first installation)..."
-  
+
+  # DEX_GITHUB_EXTRA_ORGS (env.properties, space-separated): orgs admitted besides githubOrg, e.g.
+  # the org whose apps were moved into this environment and keep their "<org>:<team>" policies.
+  local extra_orgs_json
+  # shellcheck disable=SC2086
+  extra_orgs_json=$(printf '%s\n' ${DEX_GITHUB_EXTRA_ORGS:-} | jq -R . | jq -sc 'map(select(length > 0))')
+
   # Deploy Dex using Helm
   helm upgrade --install dex "$(provision::chart_path dex)" \
     --namespace "$NAMESPACE_SSO" \
@@ -437,6 +445,7 @@ provision_dex() {
     --set config.github.clientID="${github_client_id}" \
     --set config.github.clientSecret="${github_client_secret}" \
     --set config.github.org="${github_org}" \
+    --set-json config.github.extraOrgs="${extra_orgs_json}" \
     --set ingress.enabled=true \
     --set ingress.host="${DEX_HOST}" \
     --set ingress.className="${INGRESS_CLASS}" \

@@ -35,6 +35,9 @@ config:
     clientID: ""
     clientSecret: ""
     org: ""
+    # Further orgs whose members may sign in (their teams become "<org>:<team>" groups);
+    # identity.sh fills it from DEX_GITHUB_EXTRA_ORGS in env.properties.
+    extraOrgs: []
     loadAllGroups: true
     useLoginAsID: true
     teams: []

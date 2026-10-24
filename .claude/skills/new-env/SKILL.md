@@ -62,6 +62,9 @@ ACME_EMAIL=<acme-email>
 # Optional — CI runner pod sizing (defaults fit JVM builds on a 64 GiB node; two runners):
 # RUNNER_MEMORY_LIMIT=16Gi
 # DOCKERD_MEMORY_LIMIT=8Gi
+# Optional — further GitHub orgs whose members may sign in through this env's Dex (their teams
+# become "<org>:<team>" groups), e.g. after another org's apps move here (/migrate-apps):
+# DEX_GITHUB_EXTRA_ORGS="<other-org>"
 # Recommended — the repos allowed on this org's privileged runners (root on the node); every env
 # sharing the GitHub org carries the same list (github-action-runner.sh, Phase 3b):
 # RUNNER_GROUP_REPOS="<envs-repo> <app-repo> ..."

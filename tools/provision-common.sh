@@ -996,6 +996,43 @@ EOF
   echo "$client_secret"
 }
 
+# Make the live Dex GitHub connector admit members of these orgs too (their teams become
+# "<org>:<team>" groups for Pomerium policies), e.g. when another org's apps move into this
+# environment and keep their group policies. Adds missing orgs, never removes one, restarts Dex
+# only on a change. The ConfigMap is edited in place because identity.sh never reinstalls an
+# existing Dex (the static clients live only there).
+# Usage: provision::dex_ensure_github_orgs NAMESPACE_SSO ORG [ORG...]
+provision::dex_ensure_github_orgs() {
+  local namespace_sso="$1"; shift
+  [[ $# -gt 0 ]] || return 0
+  local cfg want new cm_file
+  cfg=$(kubectl -n "$namespace_sso" get configmap dex-config -o yaml 2>/dev/null | yq eval '.data."config.yaml"' -) || {
+    provision::error "Dex ConfigMap 'dex-config' not found in '${namespace_sso}'"; return 1; }
+  want=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
+  new=$(printf '%s' "$cfg" | WANT_ORGS="$want" yq eval '(.connectors[] | select(.type == "github") | .config.orgs) |= ((. // []) + (env(WANT_ORGS) | map({"name": .})) | unique_by(.name))' -) || return 1
+  if [[ "$(printf '%s' "$cfg" | yq eval -o=json -I=0 '[.connectors[] | select(.type == "github") | .config.orgs[].name] | sort' -)" == \
+        "$(printf '%s' "$new" | yq eval -o=json -I=0 '[.connectors[] | select(.type == "github") | .config.orgs[].name] | sort' -)" ]]; then
+    provision::info "Dex GitHub orgs already include: $*"
+    return 0
+  fi
+  cm_file=$(mktemp)
+  cat > "$cm_file" <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dex-config
+  namespace: ${namespace_sso}
+data:
+  config.yaml: |
+$(printf '%s\n' "$new" | sed 's/^/    /')
+EOF
+  kubectl apply -f "$cm_file" >&2
+  rm -f "$cm_file"
+  kubectl -n "$namespace_sso" rollout restart deployment/dex >/dev/null 2>&1 || true
+  kubectl -n "$namespace_sso" rollout status deployment/dex --timeout=120s >/dev/null 2>&1 || true
+  provision::info "✓ Dex GitHub connector orgs now: $(printf '%s' "$new" | yq eval '[.connectors[] | select(.type == "github") | .config.orgs[].name] | join(", ")' -)"
+}
+
 # --- ArgoCD credential for the Helm charts in Harbor ---------------------------
 # curl config line "user = ..." for user+password, so the password never appears on argv:
 #   curl -K <(provision::curl_user_cfg "$user" "$pass") URL

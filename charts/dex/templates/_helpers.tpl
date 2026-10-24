@@ -77,6 +77,9 @@ connectors:
             - {{ . | quote }}
 {{- end }}
 {{- end }}
+{{- range .Values.config.github.extraOrgs }}
+        - name: {{ . | quote }}
+{{- end }}
 staticClients:
 {{- if .Values.config.staticClients }}
 {{ toYaml .Values.config.staticClients | indent 2 }}
