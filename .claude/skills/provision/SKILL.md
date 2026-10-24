@@ -89,6 +89,35 @@ tools/provision-hetzner-cloud.sh <env> --destroy            # Tear down (server 
 Requires `envs/shared/secrets.plain/hetzner-cloud-token.txt`. **`--destroy`** removes the server,
 the Tailscale device, and the Cloudflare DNS records — confirm with the user first.
 
+#### k3s server defaults
+Both options write these on a new server before k3s first starts; `tools/doctor.sh` (check
+`k3s-server`) warns where they are missing:
+- **Secrets encrypted at rest** (`secrets-encryption: true` in `/etc/rancher/k3s/config.yaml`). The
+  key lives in `/var/lib/rancher/k3s/server/cred/encryption-config.json`; `tools/backup.sh` copies it
+  with the datastore, because a datastore restore without it cannot read a single Secret. On the
+  node: `k3s secrets-encrypt status`. A running cluster is **not** switched over by the
+  provisioners. That takes k3s v1.33.10 / v1.34.6 / v1.35.3 or later and a window after a fresh
+  state backup: `k3s secrets-encrypt enable`, add `secrets-encryption: true` to the config and
+  restart k3s, `k3s secrets-encrypt rotate-keys` (re-encrypts every Secret), restart again, then
+  `status` must say `Enabled` / `reencrypt_finished`. Back up `server/cred/` again afterwards.
+- **Traefik edge** (`/var/lib/rancher/k3s/server/manifests/traefik-config.yaml`, a HelmChartConfig
+  rendered by `provision::k3s_traefik_config`): port 80 answers with a 301 to HTTPS, every HTTPS
+  response carries `Strict-Transport-Security` (Middleware `kube-system/hsts`, no
+  `includeSubDomains`, no preload), and the Service keeps `externalTrafficPolicy: Local`. It uses
+  static Traefik flags, so it holds across the chart's 38 -> 39 key rename. The redirect is safe
+  for certificates because identity.sh's ClusterIssuer solves DNS-01; an HTTP-01 issuer would
+  break. Knobs in env.properties: `TRAEFIK_HTTPS_REDIRECT` (default `true`) and
+  `TRAEFIK_HSTS_MAX_AGE` (default `300`, `0` = no HSTS). **Raise max-age in steps** once every
+  host has served HTTPS cleanly for a while: 86400 after about a week, then 31536000. A browser
+  that has seen the header refuses plain HTTP for that long, so a high value cannot be taken
+  back quickly. On a running server, raise it by rewriting the file (k3s applies the change; a
+  `kubectl edit` is undone at the next k3s start):
+  ```bash
+  TRAEFIK_HSTS_MAX_AGE=86400 bash -c 'source tools/provision-common.sh; provision::k3s_traefik_config' \
+    | ssh root@<server> 'umask 077; cat > /var/lib/rancher/k3s/server/manifests/traefik-config.yaml'
+  ```
+  Set the same value in env.properties, so a reprovision keeps it.
+
 Both options write `envs/<env>/kubeconfig.yaml` with the Tailscale IP as the API server address,
 and save an encrypted copy to `envs/<env>/secrets.sops/kubeconfig` (commit it). The plaintext
 file is gitignored; in a fresh clone run `tools/sops/kubeconfig.sh restore <env>`.

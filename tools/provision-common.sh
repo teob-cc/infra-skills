@@ -1292,3 +1292,73 @@ provision::grafana_api() {
       wget -q -O- --header "$auth" "http://localhost:3000$2"
     fi' sh "$@"
 }
+
+# --- k3s-bundled Traefik: HTTP->HTTPS redirect, HSTS, client IPs ---------------------
+# Prints the HelmChartConfig the server provisioners drop into
+# /var/lib/rancher/k3s/server/manifests/traefik-config.yaml before k3s first starts. k3s's
+# helm-controller merges it over the bundled Traefik chart's values:
+#   * the `web` entrypoint answers every request with a 301 to https://<same host><same path>;
+#   * every router on `websecure` gets the Middleware kube-system/hsts
+#     (Strict-Transport-Security max-age=TRAEFIK_HSTS_MAX_AGE, no includeSubDomains, no preload);
+#   * the Service keeps externalTrafficPolicy: Local (real client IPs; the provisioners' step 14b
+#     also patches it, that patch is now a no-op).
+# Version-independent on purpose: the chart moved the redirect keys between majors
+# (<= 38: ports.web.redirections, >= 39: ports.web.http.redirections; a wrong key fails the
+# chart schema), and the provisioners install whatever k3s the stable channel ships. The
+# static Traefik flags (additionalArguments) and extraObjects mean the same on 38 and 40;
+# `to=:443` is what the chart itself renders (the exposed port, not the pod's 8443).
+# The redirect is safe for certificates only while every ClusterIssuer solves DNS-01
+# (identity.sh's do): an entrypoint redirect also catches /.well-known/acme-challenge/.
+# Knobs (env.properties): TRAEFIK_HTTPS_REDIRECT (default true), TRAEFIK_HSTS_MAX_AGE (seconds,
+# default 300; 0 = no HSTS). Start at 300 and raise in steps (86400, then 31536000) once every
+# host is known to serve HTTPS; see the provision skill, "Traefik edge".
+# Usage: provision::k3s_traefik_config [MAX_AGE] [REDIRECT]
+provision::k3s_traefik_config() {
+  local max_age="${1:-${TRAEFIK_HSTS_MAX_AGE:-300}}" redirect="${2:-${TRAEFIK_HTTPS_REDIRECT:-true}}"
+  if ! [[ "$max_age" =~ ^[0-9]+$ ]]; then
+    provision::error "TRAEFIK_HSTS_MAX_AGE must be a whole number of seconds (got '${max_age}')"
+    return 1
+  fi
+  cat <<YAML
+# Written by infra-skills (provision::k3s_traefik_config). k3s applies this file on every
+# start and whenever the file changes, so edit this file, not the live object (a kubectl
+# edit lasts only until the next k3s restart).
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    service:
+      spec:
+        externalTrafficPolicy: Local
+YAML
+  if [[ "$redirect" == "true" || "$max_age" -gt 0 ]]; then
+    echo "    additionalArguments:"
+  fi
+  if [[ "$redirect" == "true" ]]; then
+    cat <<'YAML'
+      - "--entryPoints.web.http.redirections.entryPoint.to=:443"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entryPoints.web.http.redirections.entryPoint.permanent=true"
+YAML
+  fi
+  if [[ "$max_age" -gt 0 ]]; then
+    cat <<YAML
+      - "--entryPoints.websecure.http.middlewares=kube-system-hsts@kubernetescrd"
+    extraObjects:
+      - apiVersion: traefik.io/v1alpha1
+        kind: Middleware
+        metadata:
+          name: hsts
+          namespace: kube-system
+        spec:
+          headers:
+            stsSeconds: ${max_age}
+            stsIncludeSubdomains: false
+            stsPreload: false
+            forceSTSHeader: true
+YAML
+  fi
+}

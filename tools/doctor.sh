@@ -459,6 +459,39 @@ check_hardening() {
   fi
 }
 
+# --- Check: k3s server defaults --------------------------------------------
+# What the server provisioners write on a new server and an older install lacks: Secrets
+# encrypted at rest (k3s records its effective server flags, config.yaml included, in the
+# node annotation k3s.io/node-args) and the Traefik HelmChartConfig with the HTTP->HTTPS
+# redirect and HSTS (server/manifests/traefik-config.yaml, provision::k3s_traefik_config).
+check_k3s_server() {
+  require_api "k3s-server" || return
+  local issues=() args hcc
+  args="$(kc get nodes -l node-role.kubernetes.io/control-plane -o json \
+    | jq -r '[.items[].metadata.annotations["k3s.io/node-args"] // empty] | first // empty')"
+  if [[ -z "$args" ]]; then
+    record "k3s-server" "SKIP" "no k3s server node annotation (not k3s?)" ""
+    return
+  fi
+  jq -e 'index("--secrets-encryption") as $i | $i != null and .[$i + 1] == "true"' <<<"$args" >/dev/null 2>&1 \
+    || issues+=("Secrets not encrypted at rest (no secrets-encryption in the k3s config)")
+  hcc="$(kc get helmchartconfig traefik -n kube-system -o jsonpath='{.spec.valuesContent}')"
+  grep -q 'redirections' <<<"$hcc" || issues+=("Traefik does not redirect HTTP to HTTPS")
+  if grep -q 'kube-system-hsts@kubernetescrd' <<<"$hcc"; then
+    kc get middleware.traefik.io hsts -n kube-system >/dev/null 2>&1 || issues+=("HSTS middleware kube-system/hsts missing")
+  else
+    issues+=("no HSTS on websecure")
+  fi
+  if [[ ${#issues[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${issues[@]}")"
+    record "k3s-server" "WARN" "${joined%; }" \
+      "new servers get both from the provisioners; for a running one see the provision skill, \"k3s server defaults\""
+  else
+    record "k3s-server" "OK" "Secrets encrypted at rest; Traefik redirects to HTTPS and sends HSTS" ""
+  fi
+}
+
 # --- Run all checks --------------------------------------------------------
 check_cluster
 check_pods
@@ -471,6 +504,7 @@ check_releases
 check_scanning
 check_floating_images
 check_hardening
+check_k3s_server
 
 # --- Output ----------------------------------------------------------------
 json_escape() { jq -n --arg s "$1" '$s'; }

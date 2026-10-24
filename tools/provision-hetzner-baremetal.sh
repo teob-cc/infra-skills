@@ -1578,8 +1578,15 @@ else
   if [[ "@WORKER_MODE@" != "true" ]]; then
     echo "[postinstall] Writing k3s config with TLS SANs for @PUBLIC_HOSTNAME@, @EXTERNAL_IP@, and $TS_IP ..."
     mkdir -p /etc/rancher/k3s
+    # secrets-encryption: Secrets are stored AES-CBC encrypted in the datastore. k3s generates
+    # the key on first start into /var/lib/rancher/k3s/server/cred/encryption-config.json;
+    # without that file a datastore backup's Secrets cannot be read, so tools/backup.sh copies
+    # server/cred/ along with the datastore. Check: k3s secrets-encrypt status. Turning it on
+    # for a running cluster is a separate procedure (k3s secrets-encrypt enable + reencrypt),
+    # not something this file does.
     cat >/etc/rancher/k3s/config.yaml <<K3S_EOF
 write-kubeconfig-mode: "0600"
+secrets-encryption: true
 tls-san:
   - @PUBLIC_HOSTNAME@
   - @EXTERNAL_IP@
@@ -1622,6 +1629,16 @@ imageGCLowThresholdPercent: 70
 KUBELET_EOF
     printf 'kubelet-arg:\n  - "config=/etc/rancher/k3s/kubelet.config"\n' >>/etc/rancher/k3s/config.yaml
     echo "[postinstall] Wrote kubelet image-GC config (max age 48h, thresholds 80/70)"
+
+    # Bundled Traefik: HTTP->HTTPS redirect, HSTS, externalTrafficPolicy=Local. Rendered on the
+    # provisioning machine by provision::k3s_traefik_config (tools/provision-common.sh) and in
+    # place before k3s first starts, so Traefik's first install already has it.
+    mkdir -p /var/lib/rancher/k3s/server/manifests
+    ( umask 077; cat >/var/lib/rancher/k3s/server/manifests/traefik-config.yaml <<'TRAEFIK_EOF'
+@TRAEFIK_CONFIG_YAML@
+TRAEFIK_EOF
+    )
+    echo "[postinstall] Wrote Traefik HelmChartConfig (server/manifests/traefik-config.yaml)"
 
     # If k3s already exists, request certificate rotation to pick up new SANs (will be applied after restart)
     if command -v k3s >/dev/null 2>&1; then
@@ -1690,6 +1707,8 @@ else
 fi
 
 # Step 14b: Configure Traefik to preserve real client IPs (master nodes only)
+# The HelmChartConfig from step 13 already declares externalTrafficPolicy: Local, so this patch
+# normally changes nothing; it stays as the fallback for a chart that ignores service.spec.
 if skip_if_done "14b-traefik-config" "Traefik externalTrafficPolicy configuration"; then
   :
 else
@@ -2772,7 +2791,9 @@ if $RUN_FOLLOWUP; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@MASTER_VLAN_IP@/${MASTER_VLAN_IP:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@WORKER_MODE@/${WORKER_MODE}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
-    
+    TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TRAEFIK_CONFIG_YAML@/${TRAEFIK_CONFIG_YAML}}
+
     # Upload and execute postinstall script
     if [[ "$PROVISION_USER" == "root" ]]; then
       ssh -p ${ACTIVE_SSH_PORT} "${SSH_OPTS[@]}" root@"${EXTERNAL_IP}" "cat >/root/postinstall.sh && chmod +x /root/postinstall.sh" <<< "$POSTINSTALL_CONTENT"
