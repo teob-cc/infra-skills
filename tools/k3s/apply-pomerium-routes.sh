@@ -194,8 +194,9 @@ kubectl -n "$NAMESPACE_SSO" rollout restart deployment pomerium-proxy
 kubectl -n "$NAMESPACE_SSO" rollout status deployment pomerium-proxy --timeout=60s || \
   warn "Pomerium restart timed out - routes may not be active yet"
 
-# Display configured routes count from secret
-route_count=$(kubectl -n "$NAMESPACE_SSO" get secret pomerium-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | grep -c "^  - from:" || echo "0")
+# Display configured routes count from secret (parsed, not grepped: the routes' indentation varies
+# with the chart's rendering, and a grep for one indentation counted 16 of 70 routes)
+route_count=$(kubectl -n "$NAMESPACE_SSO" get secret pomerium-config -o jsonpath='{.data.config\.yaml}' 2>/dev/null | base64 -d 2>/dev/null | yq '.routes | length' 2>/dev/null || echo "0")
 
 info "✓ Pomerium routes applied successfully"
 info "  Routes configured: ${route_count}"
