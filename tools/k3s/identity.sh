@@ -258,7 +258,7 @@ metadata:
 spec:
   acme:
     email: \${ACME_EMAIL}
-    server: ${ACME_SERVER}
+    server: \${ACME_SERVER}
     privateKeySecretRef:
       name: cluster-issuer-account-key
     solvers:
