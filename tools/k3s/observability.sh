@@ -3790,12 +3790,6 @@ dashboards:
       revision: 5
       datasource: Prometheus
 
-    # MySQL InnoDB Metrics - Buffer pool, I/O, transactions
-    mysql-innodb:
-      gnetId: 7564
-      revision: 1
-      datasource: Prometheus
-
     # MySQL Exporter Quickstart - mysqld-exporter dashboard
     mysql-exporter-quickstart:
       gnetId: 14057

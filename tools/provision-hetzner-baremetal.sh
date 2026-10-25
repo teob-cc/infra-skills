@@ -1272,6 +1272,24 @@ NEEDRESTART_EOF
   mark_step "02a-needrestart-override-k3s-v2"
 fi
 
+# Step 2b: Bound the apt timers. apt-daily(-upgrade).service default to TimeoutStartSec=infinity,
+# so one hung run (a stuck dpkg lock or mirror) keeps the unit "activating" and every later timer
+# tick is skipped: hosting got no security updates for six months that way (INFRA-26).
+if skip_if_done "02b-apt-daily-timeout" "apt-daily timeout drop-ins"; then
+  :
+else
+  for unit in apt-daily apt-daily-upgrade; do
+    mkdir -p "/etc/systemd/system/${unit}.service.d"
+    cat > "/etc/systemd/system/${unit}.service.d/timeout.conf" <<'APT_TIMEOUT_EOF'
+# Managed by infra-skills (provision-hetzner-*.sh): a hung run must not block every later one.
+[Service]
+TimeoutStartSec=2h
+APT_TIMEOUT_EOF
+  done
+  systemctl daemon-reload
+  mark_step "02b-apt-daily-timeout"
+fi
+
 # Step 3: Configure locales
 if skip_if_done "03-configure-locales" "Locale configuration"; then
   :
