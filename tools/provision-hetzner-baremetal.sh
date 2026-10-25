@@ -1601,6 +1601,14 @@ K3S_EOF
     if [[ -n "$TS_IP" ]]; then
       echo "flannel-iface: tailscale0" >>/etc/rancher/k3s/config.yaml
       echo "[postinstall] Set flannel-iface=tailscale0 (cross-node pod networking over Tailscale)"
+      # flannel-iface makes the Tailscale address the node's only InternalIP, so servicelb
+      # would publish Traefik's LoadBalancer as that address. Public 443 traffic then enters
+      # through the svclb hostPort, which masquerades it: Traefik sees every client as the
+      # svclb pod, and IP allow-lists and per-IP rate limits stop working (INFRA-93). With
+      # the public address as ExternalIP, kube-proxy DNATs it straight to Traefik and
+      # externalTrafficPolicy: Local keeps the client address.
+      echo "node-external-ip: @EXTERNAL_IP@" >>/etc/rancher/k3s/config.yaml
+      echo "[postinstall] Set node-external-ip=@EXTERNAL_IP@ (Traefik sees real client addresses)"
     fi
 
     # Kubelet image garbage collection. The defaults (85/80, no max age) let one image
