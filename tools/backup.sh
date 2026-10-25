@@ -332,6 +332,8 @@ dir="/var/lib/node_exporter/textfile"
 mkdir -p "$dir"
 f="${dir}/nas_backup_${repo}.prom"
 echo "nas_backup_last_success_timestamp_seconds{repo=\"${repo}\"} $(date +%s)" > "${f}.tmp"
+# node-exporter reads this as non-root; callers may run under umask 077 (the k3s state snapshot).
+chmod 644 "${f}.tmp"
 mv "${f}.tmp" "${f}"
 HELPER
 remote "cat > /usr/local/bin/nas-backup-stamp && chmod 755 /usr/local/bin/nas-backup-stamp && mkdir -p ${TEXTFILE_DIR}" < "$STAMP_HELPER_TMP"
