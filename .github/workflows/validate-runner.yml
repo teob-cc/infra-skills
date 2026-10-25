@@ -2,6 +2,9 @@ name: Validate Runner Environment
 
 # Scheduled runs have no inputs: set the repository (or organization) variable
 # RUNNER_ENVIRONMENT so the daily drift check knows which environment to validate.
+# Without it the scheduled run is skipped. Leave it unset in a public repository: an
+# org runner group does not serve public repositories by default (allows_public_repositories),
+# so the job would sit queued until GitHub cancels it after 24 hours.
 on:
   workflow_dispatch:
     inputs:
@@ -29,6 +32,7 @@ env:
 jobs:
   validate-runner:
     name: Validate Runner (${{ inputs.environment || vars.RUNNER_ENVIRONMENT }})
+    if: inputs.environment != '' || vars.RUNNER_ENVIRONMENT != ''
     runs-on:
       - self-hosted
       - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
@@ -223,7 +227,7 @@ jobs:
     runs-on:
       - self-hosted
       - ${{ inputs.environment || vars.RUNNER_ENVIRONMENT }}
-    if: always()
+    if: always() && (inputs.environment != '' || vars.RUNNER_ENVIRONMENT != '')
     needs: validate-runner
 
     steps:
