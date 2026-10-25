@@ -383,11 +383,11 @@ configs:
     url: https://${ARGOCD_HOST}
     admin.enabled: "${ARGOCD_ADMIN_ENABLED}"
 
-    # Reconciliation cadence. Default upstream is 180s. We keep it tight (10s) so that
-    # non-webhook-driven changes (manual edits, ConfigMap drift, missed webhooks) get
-    # picked up fast. GitHub webhook configured below still triggers instant sync on
-    # push, but this guarantees a hard upper bound when the webhook misses.
-    timeout.reconciliation: 10s
+    # Reconciliation cadence (ARGOCD_RECONCILIATION_TIMEOUT, default 60s; upstream is 180s).
+    # With Pomerium in front of ArgoCD the GitHub push webhook cannot reach /api/webhook,
+    # so polling is how pushes get deployed: a change lands within about a minute. 10s
+    # bought little and polled Git and regenerated manifests six times as often.
+    timeout.reconciliation: ${ARGOCD_RECONCILIATION_TIMEOUT:-60s}
 
     # OIDC configuration pointing to external Dex
     oidc.config: |
