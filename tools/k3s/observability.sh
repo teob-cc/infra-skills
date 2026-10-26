@@ -1772,6 +1772,12 @@ serverFiles:
           # or SATA disk usually slows down long before mdadm drops it. The IOPS floor
           # keeps an idle disk's single slow flush from counting; on the reference cluster (2026-10)
           # neither threshold held for 30 minutes in 3 days, including an 80 GB restore.
+          # The time counters are not always monotonic: on Ubuntu kernel 7.0.0-31 the diskstats
+          # read/write ticks jumped by millions of seconds, up and back down, ~200 times a day
+          # (writes_completed stayed sane), and every jump read as "writes take 60s". A window in
+          # which the time counter went backwards (resets) or grew faster than 1000 requests in
+          # flight could (rate > 1000 s/s) measures nothing, so the two `unless` arms drop it.
+          # Backtested 7 days on that node: 958 alerting minutes before, 1 after.
           - alert: NodeDiskReadLatencyHigh
             expr: |
               (
@@ -1779,6 +1785,8 @@ serverFiles:
                   / rate(node_disk_reads_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
               ) > 0.1
               and rate(node_disk_reads_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1
+              unless resets(node_disk_read_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 0
+              unless rate(node_disk_read_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1000
             for: 30m
             labels: { severity: p2, app: infra }
             annotations:
@@ -1797,6 +1805,8 @@ serverFiles:
                   / rate(node_disk_writes_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m])
               ) > 0.5
               and rate(node_disk_writes_completed_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1
+              unless resets(node_disk_write_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 0
+              unless rate(node_disk_write_time_seconds_total{device=~"nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|xvd[a-z]+"}[5m]) > 1000
             for: 30m
             labels: { severity: p2, app: infra }
             annotations:
