@@ -27,6 +27,9 @@ set -euo pipefail
 # That is the point (without server/cred/ an encrypted datastore restore cannot read a
 # single Secret, and without tls/ every node and kubeconfig must be re-issued), so guard
 # the backup host and its SSH key accordingly.
+# On the backup host, pin each node's key to the rdiff-backup server, so a stolen key is no
+# shell and reaches only the backup tree (Step 5 tests through that, not with a plain ssh):
+#   restrict,command="<rdiff-backup> server --restrict-path <BACKUP_REMOTE_BASE>" ssh-ed25519 ...
 #
 # The backup runs over your VPN directly to the backup host (no SSH tunnel).
 #
@@ -496,7 +499,10 @@ remote crontab -l
 
 # --- Step 5: Test SSH connectivity to the backup host ---
 log "Step 5: Testing SSH connectivity to the backup host ..."
-if remote "ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST} 'echo OK'" 2>/dev/null | grep -q OK; then
+# Through rdiff-backup itself: a key pinned to the rdiff-backup server (see the header) runs no
+# 'echo', so a plain ssh test would report a working key as broken.
+TEST_SCHEMA="ssh -p ${BACKUP_TARGET_PORT} -i ${DATA_DIR}/${BACKUP_USER}/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 %s ${REMOTE_RDIFF_BIN} --server"
+if remote "rdiff-backup --remote-schema '${TEST_SCHEMA}' test ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_BASE}" 2>/dev/null | grep -q 'Server OK'; then
   info "SSH to backup host: OK"
 else
   warn "SSH to backup host failed. Ensure the public key is in ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:~/.ssh/authorized_keys"
