@@ -12,8 +12,9 @@ set -euo pipefail
 # 4. Installs the k3s-storage sweep, which leaves out every CloudNativePG volume
 # 5. Installs the k3s server-state snapshot (see below)
 # 6. Sets up daily cron: server state 05:45, backup 06:00, k3s-storage 06:15, increment
-#    cleanup (${BACKUP_RETENTION:-30D}) 06:30/06:35. These live in a marked block of
-#    root's crontab; any other entries in it are kept.
+#    cleanup 06:30/06:35 (users repo ${BACKUP_USERS_RETENTION:-same as k3s}, k3s-storage
+#    ${BACKUP_RETENTION:-30D}). These live in a marked block of root's crontab; any other entries
+#    in it are kept.
 #
 # k3s server state (/usr/local/bin/k3s-server-state-snapshot, 05:45): a consistent copy of
 # the datastore (sqlite .backup of kine's state.db, or k3s etcd-snapshot save on embedded
@@ -122,6 +123,11 @@ done
 # the latest state is always present regardless. Raise it if your recovery window
 # is longer; at 90 days the increments can dwarf the mirror they serve.
 BACKUP_RETENTION="${BACKUP_RETENTION:-30D}"
+# The users repo may keep less: what it holds (DB dumps, the server-state snapshots) already
+# has its own on-node retention, and a dump written under a dated name is a new file to rdiff,
+# so every dump that ages out on the node is kept whole as an increment for the whole window
+# (30 x a 10 GB dump = 300 GB). A short window here leaves the NAS with what the node keeps.
+BACKUP_USERS_RETENTION="${BACKUP_USERS_RETENTION:-$BACKUP_RETENTION}"
 # --- Backup target (required; set these in your environment) ---
 BACKUP_TARGET_HOST="${BACKUP_TARGET_HOST:-}"    # your NAS/backup host reachable over your VPN
 BACKUP_TARGET_PORT="${BACKUP_TARGET_PORT:-22}"  # SSH port on the backup host
@@ -455,8 +461,8 @@ CRON_BLOCK="${CRON_BEGIN}
 # Excludes live PGDATA (use pg_dump), Loki logs, Trivy cache, and Harbor blobs.
 15 6 * * * ${K3S_SWEEP}
 
-# Remove increments older than ${BACKUP_RETENTION} at 06:30
-30 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
+# Remove increments older than ${BACKUP_USERS_RETENTION} (users) and ${BACKUP_RETENTION} (k3s-storage) at 06:30/06:35
+30 6 * * * rdiff-backup --remove-older-than ${BACKUP_USERS_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_BACKUP_DIR}
 35 6 * * * rdiff-backup --remove-older-than ${BACKUP_RETENTION} --remote-schema '${RDIFF_SCHEMA_CRON}' --force ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}::${REMOTE_K3S_BACKUP_DIR}
 ${CRON_END}"
 
@@ -503,7 +509,7 @@ log "  Backup user:    ${BACKUP_USER} (UID ${BACKUP_UID})"
 log "  Sources:        ${DATA_DIR} (incl. ${K3S_STATE_DIR}), ${K3S_STORAGE_DIR} (excl. live PGDATA, Loki, Trivy)"
 log "  Remote (users): ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_BACKUP_DIR}"
 log "  Remote (k3s):   ${BACKUP_TARGET_USER}@${BACKUP_TARGET_HOST}:${REMOTE_K3S_BACKUP_DIR}"
-log "  Schedule:       daily 05:45 (k3s server state), 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup ${BACKUP_RETENTION})"
+log "  Schedule:       daily 05:45 (k3s server state), 06:00 (users), 06:15 (k3s-storage), 06:30/35 (cleanup users ${BACKUP_USERS_RETENTION}, k3s ${BACKUP_RETENTION})"
 log ""
 log "To run a backup now:  $0 ${ENV_NAME} --run-now"
 log "To check status:      $0 ${ENV_NAME} --show-status"
