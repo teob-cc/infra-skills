@@ -130,6 +130,9 @@ BACKUP_RETENTION="${BACKUP_RETENTION:-30D}"
 # has its own on-node retention, and a dump written under a dated name is a new file to rdiff,
 # so every dump that ages out on the node is kept whole as an increment for the whole window
 # (30 x a 10 GB dump = 300 GB). A short window here leaves the NAS with what the node keeps.
+# Keep it at 2D or more: at 1D the 06:30 cleanup leaves no increment at all, rdiff-backup prunes
+# the emptied increment dirs, and the next night it fails writing increments into them
+# (rdiff-backup 2.2.6, "No such file or directory: .../increments/<dir>/<file>.missing").
 BACKUP_USERS_RETENTION="${BACKUP_USERS_RETENTION:-$BACKUP_RETENTION}"
 # --- Backup target (required; set these in your environment) ---
 BACKUP_TARGET_HOST="${BACKUP_TARGET_HOST:-}"    # your NAS/backup host reachable over your VPN
