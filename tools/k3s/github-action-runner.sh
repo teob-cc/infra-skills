@@ -88,6 +88,18 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Validation ---
+# Runners of the regular pool. RUNNER_REPLICAS overrides. test carries the CI, publishes and deploys of every teob-cc
+# repository on one pool, so it gets one more (INFRA-114, CORE-700).
+regular_runner_replicas() {
+  if [[ -n "${RUNNER_REPLICAS:-}" ]]; then
+    echo "$RUNNER_REPLICAS"
+  elif [[ "$ENV_NAME" == "test" ]]; then
+    echo 3
+  else
+    echo 2
+  fi
+}
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
 need kubectl
 need helm
@@ -779,7 +791,7 @@ create_runner_deployment() {
   else
     runner_name="${ENV_NAME}-runners"
     runner_labels="self-hosted, linux, x64, ${ENV_NAME}"
-    runner_replicas=2
+    runner_replicas=$(regular_runner_replicas)
     info "Creating runner deployment for environment: ${ENV_NAME}..."
     info "  Purpose: Regular CI/CD workflows"
 
@@ -1343,7 +1355,7 @@ info "  Runner labels: self-hosted, linux, x64, ${ENV_NAME}"
 if [[ "$BOOTSTRAP_MODE" == "true" ]]; then
   info "  Runner replicas: 1 (bootstrap)"
 else
-  info "  Runner replicas: 2"
+  info "  Runner replicas: $(regular_runner_replicas)"
 fi
 if [[ "$CUSTOM_RUNNER_IMAGE" == "true" ]]; then
   info "  Runner image: ${RUNNER_IMAGE_REF:-harbor.${HOSTNAME}/library/github-runner:latest} (custom)"
