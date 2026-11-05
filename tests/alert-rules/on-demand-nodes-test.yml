@@ -1,0 +1,403 @@
+# promtool unit tests for the on-demand node handling in tools/k3s/observability.sh
+# (docs/ALERTING.md, "On-demand nodes"). The rules live in a heredoc of that script, so
+# render them first; a dry run changes nothing on the cluster:
+#   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
+#   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
+#   cd tests/alert-rules
+#   docker run --rm -v "$PWD":/w -w /w --entrypoint promtool \
+#     quay.io/prometheus/prometheus:v3.14.0 test rules on-demand-nodes-test.yml
+# rules.yml is git-ignored. Scenarios 6 and 7 guard two evaluation errors seen or
+# reproduced on 2026-11-05: "vector cannot contain metrics with the same labelset"
+# (KubeletDown) and "found duplicate series for the match group" (KubeDaemonSetUnavailable).
+rule_files:
+  - rules.yml
+evaluation_interval: 1m
+
+tests:
+  # 1. Parked on-demand node: NotReady, every target on it down, its DaemonSet pods not ready.
+  #    Nothing about the node may fire. A DaemonSet broken on another node still fires.
+  - name: parked on-demand node is silent
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="test"}
+        values: 1x40
+      - series: kube_node_info{node="gpu-worker"}
+        values: 1x40
+      - series: kube_node_status_condition{node="test",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true"}
+        values: 0x40
+      - series: up{job="kubernetes-nodes",instance="test",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-nodes-cadvisor",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="1.1.1.1:9100",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="2.2.2.2:9100",node="gpu-worker"}
+        values: 0x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_info{namespace="kube-system",pod="nv-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="nvidia"}
+        values: 1x40
+      - series: kube_pod_info{namespace="observability",pod="ne-test",node="test",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_info{namespace="observability",pod="promtail-test",node="test",created_by_kind="DaemonSet",created_by_name="promtail"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="kube-system",pod="nv-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-gpu",phase="Running"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="kube-system",pod="nv-gpu",phase="Running"}
+        values: 1x40
+      # node-exporter tolerates everything: the parked node's pod counts as unavailable.
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter"}
+        values: 1x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 2x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 2x40
+      # the device plugin does not tolerate unreachable:NoSchedule: its pod counts as misscheduled.
+      - series: kube_daemonset_status_number_unavailable{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 1x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      # promtail: no pod on the parked node, healthy.
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="promtail"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="promtail"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="promtail"}
+        values: 1x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="promtail"}
+        values: 1x40
+      # the marker
+      - series: kube_node_labels{node="test"}
+        values: 1x40
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true"}
+        values: 1x40
+    promql_expr_test:
+      - expr: node:on_demand_parked
+        eval_time: 35m
+        exp_samples:
+          - labels: 'node:on_demand_parked{node="gpu-worker"}'
+            value: 1
+      - expr: count by (alertname) (ALERTS{alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 35m
+        exp_samples: []
+
+  # 2. The same outage on a node without the label: every rule fires as before.
+  - name: ordinary node down still fires everything
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="test"}
+        values: 1x40
+      - series: kube_node_info{node="gpu-worker"}
+        values: 1x40
+      - series: kube_node_status_condition{node="test",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true"}
+        values: 0x40
+      - series: up{job="kubernetes-nodes",instance="test",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-nodes-cadvisor",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="1.1.1.1:9100",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="2.2.2.2:9100",node="gpu-worker"}
+        values: 0x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_info{namespace="kube-system",pod="nv-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="nvidia"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="kube-system",pod="nv-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-gpu",phase="Running"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="kube-system",pod="nv-gpu",phase="Running"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter"}
+        values: 1x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 2x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 2x40
+      - series: kube_daemonset_status_number_unavailable{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 1x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="kube-system",daemonset="nvidia"}
+        values: 0x40
+      - series: kube_node_labels{node="test"}
+        values: 1x40
+      - series: kube_node_labels{node="gpu-worker"}
+        values: 1x40
+    promql_expr_test:
+      - expr: node:on_demand_parked
+        eval_time: 35m
+        exp_samples: []
+      - expr: sort_desc(count by (alertname) (ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"}))
+        eval_time: 35m
+        exp_samples:
+          - labels: '{alertname="KubeNodeNotReady"}'
+            value: 1
+          - labels: '{alertname="KubeletDown"}'
+            value: 1
+          - labels: '{alertname="NodeExporterDown"}'
+            value: 1
+          - labels: '{alertname="ScrapeTargetDown"}'
+            value: 2
+          - labels: '{alertname="PodNotReady"}'
+            value: 2
+          - labels: '{alertname="KubeDaemonSetUnavailable"}'
+            value: 2
+
+  # 3. On-demand node that is joined and Ready: failures on it are real and fire.
+  - name: ready on-demand node is watched like any other
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="gpu-worker"}
+        values: 1x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="2.2.2.2:9100",node="gpu-worker"}
+        values: 0x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-gpu",phase="Running"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter"}
+        values: 1x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 1x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 1x40
+    promql_expr_test:
+      - expr: sort_desc(count by (alertname) (ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"}))
+        eval_time: 35m
+        exp_samples:
+          - labels: '{alertname="KubeletDown"}'
+            value: 1
+          - labels: '{alertname="NodeExporterDown"}'
+            value: 1
+          - labels: '{alertname="ScrapeTargetDown"}'
+            value: 1
+          - labels: '{alertname="PodNotReady"}'
+            value: 1
+          - labels: '{alertname="KubeDaemonSetUnavailable"}'
+            value: 1
+
+  # 4. Parked node plus a real failure of the same DaemonSet on another node, a DaemonSet
+  #    that is misscheduled with no parked node involved, and an ordinary node NotReady
+  #    next to the parked one: only the real failures fire.
+  - name: parked node does not hide real failures
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="gpu-worker"}
+        values: 1x40
+      - series: kube_node_info{node="worker1"}
+        values: 1x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true"}
+        values: 0x40
+      - series: kube_node_status_condition{node="worker1",condition="Ready",status="true"}
+        values: 0x40
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true"}
+        values: 1x40
+      - series: kube_node_labels{node="worker1"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="gpu-worker",node="gpu-worker"}
+        values: 0x40
+      - series: up{job="kubernetes-nodes",instance="worker1",node="worker1"}
+        values: 1x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="3.3.3.3:9100",node="worker1"}
+        values: 1x40
+      # a scrape target with no node label at all must not be swallowed
+      - series: up{job="blackbox-http",instance="https://example.com"}
+        values: 0x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_info{namespace="observability",pod="ne-w1",node="worker1",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-gpu",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-gpu",phase="Running"}
+        values: 1x40
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-w1",condition="false"}
+        values: 1x40
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-w1",phase="Running"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter"}
+        values: 2x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 3x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 3x40
+      - series: kube_daemonset_status_number_unavailable{namespace="kube-system",daemonset="svclb"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="kube-system",daemonset="svclb"}
+        values: 1x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="kube-system",daemonset="svclb"}
+        values: 1x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="kube-system",daemonset="svclb"}
+        values: 1x40
+    promql_expr_test:
+      - expr: count by (alertname, node, pod, daemonset, job) (ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 35m
+        exp_samples:
+          - labels: '{alertname="KubeDaemonSetUnavailable", daemonset="node-exporter"}'
+            value: 1
+          - labels: '{alertname="KubeDaemonSetUnavailable", daemonset="svclb"}'
+            value: 1
+          - labels: '{alertname="KubeNodeNotReady", node="worker1"}'
+            value: 1
+          - labels: '{alertname="PodNotReady", pod="ne-w1"}'
+            value: 1
+          - labels: '{alertname="ScrapeTargetDown", job="blackbox-http"}'
+            value: 1
+
+  # 5. A full cycle: the node is up, goes away at minute 10 (the Ready condition follows a
+  #    minute later), and is back at minute 30. Nothing fires at any point.
+  - name: power-off and return raise nothing
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="gpu-worker"}
+        values: 1x60
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true"}
+        values: 1x60
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true"}
+        values: 1x10 0x19 1x29
+      - series: up{job="kubernetes-nodes",instance="gpu-worker",node="gpu-worker"}
+        values: 1x9 0x20 1x29
+      - series: up{job="kubernetes-nodes-cadvisor",instance="gpu-worker",node="gpu-worker"}
+        values: 1x9 0x20 1x29
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="2.2.2.2:9100",node="gpu-worker"}
+        values: 1x9 0x20 1x29
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter"}
+        values: 1x60
+      - series: kube_pod_status_ready{namespace="observability",pod="ne-gpu",condition="false"}
+        values: 0x10 1x19 0x29
+      - series: kube_pod_status_phase{namespace="observability",pod="ne-gpu",phase="Running"}
+        values: 1x60
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter"}
+        values: 0x10 1x19 0x29
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter"}
+        values: 0x60
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 1x60
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter"}
+        values: 1x60
+    promql_expr_test:
+      - expr: count(ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 12m
+        exp_samples: []
+      - expr: count(ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 29m
+        exp_samples: []
+      - expr: count(ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 33m
+        exp_samples: []
+      - expr: count(ALERTS{alertstate="firing",alertname=~"KubeNodeNotReady|KubeletDown|NodeExporterDown|ScrapeTargetDown|PodNotReady|KubeDaemonSetUnavailable"})
+        eval_time: 55m
+        exp_samples: []
+
+  # 6. Scrape-label overlap: the kubelet target exists with and without the node label for
+  #    a while (relabel dropped and re-added). KubeletDown must evaluate and stay quiet.
+  - name: kubelet series overlap does not break KubeletDown
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="test"}
+        values: 1x40
+      - series: kube_node_status_condition{node="test",condition="Ready",status="true"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="test",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-nodes",instance="test"}
+        values: 1x40
+    promql_expr_test:
+      - expr: count(ALERTS{alertname="KubeletDown"})
+        eval_time: 20m
+        exp_samples: []
+
+  # 7. Two kube-state-metrics pods overlap during a rollout: every kube_* series exists
+  #    twice, with different instance labels. The DaemonSet rule must evaluate; the parked
+  #    node stays silent and a real failure (promtail) fires for both instances' series.
+  - name: duplicate kube-state-metrics series do not break the DaemonSet rule
+    interval: 1m
+    input_series:
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true",instance="a"}
+        values: 1x40
+      - series: kube_node_labels{node="gpu-worker",label_infra_skills_on_demand="true",instance="b"}
+        values: 1x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true",instance="a"}
+        values: 0x40
+      - series: kube_node_status_condition{node="gpu-worker",condition="Ready",status="true",instance="b"}
+        values: 0x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter",instance="a"}
+        values: 1x40
+      - series: kube_pod_info{namespace="observability",pod="ne-gpu",node="gpu-worker",created_by_kind="DaemonSet",created_by_name="node-exporter",instance="b"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter",instance="a"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="node-exporter",instance="b"}
+        values: 1x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter",instance="a"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="node-exporter",instance="b"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter",instance="a"}
+        values: 2x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="node-exporter",instance="b"}
+        values: 2x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter",instance="a"}
+        values: 2x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="node-exporter",instance="b"}
+        values: 2x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="promtail",instance="a"}
+        values: 1x40
+      - series: kube_daemonset_status_number_unavailable{namespace="observability",daemonset="promtail",instance="b"}
+        values: 1x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="promtail",instance="a"}
+        values: 0x40
+      - series: kube_daemonset_status_number_misscheduled{namespace="observability",daemonset="promtail",instance="b"}
+        values: 0x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="promtail",instance="a"}
+        values: 1x40
+      - series: kube_daemonset_status_desired_number_scheduled{namespace="observability",daemonset="promtail",instance="b"}
+        values: 1x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="promtail",instance="a"}
+        values: 1x40
+      - series: kube_daemonset_status_current_number_scheduled{namespace="observability",daemonset="promtail",instance="b"}
+        values: 1x40
+    promql_expr_test:
+      - expr: count by (daemonset) (ALERTS{alertstate="firing",alertname="KubeDaemonSetUnavailable"})
+        eval_time: 30m
+        exp_samples:
+          - labels: '{daemonset="promtail"}'
+            value: 2

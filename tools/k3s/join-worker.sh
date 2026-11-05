@@ -44,7 +44,10 @@ Arguments:
 Flags:
   --ssh-user USER       SSH username (default: auto-detect)
   --ssh-key PATH        SSH private key (default: ~/.ssh/id_ed25519)
-  --label KEY=VALUE     Add label to node (repeatable, e.g. --label gpu=rtx4080)
+  --label KEY=VALUE     Add label to node (repeatable, e.g. --label gpu=rtx4080).
+                        infra-skills/on-demand=true marks a node that is powered on only
+                        when needed: alerts treat it as parked, not failed, while it is
+                        not Ready (docs/ALERTING.md, "On-demand nodes")
   --taint KEY=VAL:EFF   Add taint to node (repeatable, e.g. --taint gpu=rtx4080:NoSchedule)
   --remove              Park: drain, delete node, stop+disable k3s-agent
                         (keeps k3s and the containerd image cache for fast revival)
