@@ -69,6 +69,35 @@ k3s serves the API server and kubelet metrics from one process, so most control-
 series appear twice (jobs `kubernetes-api-servers` and `kubernetes-nodes`). Every rule
 pins one job.
 
+### On-demand nodes
+
+A worker that is powered on only when it is needed (a GPU box, a burst worker) would
+page as a dead node every time it is switched off. Label such a node
+`infra-skills/on-demand=true`:
+
+```bash
+kubectl label node <node> infra-skills/on-demand=true
+```
+
+Add the label to `NODE_LABELS` in the worker's `env.properties` as well, so
+`join-worker.sh` puts it back when the node registers again.
+
+While a labelled node is not Ready it is parked, and the rules leave it alone:
+KubeNodeNotReady, KubeletDown, NodeExporterDown and ScrapeTargetDown skip the node,
+PodNotReady skips the pods on it, and KubeDaemonSetUnavailable does not count them. The
+recording rule `node:on_demand_parked` holds one series per parked node. As soon as the
+node is Ready again, every rule applies to it like to any other node, so a failing
+exporter or pod on a joined on-demand node still alerts.
+
+`observability.sh` knows about parked nodes too. node-exporter runs on every node, so
+with a parked node its DaemonSet is never fully ready and `helm --wait` would time out.
+The script then upgrades the `prometheus` release without `--wait` and waits for the
+Deployments and the Alertmanager StatefulSet instead.
+
+Nothing tells a parked node from one that crashed: both are simply not Ready. Do not
+label a node that must stay up. Workloads that need the node are still watched: a pod
+that waits for a parked node fires KubePodUnschedulable.
+
 ## Runbook
 
 The alert descriptions carry the first steps; this section adds context per group.

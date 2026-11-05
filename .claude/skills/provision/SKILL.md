@@ -125,8 +125,10 @@ file is gitignored; in a fresh clone run `tools/sops/kubeconfig.sh restore <env>
 #### Worker nodes (optional)
 An environment may have worker directories `envs/<env>/<worker>/env.properties` with
 `MASTER_VLAN_IP` / `MASTER_HOSTNAME` (and `NODE_LABELS`, `NODE_TAINTS`, `REGISTRY_HOSTS` for
-special nodes such as a GPU box). Join them after the master is up — and again after any
-reprovision, since the cluster CA and node token are new:
+special nodes such as a GPU box). A node that is powered on only when needed gets
+`infra-skills/on-demand=true` in `NODE_LABELS`, so the alert rules treat it as parked rather
+than failed while it is off (docs/ALERTING.md, "On-demand nodes"). Join them after the master
+is up — and again after any reprovision, since the cluster CA and node token are new:
 ```bash
 tools/k3s/join-worker.sh <env> <worker>
 ```
