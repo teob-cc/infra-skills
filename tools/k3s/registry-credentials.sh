@@ -197,7 +197,7 @@ fi
 
 info "✓ Retrieved Harbor robot credentials"
 info "  Username: ${HARBOR_USERNAME}"
-info "  Password: ${HARBOR_PASSWORD:0:10}..."
+info "  Password: ${#HARBOR_PASSWORD} characters (not shown)"
 
 # ============================================================================
 # Step 2: Get GitHub App credentials and generate token

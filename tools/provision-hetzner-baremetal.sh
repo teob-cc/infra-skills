@@ -472,13 +472,12 @@ function tailscale::api(){
   local url="https://api.tailscale.com/api/v2${path}"
   dbg "TAILSCALE ${method} ${url}"
   dbg "TAILSCALE API token length: ${#TS_API_TOKEN}"
-  dbg "TAILSCALE API token prefix: ${TS_API_TOKEN:0:20}..."
   
   local response http body
   local curl_output curl_rc
   
   if $DEBUG; then
-    info "TAILSCALE curl command: curl -sS -u '${TS_API_TOKEN:0:20}...:[redacted]' -X ${method} -H 'Content-Type: application/json' ${url} $@"
+    info "TAILSCALE curl command: curl -sS -u '[redacted]:' -X ${method} -H 'Content-Type: application/json' ${url} $@"
   fi
   
   response=$(curl -sS -u "${TS_API_TOKEN}:" -X "$method" \
