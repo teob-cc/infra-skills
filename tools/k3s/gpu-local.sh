@@ -111,9 +111,11 @@ print_status() {
   mode=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.labels.${LABEL_KEY}}" 2>/dev/null)
   gpu_alloc=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}' 2>/dev/null)
   info "Node ${NODE_NAME}: schedulable=$([[ "$unsched" == "true" ]] && echo 'NO (cordoned)' || echo yes)  ${LABEL_KEY}=${mode:-<unset>}  nvidia.com/gpu alloc=${gpu_alloc:-0}"
-  local claimed_by claimed_at
-  claimed_by=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.annotations.${ANNO_PREFIX}/claimed-by}" 2>/dev/null)
-  claimed_at=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.annotations.${ANNO_PREFIX}/claimed-at}" 2>/dev/null)
+  # jsonpath reads a dot as a path separator, so the dots of the annotation prefix must be
+  # escaped; unescaped, both lookups return nothing and the claim is never shown.
+  local claimed_by claimed_at anno_path="${ANNO_PREFIX//./\\.}"
+  claimed_by=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.annotations.${anno_path}/claimed-by}" 2>/dev/null)
+  claimed_at=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.annotations.${anno_path}/claimed-at}" 2>/dev/null)
   [[ -n "$claimed_by" ]] && info "  claimed-by=${claimed_by} claimed-at=${claimed_at}"
   info "  non-daemonset pods on node:"
   kubectl get pods -A --field-selector "spec.nodeName=${NODE_NAME}" \
