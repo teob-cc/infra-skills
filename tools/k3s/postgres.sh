@@ -177,6 +177,18 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${POSTGRES_STORAGE_CLASS:=local-path}"
 : "${POSTGRES_STORAGE_SIZE:=50Gi}"
 : "${POSTGRES_INSTANCES:=1}"
+# postgres-cluster resources and memory parameters, applied only when the cluster is
+# created (a running cluster is never changed; live-patch it and record the values in
+# envs/<env>/env.properties). Defaults are the small-node profile; an env whose
+# cluster holds a large event journal overrides them.
+: "${POSTGRES_CPU_REQUEST:=500m}"
+: "${POSTGRES_MEMORY_REQUEST:=1Gi}"
+: "${POSTGRES_CPU_LIMIT:=2}"
+: "${POSTGRES_MEMORY_LIMIT:=2Gi}"
+: "${POSTGRES_SHARED_BUFFERS:=256MB}"
+: "${POSTGRES_EFFECTIVE_CACHE_SIZE:=512MB}"
+: "${POSTGRES_MAINTENANCE_WORK_MEM:=64MB}"
+: "${POSTGRES_MAX_WAL_SIZE:=4GB}"
 : "${ENFORCE_POMERIUM:=true}"
 # PostgreSQL operand image (CNPG postgres-containers). Use the immutable
 # MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
@@ -1592,6 +1604,16 @@ create_postgres_cluster() {
       warn "  Back up, then (restarts the instance; same major only, a major upgrade needs its own plan):"
       warn "  kubectl -n ${NAMESPACE_POSTGRES} patch cluster postgres-cluster --type=merge -p '{\"spec\":{\"imageName\":\"${POSTGRES_IMAGE}\"}}'"
     fi
+    # Resources and memory parameters are never changed here either (a change restarts the
+    # instance). Compared as written, so "8" and "8000m" count as different: keep the live
+    # patch and env.properties in the same notation.
+    local live_sizing want_sizing
+    live_sizing=$(kubectl -n "$NAMESPACE_POSTGRES" get cluster postgres-cluster -o jsonpath='{.spec.resources.limits.cpu}/{.spec.resources.limits.memory}/{.spec.postgresql.parameters.shared_buffers}' 2>/dev/null || true)
+    want_sizing="${POSTGRES_CPU_LIMIT}/${POSTGRES_MEMORY_LIMIT}/${POSTGRES_SHARED_BUFFERS}"
+    if [[ -n "$live_sizing" && "$live_sizing" != "$want_sizing" ]]; then
+      warn "postgres-cluster limits cpu/memory/shared_buffers are ${live_sizing}; env.properties says ${want_sizing}. Not changing it here."
+      warn "  Patch it deliberately (restarts the instance), e.g. from envs/<env>/migrations/ if the env keeps a patch file."
+    fi
     warn_pg_hba_md5
     [[ -n "$PG_RECOVER_FROM" ]] && \
       warn "PG_RECOVER_FROM=${PG_RECOVER_FROM} ignored: postgres-cluster exists (it only bootstraps a new cluster); remove it from env.properties"
@@ -1705,9 +1727,9 @@ ${managed_block}${plugins_block}
   postgresql:
     parameters:
       max_connections: "100"
-      shared_buffers: "256MB"
-      effective_cache_size: "512MB"
-      maintenance_work_mem: "64MB"
+      shared_buffers: "${POSTGRES_SHARED_BUFFERS}"
+      effective_cache_size: "${POSTGRES_EFFECTIVE_CACHE_SIZE}"
+      maintenance_work_mem: "${POSTGRES_MAINTENANCE_WORK_MEM}"
       checkpoint_completion_target: "0.9"
       wal_buffers: "16MB"
       default_statistics_target: "100"
@@ -1715,7 +1737,7 @@ ${managed_block}${plugins_block}
       effective_io_concurrency: "200"
       work_mem: "4MB"
       min_wal_size: "1GB"
-      max_wal_size: "4GB"
+      max_wal_size: "${POSTGRES_MAX_WAL_SIZE}"
     # SCRAM only (INFRA-65). CNPG appends "host all all all scram-sha-256" itself (PG >= 14);
     # these private-range lines spell the method out. "md5" here would also accept roles
     # whose stored password is still an MD5 hash (password_encryption is scram-sha-256 by
@@ -1738,11 +1760,11 @@ ${bootstrap_block}
   # Resource limits
   resources:
     requests:
-      memory: "1Gi"
-      cpu: "500m"
+      memory: "${POSTGRES_MEMORY_REQUEST}"
+      cpu: "${POSTGRES_CPU_REQUEST}"
     limits:
-      memory: "2Gi"
-      cpu: "2000m"
+      memory: "${POSTGRES_MEMORY_LIMIT}"
+      cpu: "${POSTGRES_CPU_LIMIT}"
 YAML
   fi
 
