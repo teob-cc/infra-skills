@@ -26,6 +26,9 @@ set -euo pipefail
 #                        Alertmanager config) with the full rendered values
 #   --dry-run            With --rules-only semantics: render server-side, print the
 #                        ConfigMap diff against the live release, change nothing
+#   --export-only        Only put the Prometheus export up or down
+#                        (PROMETHEUS_EXPORT_ALLOWED_CIDRS): its Secret, Middlewares and
+#                        Ingress. No release is upgraded and no DNS record is made
 #
 # env.properties (optional):
 #   GRAFANA_ADMIN_PASSWORD  Grafana admin password; unset = keep the one in
@@ -38,6 +41,28 @@ set -euo pipefail
 #   LOKI_RETENTION_PERIOD  e.g. 2160h; enables compactor retention. Default: keep forever
 #   GITHUB_ORG           Org for Grafana's role mapping; default: secrets.plain, then the
 #                        live Dex config
+#   PROMETHEUS_EXPORT_ALLOWED_CIDRS="203.0.113.0/24 198.51.100.7/32"
+#                        Serve this Prometheus's query API (path prefix /api/v1/ only) at
+#                        PROMETHEUS_EXPORT_HOST for another cluster's Grafana: Traefik
+#                        ipAllowList of these ranges plus basic auth (Secret
+#                        observability/prometheus-export, SOPS copy in the envs repo).
+#                        Unset = no export; a run removes the Ingress and middlewares.
+#   PROMETHEUS_EXPORT_HOST  default prometheus-export.<HOSTNAME>
+#   GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ..."  One Grafana datasource Prometheus-<name>
+#                        (uid the same) per entry, reading another cluster's export with
+#                        the keys <name>-username/<name>-password of Secret
+#                        observability/grafana-remote-prometheus (grafana-remote-prometheus.sh
+#                        fills it); an entry whose keys are missing is left out with a warning
+#   GRAFANA_FRAME_ANCESTORS="https://portal.example.com ..."  Origins that may show Grafana
+#                        in an iframe: grafana.ini security.allow_embedding, and the Pomerium
+#                        route answers Content-Security-Policy: frame-ancestors 'self' <origins>.
+#                        allow_embedding needs the SSO block of grafana.ini (a warning says so)
+#   GRAFANA_POMERIUM_JWT=true  Sign users in from the JWT Pomerium passes on every request
+#                        (grafana.ini auth.jwt, keys from https://<AUTH_HOST>/.well-known/pomerium/jwks.json,
+#                        audience pinned to GRAFANA_HOST, the same role mapping as Dex SSO).
+#                        Default false. A wrong setting locks the UI behind the route until
+#                        the property is removed and the script re-run
+#                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
 #   ALLOW_GRAFANA_REGRESSION=true  let a run drop SSO, root_url or a datasource that the
@@ -64,6 +89,7 @@ Options:
   --sync-dashboards    Only upsert dashboards into Grafana
   --rules-only         Only upgrade the prometheus release (rules, scrape, Alertmanager)
   --dry-run            Like --rules-only, but only print the ConfigMap diff
+  --export-only        Only put the Prometheus export up or down; upgrades nothing
 
 Available environments:
 EOF
@@ -94,6 +120,7 @@ SKIP_SSO=false
 SYNC_DASHBOARDS=false
 RULES_ONLY=false
 DRY_RUN=false
+EXPORT_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -106,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --sync-dashboards) SYNC_DASHBOARDS=true; shift ;;
     --rules-only) RULES_ONLY=true; shift ;;
     --dry-run) DRY_RUN=true; RULES_ONLY=true; shift ;;
+    --export-only) EXPORT_ONLY=true; shift ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -263,6 +291,98 @@ LOKI_RETENTION_PERIOD="${LOKI_RETENTION_PERIOD:-}"
 # Ingress configuration
 INGRESS_CLASS="${INGRESS_CLASS:-traefik}"
 CLUSTER_ISSUER="${CLUSTER_ISSUER:-letsencrypt-prod}"
+
+# --- Prometheus export: another cluster's Grafana reads this Prometheus ---
+# PROMETHEUS_EXPORT_ALLOWED_CIDRS switches it on (ensure_prometheus_export). Unset, the
+# default, exports nothing, and a run takes down what an earlier run put up. Checked here,
+# before anything changes, so a typo fails the run instead of opening the endpoint wider.
+PROMETHEUS_EXPORT_ALLOWED_CIDRS="${PROMETHEUS_EXPORT_ALLOWED_CIDRS:-}"
+PROMETHEUS_EXPORT_SECRET="prometheus-export"
+PROMETHEUS_EXPORT_USER="grafana"
+if [[ -z "${PROMETHEUS_EXPORT_HOST:-}" && -n "${HOSTNAME:-}" ]]; then
+  PROMETHEUS_EXPORT_HOST="prometheus-export.${HOSTNAME}"
+fi
+if [[ -n "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+  for cidr in ${PROMETHEUS_EXPORT_ALLOWED_CIDRS//,/ }; do
+    if ! [[ "$cidr" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]]; then
+      err "PROMETHEUS_EXPORT_ALLOWED_CIDRS: '${cidr}' is not an IP or CIDR"; exit 1
+    fi
+    if [[ "$cidr" == "0.0.0.0/0" || "$cidr" == "::/0" ]]; then
+      warn "PROMETHEUS_EXPORT_ALLOWED_CIDRS contains ${cidr}: the export is open to the Internet, basic auth alone guards it"
+    fi
+  done
+  if ! [[ "${PROMETHEUS_EXPORT_HOST:-}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    err "PROMETHEUS_EXPORT_ALLOWED_CIDRS is set, but PROMETHEUS_EXPORT_HOST ('${PROMETHEUS_EXPORT_HOST:-}') is not a host name; set it or HOSTNAME"
+    exit 1
+  fi
+fi
+
+# --- Remote Prometheus datasources: this Grafana reads other clusters' exports ---
+# GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ...", e.g. "prod=https://prometheus-export.prod.example.com".
+# <name> becomes the datasource name and uid Prometheus-<name> (a uid is at most 40 characters)
+# and the key prefix in the Secret, so it is lower-case letters, digits and dashes.
+GRAFANA_REMOTE_PROMETHEUS="${GRAFANA_REMOTE_PROMETHEUS:-}"
+GRAFANA_REMOTE_PROMETHEUS_SECRET="grafana-remote-prometheus"
+
+# --- Framing: other origins may show this Grafana in an iframe ---
+# GRAFANA_FRAME_ANCESTORS="<origin> ..." (scheme://host[:port], a leading *. allowed). Grafana
+# gets security.allow_embedding, and the Pomerium route of its host answers
+# Content-Security-Policy: frame-ancestors 'self' <origins>, which browsers obey over the
+# X-Frame-Options: SAMEORIGIN Pomerium sends by default. The route is rewritten on every run
+# (provision::_pomerium_routes_upsert), so the header has to come from here. Unset: the route
+# and the values are what they were without it.
+GRAFANA_FRAME_ANCESTORS="${GRAFANA_FRAME_ANCESTORS:-}"
+grafana_frame_csp=""
+if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+  for frame_origin in $GRAFANA_FRAME_ANCESTORS; do
+    if ! [[ "$frame_origin" =~ ^https?://(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$ ]]; then
+      err "GRAFANA_FRAME_ANCESTORS: '${frame_origin}' is not an origin (scheme://host[:port], no path)"; exit 1
+    fi
+    grafana_frame_csp+=" ${frame_origin}"
+  done
+  grafana_frame_csp="frame-ancestors 'self'${grafana_frame_csp}"
+  unset frame_origin
+fi
+
+# --- Sign-in from Pomerium's JWT (GRAFANA_POMERIUM_JWT=true, off by default) ---
+# Pomerium passes a signed assertion on every request of the route (pass_identity_headers):
+# header X-Pomerium-Jwt-Assertion, aud and iss the route's host, the user's email and groups.
+# With this on, Grafana's auth.jwt signs the user in from it (no Grafana login step), with the
+# signing keys from the authenticate service: AUTH_HOST, the same default as identity.sh.
+# Every request through the route carries the header and Grafana rejects one it cannot
+# verify, so a wrong setting locks the UI until the property is removed and the script re-run.
+GRAFANA_POMERIUM_JWT="${GRAFANA_POMERIUM_JWT:-false}"
+if [[ "$GRAFANA_POMERIUM_JWT" != "true" && "$GRAFANA_POMERIUM_JWT" != "false" ]]; then
+  err "GRAFANA_POMERIUM_JWT='${GRAFANA_POMERIUM_JWT}' must be true or false"; exit 1
+fi
+if [[ -z "${AUTH_HOST:-}" && -n "${HOSTNAME:-}" ]]; then
+  AUTH_HOST="auth.${HOSTNAME}"
+fi
+if [[ "$GRAFANA_POMERIUM_JWT" == "true" && -z "${AUTH_HOST:-}" ]]; then
+  err "GRAFANA_POMERIUM_JWT=true needs the Pomerium authenticate host: set AUTH_HOST or HOSTNAME"; exit 1
+fi
+if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
+  remote_prom_seen=" "
+  remote_prom_url_re='^https?://[^[:space:]"$`\\]+$'
+  for remote_prom_pair in $GRAFANA_REMOTE_PROMETHEUS; do
+    remote_prom_name="${remote_prom_pair%%=*}"
+    remote_prom_url="${remote_prom_pair#*=}"
+    if [[ "$remote_prom_pair" != *=* ]] || ! [[ "$remote_prom_name" =~ ^[a-z0-9]([a-z0-9-]{0,27}[a-z0-9])?$ ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_pair}' is not <name>=<url> with a name of lower-case letters, digits and dashes (at most 29)"
+      exit 1
+    fi
+    if ! [[ "$remote_prom_url" =~ $remote_prom_url_re ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: the URL of '${remote_prom_name}' is not an http(s) URL without quotes or \$"
+      exit 1
+    fi
+    [[ "$remote_prom_url" == https://* ]] || warn "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_name}' is plain http; its password would cross the network in clear"
+    if [[ "$remote_prom_seen" == *" ${remote_prom_name} "* ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_name}' appears twice"; exit 1
+    fi
+    remote_prom_seen+="${remote_prom_name} "
+  done
+  unset remote_prom_seen remote_prom_url_re remote_prom_pair remote_prom_name remote_prom_url
+fi
 
 # --- StoreBack read-only Postgres datasource (powers the "UCE - shops & activity" dashboard) ---
 # DB + role were renamed uce -> storeback in 2026-07; these default to the post-rename names.
@@ -452,7 +572,8 @@ ensure_grafana_admin_login() {
 #
 # Compares the live release's user values with the values this run rendered and lists
 # what would disappear: the Dex SSO block, envFromSecret (the Dex client secret),
-# server.root_url, and every datasource by name. Only names and flags are compared,
+# server.root_url, security.allow_embedding (a framing page would go blank), and every
+# datasource by name (Prometheus-<name> included). Only names and flags are compared,
 # never secret values. Exits the script on a regression unless
 # ALLOW_GRAFANA_REGRESSION=true. No live release (first install) passes.
 grafana_values_guard() {
@@ -471,6 +592,9 @@ grafana_values_guard() {
          then "envFromSecret \($live.envFromSecret)" else empty end),
       (if ($live["grafana.ini"].server.root_url // "") != "" and ($new["grafana.ini"].server.root_url // "") == ""
          then "grafana.ini server.root_url" else empty end),
+      (if ($live["grafana.ini"].security.allow_embedding // "" | tostring) == "true"
+          and ($new["grafana.ini"].security.allow_embedding // "" | tostring) != "true"
+         then "grafana.ini security.allow_embedding (GRAFANA_FRAME_ANCESTORS)" else empty end),
       (($live|dsnames) - ($new|dsnames) | .[] | "datasource \(.)")
     ] | .[]')
   if [[ -z "$lost" ]]; then
@@ -484,9 +608,64 @@ grafana_values_guard() {
   fi
   err "This run would remove from the live Grafana release:"
   printf '%s\n' "$lost" | sed 's/^/  - /' >&2
-  err "Usual causes: --skip-sso, the Dex client step failed, or the Postgres-UCE role check failed."
+  err "Usual causes: --skip-sso, the Dex client step failed, the Postgres-UCE role check failed, or"
+  err "Secret ${GRAFANA_REMOTE_PROMETHEUS_SECRET} lacks the keys of a GRAFANA_REMOTE_PROMETHEUS entry."
   err "Fix the cause, or set ALLOW_GRAFANA_REGRESSION=true to accept the loss. Nothing was changed in Grafana."
   exit 1
+}
+
+# --- Datasources for other clusters' Prometheus (GRAFANA_REMOTE_PROMETHEUS) ---
+#
+# The Postgres-UCE pattern: the datasource YAML holds environment variables, never the
+# credential, and the Grafana pod gets them from Secret grafana-remote-prometheus
+# (envValueFrom). An entry is rendered only when its two keys exist, so no datasource is ever
+# provisioned with a password that would not expand. The secretKeyRefs are optional: should
+# the keys go later, the pod still starts and that one datasource fails, not the whole
+# Grafana. Reads the Secret's key names, one per line, on stdin (never its values) and sets
+# remote_prom_datasource_block and remote_prom_env_block (envValueFrom entries).
+grafana_remote_prometheus_blocks() {
+  local keys pair name url var secret="$GRAFANA_REMOTE_PROMETHEUS_SECRET"
+  keys=$(cat)
+  remote_prom_datasource_block=""
+  remote_prom_env_block=""
+  for pair in $GRAFANA_REMOTE_PROMETHEUS; do
+    name="${pair%%=*}"
+    url="${pair#*=}"
+    if ! grep -qxF -- "${name}-username" <<<"$keys" || ! grep -qxF -- "${name}-password" <<<"$keys"; then
+      warn "Datasource Prometheus-${name} omitted: Secret ${NAMESPACE_OBSERVABILITY}/${secret} has no ${name}-username and ${name}-password"
+      warn "  (tools/k3s/grafana-remote-prometheus.sh puts them there, then re-run this script)"
+      continue
+    fi
+    var="GRAFANA_REMOTE_PROM_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    remote_prom_datasource_block+="    - name: Prometheus-${name}
+      uid: Prometheus-${name}
+      type: prometheus
+      access: proxy
+      url: \"${url}\"
+      isDefault: false
+      basicAuth: true
+      basicAuthUser: \"\$${var}_USERNAME\"
+      secureJsonData:
+        basicAuthPassword: \"\$${var}_PASSWORD\"
+      jsonData:
+        # Same as the local Prometheus datasource: the exporting Prometheus scrapes every 1m.
+        timeInterval: 1m
+"
+    remote_prom_env_block+="  ${var}_USERNAME:
+    secretKeyRef:
+      name: ${secret}
+      key: ${name}-username
+      optional: true
+  ${var}_PASSWORD:
+    secretKeyRef:
+      name: ${secret}
+      key: ${name}-password
+      optional: true
+"
+    info "Datasource Prometheus-${name} -> ${url}"
+  done
+  remote_prom_datasource_block="${remote_prom_datasource_block%$'\n'}"
+  remote_prom_env_block="${remote_prom_env_block%$'\n'}"
 }
 
 # --- Front Grafana with Pomerium ---
@@ -526,12 +705,203 @@ spec:
         - ${GRAFANA_HOST}
       secretName: grafana-pomerium-tls
 YAML
+  # GRAFANA_FRAME_ANCESTORS: the route answers with the CSP that lets those origins frame
+  # Grafana. Without it the extra options are {} and the route is what it always was.
+  local route_extra="{}"
+  if [[ -n "$grafana_frame_csp" ]]; then
+    route_extra=$(jq -cn --arg csp "$grafana_frame_csp" '{set_response_headers: {"Content-Security-Policy": $csp}}')
+    info "Pomerium route for ${GRAFANA_HOST} answers Content-Security-Policy: ${grafana_frame_csp}"
+  fi
   if provision::pomerium_routes_add "https://${GRAFANA_HOST}" \
-       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true; then
+       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true \
+       "$route_extra"; then
     info "✓ Pomerium route ensured: https://${GRAFANA_HOST} -> grafana"
   else
     warn "Failed to ensure the Pomerium route for https://${GRAFANA_HOST}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
   fi
+}
+
+# --- Export this Prometheus to another cluster's Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS) ---
+#
+# The reading cluster's Grafana queries https://${PROMETHEUS_EXPORT_HOST}/api/v1/... with basic
+# auth (docs/GRAFANA-ACROSS-CLUSTERS.md). Next to prometheus-server, in the observability
+# namespace:
+#   * Secret prometheus-export, type kubernetes.io/basic-auth, keys `username` (grafana) and
+#     `password`: generated once, SOPS-encrypted into envs/<env>/secrets.sops/, restored from
+#     there when the cluster has lost it. Traefik reads a Secret of this type by its username
+#     and password keys. (An Opaque Secret with an htpasswd `users` key would have to hold that
+#     key alone: Traefik refuses an Opaque basicAuth Secret with more than one key.)
+#   * Middlewares prometheus-export-allowlist (ipAllowList of the CIDRs, nothing else) and
+#     prometheus-export-auth (basicAuth on that Secret).
+#   * Ingress prometheus-export: only the path prefix /api/v1/ of the host reaches Prometheus.
+# tools/k3s/grafana-remote-prometheus.sh copies the credential to the reading cluster.
+
+# Print the two Middlewares and the Ingress of the export (rendering only, no cluster access).
+prometheus_export_manifests() {
+  local ns="$NAMESPACE_OBSERVABILITY" ranges="" cidr
+  for cidr in ${PROMETHEUS_EXPORT_ALLOWED_CIDRS//,/ }; do
+    ranges+="      - \"${cidr}\""$'\n'
+  done
+  cat <<YAML
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: prometheus-export-allowlist
+  namespace: ${ns}
+spec:
+  ipAllowList:
+    sourceRange:
+${ranges%$'\n'}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: prometheus-export-auth
+  namespace: ${ns}
+spec:
+  basicAuth:
+    secret: ${PROMETHEUS_EXPORT_SECRET}
+    removeHeader: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-export
+  namespace: ${ns}
+  annotations:
+    cert-manager.io/cluster-issuer: ${CLUSTER_ISSUER}
+    cert-manager.io/common-name: ${PROMETHEUS_EXPORT_HOST}
+    traefik.ingress.kubernetes.io/router.middlewares: ${ns}-prometheus-export-allowlist@kubernetescrd,${ns}-prometheus-export-auth@kubernetescrd
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+    - host: ${PROMETHEUS_EXPORT_HOST}
+      http:
+        paths:
+          - backend:
+              service:
+                name: prometheus-server
+                port:
+                  number: 80
+            path: /api/v1/
+            pathType: Prefix
+  tls:
+    - hosts:
+        - ${PROMETHEUS_EXPORT_HOST}
+      secretName: prometheus-export-tls
+YAML
+}
+
+# Normalise a Secret (JSON on stdin) to the export Secret object: name, namespace, type and
+# the two keys, nothing else of the live object.
+prometheus_export_secret_object() {
+  jq --arg n "$PROMETHEUS_EXPORT_SECRET" --arg ns "$NAMESPACE_OBSERVABILITY" \
+    '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/basic-auth",
+      metadata: {name: $n, namespace: $ns},
+      data: {username: .data.username, password: .data.password}}'
+}
+
+# Write the export Secret (JSON on stdin) to secrets.plain, apply it when asked, encrypt it into
+# secrets.sops and remove the plaintext; the same steps as grafana-mcp-token.sh's store_token.
+# A subshell with its own EXIT trap removes the plaintext whatever happens. Every step is checked
+# by hand: callers run this under `||`, where set -e does not stop anything.
+prometheus_export_store_secret() { # <apply: true|false>
+  local apply="$1" file="${PROMETHEUS_EXPORT_SECRET}.yaml"
+  local plain="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/${file}"
+  local sops_file="${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${file}"
+  provision::assert_plaintext_ignored "$plain" || return 1
+  (
+    trap 'rm -f "$plain"' EXIT
+    umask 077
+    mkdir -p "$(dirname "$plain")" || exit 1
+    yq -p json -o yaml '.' - > "$plain" || exit 1
+    [[ "$(yq '.kind' "$plain")" == "Secret" ]] || { err "No Secret object to store"; exit 1; }
+    if [[ "$apply" == "true" ]]; then
+      kubectl apply -f "$plain" >/dev/null || { err "Could not apply the Secret ${NAMESPACE_OBSERVABILITY}/${PROMETHEUS_EXPORT_SECRET}"; exit 1; }
+      info "✓ Secret ${NAMESPACE_OBSERVABILITY}/${PROMETHEUS_EXPORT_SECRET} applied"
+    fi
+    "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$file" >/dev/null || { err "tools/sops/encrypt.sh failed on ${file}"; exit 1; }
+    if [[ "$(yq '[(.data // {}), (.stringData // {})] | map(to_entries) | flatten
+                 | map(select((.value | tostring | test("^ENC\\[")) | not)) | length' "$sops_file")" != "0" ]] ||
+       [[ "$(yq '(.data.password // .stringData.password // "") | test("^ENC\\[")' "$sops_file")" != "true" ]]; then
+      err "The password did not come out encrypted in ${sops_file}"; exit 1
+    fi
+    info "✓ Encrypted to ${sops_file#"${ENVS_ROOT}/"} - commit it in the envs repo"
+  )
+}
+
+# The export credential: reuse the cluster's Secret, restore it from the SOPS copy, or generate
+# it (first run, or an incomplete Secret). The password never leaves pipes: it is not printed,
+# not an argument, and the only file it touches is the git-ignored plaintext the store step
+# removes again.
+prometheus_export_ensure_secret() {
+  local ns="$NAMESPACE_OBSERVABILITY" json state
+  local sops_file="${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${PROMETHEUS_EXPORT_SECRET}.yaml"
+  json=$(kubectl -n "$ns" get secret "$PROMETHEUS_EXPORT_SECRET" -o json 2>/dev/null || true)
+  if [[ -z "$json" && -f "$sops_file" ]]; then
+    log "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} missing; restoring it from ${sops_file#"${ENVS_ROOT}/"}"
+    if ! sops -d "$sops_file" | kubectl apply -f - >/dev/null; then
+      err "Could not restore ${ns}/${PROMETHEUS_EXPORT_SECRET} from ${sops_file#"${ENVS_ROOT}/"} (age key?); not generating a new one,"
+      err "which would cut off every reading cluster. Apply it (tools/sops/apply.sh ${ENV_NAME}) and re-run."
+      return 1
+    fi
+    json=$(kubectl -n "$ns" get secret "$PROMETHEUS_EXPORT_SECRET" -o json 2>/dev/null || true)
+  fi
+  state=$(printf '%s' "${json:-null}" | jq -r --arg u "$PROMETHEUS_EXPORT_USER" '
+    if . == null then "missing"
+    elif .type != "kubernetes.io/basic-auth" then "type \(.type)"
+    elif ((.data.username // "") | @base64d) != $u or (.data.password // "") == "" then "incomplete"
+    else "complete" end')
+  case "$state" in
+    complete)
+      info "✓ Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} holds the export credential (user ${PROMETHEUS_EXPORT_USER})"
+      if [[ ! -f "$sops_file" ]]; then
+        log "No SOPS copy of it yet; encrypting the cluster's Secret into ${sops_file#"${ENVS_ROOT}/"}"
+        printf '%s' "$json" | prometheus_export_secret_object | prometheus_export_store_secret false || \
+          warn "Could not keep a SOPS copy of ${ns}/${PROMETHEUS_EXPORT_SECRET}; the export works, but a rebuilt cluster would get a new password"
+      fi
+      return 0
+      ;;
+    "type "*)
+      err "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} has ${state}; Traefik's basicAuth needs kubernetes.io/basic-auth."
+      err "Delete it (kubectl -n ${ns} delete secret ${PROMETHEUS_EXPORT_SECRET}) and re-run; then re-link the reading clusters."
+      return 1
+      ;;
+    incomplete)
+      warn "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} is incomplete; generating a new password."
+      warn "Re-link every reading cluster afterwards (tools/k3s/grafana-remote-prometheus.sh)."
+      ;;
+    *) log "Generating the export credential (Secret ${ns}/${PROMETHEUS_EXPORT_SECRET}, user ${PROMETHEUS_EXPORT_USER})" ;;
+  esac
+  openssl rand -base64 48 | tr -d '\n=/+' | head -c 40 | \
+    jq -Rs --arg n "$PROMETHEUS_EXPORT_SECRET" --arg ns "$ns" --arg u "$PROMETHEUS_EXPORT_USER" \
+      '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/basic-auth",
+        metadata: {name: $n, namespace: $ns}, stringData: {username: $u, password: .}}' | \
+    prometheus_export_store_secret true
+}
+
+# Put the export up (property set) or take it down (unset; minio.sh's MINIO_ALLOWED_CIDRS
+# pattern). Taking it down keeps the Secret, so switching the export back on keeps the
+# credential the reading clusters hold. Best-effort: a failure warns and exposes nothing new.
+ensure_prometheus_export() {
+  local ns="$NAMESPACE_OBSERVABILITY"
+  if [[ -z "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+    kubectl -n "$ns" delete ingress prometheus-export --ignore-not-found >/dev/null 2>&1 || true
+    kubectl -n "$ns" delete middleware.traefik.io prometheus-export-allowlist prometheus-export-auth \
+      --ignore-not-found >/dev/null 2>&1 || true
+    return 0
+  fi
+  log "Exporting Prometheus at https://${PROMETHEUS_EXPORT_HOST}/api/v1/ for ${PROMETHEUS_EXPORT_ALLOWED_CIDRS} ..."
+  if ! prometheus_export_ensure_secret; then
+    warn "Prometheus export not set up: no usable credential. Nothing new is exposed."
+    return 0
+  fi
+  if ! prometheus_export_manifests | kubectl apply -f - >/dev/null; then
+    warn "Could not apply the export Ingress/Middlewares (Traefik CRDs missing?); see: kubectl -n ${ns} get ingress,middleware.traefik.io"
+    return 0
+  fi
+  info "✓ Prometheus export: https://${PROMETHEUS_EXPORT_HOST}/api/v1/ (basic auth, user ${PROMETHEUS_EXPORT_USER}; from ${PROMETHEUS_EXPORT_ALLOWED_CIDRS})"
+  info "  Link a reading cluster: tools/k3s/grafana-remote-prometheus.sh"
 }
 
 # --- Detect Tailscale IP ---
@@ -636,6 +1006,23 @@ ensure_dns_records() {
   else
     info "Wildcard DNS exists, skipping individual Grafana DNS record"
   fi
+
+  # The export host, the same way. The wildcard covers it only when it is one label under
+  # HOSTNAME (the default, prometheus-export.<HOSTNAME>).
+  if [[ -n "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+    local export_label="${PROMETHEUS_EXPORT_HOST%".${HOSTNAME:-}"}"
+    if [[ "$WILDCARD_EXISTS" == "true" && "$export_label" != "$PROMETHEUS_EXPORT_HOST" && "$export_label" != *.* ]]; then
+      info "Wildcard DNS exists, skipping individual DNS record for ${PROMETHEUS_EXPORT_HOST}"
+    else
+      log "Creating DNS record: $PROMETHEUS_EXPORT_HOST → $EXTERNAL_IP"
+      if provision::cloudflare_ensure_dns_record "$PROMETHEUS_EXPORT_HOST" "$EXTERNAL_IP"; then
+        info "✓ DNS record created/updated for $PROMETHEUS_EXPORT_HOST"
+      else
+        warn "Failed to create DNS record for $PROMETHEUS_EXPORT_HOST"
+        warn "You may need to create it manually in Cloudflare"
+      fi
+    fi
+  fi
 }
 
 # --- Register Dex client for Grafana ---
@@ -702,6 +1089,18 @@ fi
 helm repo update || warn "Some Helm repositories failed to update (non-fatal)"
 
 # Ensure DNS records
+# --export-only: the export of this Prometheus and nothing else, for a cluster where a full
+# run (three helm upgrades) is more than switching the export on or off should cost. The
+# host's DNS record is not made here: a wildcard covers the default host, otherwise run once
+# without the flag or create the record by hand.
+if [[ "$EXPORT_ONLY" == "true" ]]; then
+  if [[ "$RULES_ONLY" == "true" ]]; then
+    err "--export-only and --rules-only/--dry-run contradict each other"; exit 1
+  fi
+  ensure_prometheus_export
+  exit 0
+fi
+
 ensure_dns_records
 
 # Register Dex client for Grafana SSO
@@ -3476,6 +3875,12 @@ EOF
   fi
   rm -f "$node_cm_file"
 
+  # Query API for other clusters' Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS); --rules-only
+  # leaves the export as it is, like everything else outside the prometheus release.
+  if [[ "$RULES_ONLY" != "true" ]]; then
+    ensure_prometheus_export
+  fi
+
   info "✓ Prometheus installed successfully"
   info "  Endpoint: http://prometheus-server.${NAMESPACE_OBSERVABILITY}.svc.cluster.local"
   info "  Configured to scrape postgres-exporter from ${NAMESPACE_POSTGRES} namespace"
@@ -3563,6 +3968,31 @@ if [[ "$SKIP_GRAFANA" != "true" ]]; then
     warn "Postgres-UCE datasource omitted - the 'UCE - shops & activity' dashboard will have no datasource."
   fi
 
+  # Other clusters' Prometheus (GRAFANA_REMOTE_PROMETHEUS, grafana_remote_prometheus_blocks).
+  # Only the Secret's key names come back from the cluster; its values stay in the pipe to jq.
+  # Both blocks join the Postgres-UCE ones, so the document keeps one envValueFrom key; with
+  # no entry they stay as they were.
+  grafana_extra_datasources="$uce_pg_datasource_block"
+  grafana_env_value_from="$uce_pg_env_block"
+  if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
+    remote_prom_keys=$(kubectl -n "$NAMESPACE_OBSERVABILITY" get secret "$GRAFANA_REMOTE_PROMETHEUS_SECRET" -o json 2>/dev/null \
+      | jq -r '.data // {} | keys[]' 2>/dev/null || true)
+    if [[ -z "$remote_prom_keys" ]]; then
+      warn "Secret ${NAMESPACE_OBSERVABILITY}/${GRAFANA_REMOTE_PROMETHEUS_SECRET} is missing or empty; no remote Prometheus datasource this run."
+    fi
+    grafana_remote_prometheus_blocks <<<"$remote_prom_keys"
+    if [[ -n "$remote_prom_datasource_block" ]]; then
+      if [[ -n "$grafana_extra_datasources" ]]; then
+        grafana_extra_datasources+=$'\n'
+      fi
+      grafana_extra_datasources+="$remote_prom_datasource_block"
+      if [[ "$grafana_env_value_from" == "envValueFrom: {}" ]]; then
+        grafana_env_value_from="envValueFrom:"
+      fi
+      grafana_env_value_from+=$'\n'"${remote_prom_env_block}"
+    fi
+  fi
+
   cat > "$grafana_values" <<EOF
 adminPassword: ${GRAFANA_ADMIN_PASSWORD}
 
@@ -3570,7 +4000,7 @@ image:
   tag: "${GRAFANA_IMAGE_TAG}"
   sha: "${GRAFANA_IMAGE_SHA}"
 
-${uce_pg_env_block}
+${grafana_env_value_from}
 
 # Fix permission issues with local-path storage
 securityContext:
@@ -3606,7 +4036,7 @@ datasources:
         # assumes 15s, making rate-interval macro windows too small to span two
         # samples — every rate() panel silently renders empty at short ranges.
         timeInterval: 1m
-${uce_pg_datasource_block}
+${grafana_extra_datasources}
 dashboardProviders:
   dashboardproviders.yaml:
     apiVersion: 1
@@ -3808,7 +4238,9 @@ dashboards:
 
 EOF
 
-  # Add GitHub SSO configuration if Dex is available
+  # Add GitHub SSO configuration if Dex is available. The grafana.ini key exists only here, so
+  # what GRAFANA_FRAME_ANCESTORS asks of grafana.ini lands here too (grafana_ini_written).
+  grafana_ini_written=false
   if [[ "$SKIP_SSO" != "true" && -n "${DEX_CLIENT_SECRET_GRAFANA:-}" ]]; then
     # GitHub org for the role mapping. secrets.plain is only a local cache and is often
     # stale or missing (secrets.sops is the truth), and a missing org used to drop the
@@ -3856,7 +4288,40 @@ grafana.ini:
     role_attribute_strict: "false"
     allow_assign_grafana_admin: "true"
 EOF
-      
+      # Further grafana.ini sections go into this same block: a second grafana.ini key would
+      # make the document invalid (or silently replace this one). Nothing is appended when no
+      # property asks for it, so the values stay as they were.
+      grafana_ini_extra=""
+      if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+        grafana_ini_extra+="  security:
+    # GRAFANA_FRAME_ANCESTORS; the Pomerium route's CSP frame-ancestors limits who may frame it.
+    allow_embedding: \"true\"
+"
+      fi
+      if [[ "$GRAFANA_POMERIUM_JWT" == "true" ]]; then
+        # Pomerium's assertion: aud and iss are the route's host, groups as Dex gives them,
+        # so the role mapping is the generic_oauth one. auto_sign_up creates the user on the
+        # first request, matched to an existing one by email.
+        grafana_ini_extra+="  auth.jwt:
+    # GRAFANA_POMERIUM_JWT=true: sign in from the assertion Pomerium adds to every request.
+    enabled: \"true\"
+    header_name: X-Pomerium-Jwt-Assertion
+    email_claim: email
+    username_claim: email
+    jwk_set_url: https://${AUTH_HOST}/.well-known/pomerium/jwks.json
+    expect_claims: '{\"aud\": \"${GRAFANA_HOST}\"}'
+    auto_sign_up: \"true\"
+    role_attribute_path: \"contains(groups[*], '${github_org}:admins') && 'Admin' || contains(groups[*], '${github_org}') && 'Editor' || 'Viewer'\"
+    role_attribute_strict: \"false\"
+    allow_assign_grafana_admin: \"true\"
+"
+        info "Grafana signs users in from Pomerium's JWT (keys: https://${AUTH_HOST}/.well-known/pomerium/jwks.json, aud ${GRAFANA_HOST})"
+      fi
+      if [[ -n "$grafana_ini_extra" ]]; then
+        printf '%s' "$grafana_ini_extra" >> "$grafana_values"
+      fi
+      grafana_ini_written=true
+
       info "✓ GitHub SSO configured for Grafana"
       info "  Organization: ${github_org}"
       info "  Dex issuer: https://${DEX_HOST}"
@@ -3864,7 +4329,17 @@ EOF
       warn "GitHub org or DEX_HOST not configured. Skipping SSO setup."
     fi
   fi
-  
+  if [[ "$grafana_ini_written" != "true" && -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+    warn "GRAFANA_FRAME_ANCESTORS is set, but security.allow_embedding is NOT applied: grafana.ini is only"
+    warn "  written with the Dex SSO block, which this run skipped (--skip-sso, no Dex client, or no GitHub org)."
+    warn "  The Pomerium route still carries the CSP frame-ancestors header, but Grafana keeps sending"
+    warn "  X-Frame-Options: deny (browsers that honour the CSP ignore it). Fix SSO and re-run."
+  fi
+  if [[ "$grafana_ini_written" != "true" && "$GRAFANA_POMERIUM_JWT" == "true" ]]; then
+    warn "GRAFANA_POMERIUM_JWT=true, but auth.jwt is NOT applied: grafana.ini is only written with the Dex"
+    warn "  SSO block (and needs its GitHub org for the roles), which this run skipped. Fix SSO and re-run."
+  fi
+
   # With Pomerium in the sso namespace the UI goes through it (ensure_grafana_pomerium, after
   # the install) and the chart gets no ingress; without it the chart's ingress exposes Grafana.
   GRAFANA_VIA_POMERIUM=false
@@ -3888,6 +4363,10 @@ ingress:
         - ${GRAFANA_HOST}
 EOF
     info "Grafana will be exposed at: https://${GRAFANA_HOST}/"
+  fi
+  if [[ "$GRAFANA_VIA_POMERIUM" != "true" && "$GRAFANA_POMERIUM_JWT" == "true" && "$grafana_ini_written" == "true" ]]; then
+    warn "GRAFANA_POMERIUM_JWT=true, but no Pomerium fronts Grafana here: no request carries the assertion,"
+    warn "  so auth.jwt has no effect (sign-in stays Dex SSO)."
   fi
   
   # The values above are rebuilt from scratch on every run, so anything this run could

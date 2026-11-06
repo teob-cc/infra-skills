@@ -236,6 +236,9 @@ come from `envs/shared/alerts/` and `envs/<env>/alerts/`; `POSTGRES_SIZE_ALERT_E
 password stays the one in `secret/grafana` across runs (set `GRAFANA_ADMIN_PASSWORD` to choose it);
 `GRAFANA_MCP=true` also ensures the Viewer service account and token of the read-only Grafana MCP
 server (docs/GITOPS.md, "Read-only access for agents").
+One env's Grafana can also show other envs' metrics and be framed by named origins
+(`PROMETHEUS_EXPORT_ALLOWED_CIDRS`, `GRAFANA_REMOTE_PROMETHEUS`, `GRAFANA_FRAME_ANCESTORS`):
+docs/GRAFANA-ACROSS-CLUSTERS.md has the order of runs.
 
 ### Step 8 — Databases and VPN (optional)
 
