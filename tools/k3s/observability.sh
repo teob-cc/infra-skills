@@ -1776,7 +1776,7 @@ serverFiles:
           # read/write ticks jumped by millions of seconds, up and back down, ~200 times a day
           # (writes_completed stayed sane), and every jump read as "writes take 60s". A window in
           # which the time counter went backwards (resets) or grew faster than 1000 requests in
-          # flight could (rate > 1000 s/s) measures nothing, so the two `unless` arms drop it.
+          # flight could (rate > 1000 s/s) measures nothing, so the two \`unless\` arms drop it.
           # Backtested 7 days on that node: 958 alerting minutes before, 1 after.
           - alert: NodeDiskReadLatencyHigh
             expr: |
