@@ -26,7 +26,7 @@ before.
 | `PROMETHEUS_EXPORT_HOST` | exporting env | The export host. Default `prometheus-export.<HOSTNAME>`, which a `*.<HOSTNAME>` wildcard record covers. |
 | `GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ..."` | reading env | One Prometheus datasource per entry, named `Prometheus-<name>` with uid `Prometheus-<name>`, proxy access, basic auth, `timeInterval: 1m`, not the default datasource. `<name>` is lower-case letters, digits and dashes, at most 29 characters. `<url>` is the export's base URL, e.g. `https://prometheus-export.prod.example.com`. |
 | `GRAFANA_FRAME_ANCESTORS="https://portal.example.com ..."` | reading env | Origins (`scheme://host[:port]`, a leading `*.` allowed) that may show Grafana in an iframe. Sets `security.allow_embedding` in `grafana.ini`, and the Pomerium route of the Grafana host answers `Content-Security-Policy: frame-ancestors 'self' <origins>`. |
-| `GRAFANA_POMERIUM_JWT=true` | reading env | Grafana signs users in from the JWT Pomerium adds to every request, instead of asking them to sign in again. Off by default; read its section before turning it on. |
+| `GRAFANA_POMERIUM_JWT=true` | reading env | Grafana signs users in from the JWT Pomerium adds to every request, instead of asking them to sign in again. Off by default; its section says what changes for people (the role then follows `groups` on every request). |
 
 Malformed values (a CIDR, a name, a URL or an origin that does not parse) fail the run before
 anything changes.
@@ -115,14 +115,29 @@ the user in from it:
 - `auto_sign_up: true`, and the same `role_attribute_path` on `groups` (plus
   `allow_assign_grafana_admin`) as the Dex `generic_oauth` block.
 
-This is what makes a framed Grafana usable without a second sign-in inside the iframe.
+This is what makes a framed Grafana usable. Without it a reader with no Grafana session gets
+Grafana's login page inside the iframe, and a sign-in through GitHub cannot complete there
+(GitHub refuses to be framed). A Grafana session also lapses after 7 idle days by default.
 
-**A wrong setting locks the UI.** Every request through the route carries the header, and Grafana
-rejects a request whose token it cannot verify (wrong `AUTH_HOST`, unreachable JWKS, audience
-mismatch) instead of falling back to its login page. The UI behind the route then stays locked
-until the property is removed and `observability.sh <env>` re-run. In-cluster callers that use
-the Service (`provision::grafana_api`, mcp-grafana) do not go through Pomerium and are not
-affected.
+**What changes for people.** Through the route a reader is always the person Pomerium names:
+
+- a valid assertion wins over a Grafana session cookie, so the local `admin` account cannot be
+  used through the route, and "Sign out" in Grafana leads straight back in;
+- the org role is set from `groups` on every request, so a role given by hand in Grafana lasts
+  until that person's next request. Roles belong in the GitHub teams the mapping names;
+- a user that exists already (made by the Dex sign-in) is matched by e-mail and keeps its id.
+
+In-cluster callers that use the Service (`provision::grafana_api`, mcp-grafana) do not go
+through Pomerium, carry no assertion, and are not affected.
+
+**What a wrong setting does.** Grafana tries the assertion first. When it cannot verify one
+(wrong `AUTH_HOST`, unreachable key set, audience mismatch) it falls back to its other sign-in
+methods: a reader with a Grafana session stays in, and anyone else gets the login page, as
+before the setting. Nobody is locked out; the setting just has no effect, and an iframe shows
+the login page again. Grafana's log names the reason on every refused request
+(`client=auth.client.jwt error="[jwt.invalid] failed to verify JWT: ..."`). Checked on Grafana
+12.4 with tokens shaped like Pomerium's: wrong audience, expired, wrong key, unknown key id.
+A token without an `email` claim is refused the same way (`jwt.missing_claim`).
 
 ## Undo
 
