@@ -45,6 +45,11 @@ set -euo pipefail
 #                        observability/prometheus-export, SOPS copy in the envs repo).
 #                        Unset = no export; a run removes the Ingress and middlewares.
 #   PROMETHEUS_EXPORT_HOST  default prometheus-export.<HOSTNAME>
+#   GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ..."  One Grafana datasource Prometheus-<name>
+#                        (uid the same) per entry, reading another cluster's export with
+#                        the keys <name>-username/<name>-password of Secret
+#                        observability/grafana-remote-prometheus (grafana-remote-prometheus.sh
+#                        fills it); an entry whose keys are missing is left out with a warning
 #                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
@@ -297,6 +302,35 @@ if [[ -n "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
   fi
 fi
 
+# --- Remote Prometheus datasources: this Grafana reads other clusters' exports ---
+# GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ...", e.g. "prod=https://prometheus-export.prod.example.com".
+# <name> becomes the datasource name and uid Prometheus-<name> (a uid is at most 40 characters)
+# and the key prefix in the Secret, so it is lower-case letters, digits and dashes.
+GRAFANA_REMOTE_PROMETHEUS="${GRAFANA_REMOTE_PROMETHEUS:-}"
+GRAFANA_REMOTE_PROMETHEUS_SECRET="grafana-remote-prometheus"
+if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
+  remote_prom_seen=" "
+  remote_prom_url_re='^https?://[^[:space:]"$`\\]+$'
+  for remote_prom_pair in $GRAFANA_REMOTE_PROMETHEUS; do
+    remote_prom_name="${remote_prom_pair%%=*}"
+    remote_prom_url="${remote_prom_pair#*=}"
+    if [[ "$remote_prom_pair" != *=* ]] || ! [[ "$remote_prom_name" =~ ^[a-z0-9]([a-z0-9-]{0,27}[a-z0-9])?$ ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_pair}' is not <name>=<url> with a name of lower-case letters, digits and dashes (at most 29)"
+      exit 1
+    fi
+    if ! [[ "$remote_prom_url" =~ $remote_prom_url_re ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: the URL of '${remote_prom_name}' is not an http(s) URL without quotes or \$"
+      exit 1
+    fi
+    [[ "$remote_prom_url" == https://* ]] || warn "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_name}' is plain http; its password would cross the network in clear"
+    if [[ "$remote_prom_seen" == *" ${remote_prom_name} "* ]]; then
+      err "GRAFANA_REMOTE_PROMETHEUS: '${remote_prom_name}' appears twice"; exit 1
+    fi
+    remote_prom_seen+="${remote_prom_name} "
+  done
+  unset remote_prom_seen remote_prom_url_re remote_prom_pair remote_prom_name remote_prom_url
+fi
+
 # --- StoreBack read-only Postgres datasource (powers the "UCE - shops & activity" dashboard) ---
 # DB + role were renamed uce -> storeback in 2026-07; these default to the post-rename names.
 UCE_PG_DATABASE="${UCE_PG_DATABASE:-storeback}"
@@ -517,9 +551,64 @@ grafana_values_guard() {
   fi
   err "This run would remove from the live Grafana release:"
   printf '%s\n' "$lost" | sed 's/^/  - /' >&2
-  err "Usual causes: --skip-sso, the Dex client step failed, or the Postgres-UCE role check failed."
+  err "Usual causes: --skip-sso, the Dex client step failed, the Postgres-UCE role check failed, or"
+  err "Secret ${GRAFANA_REMOTE_PROMETHEUS_SECRET} lacks the keys of a GRAFANA_REMOTE_PROMETHEUS entry."
   err "Fix the cause, or set ALLOW_GRAFANA_REGRESSION=true to accept the loss. Nothing was changed in Grafana."
   exit 1
+}
+
+# --- Datasources for other clusters' Prometheus (GRAFANA_REMOTE_PROMETHEUS) ---
+#
+# The Postgres-UCE pattern: the datasource YAML holds environment variables, never the
+# credential, and the Grafana pod gets them from Secret grafana-remote-prometheus
+# (envValueFrom). An entry is rendered only when its two keys exist, so no datasource is ever
+# provisioned with a password that would not expand. The secretKeyRefs are optional: should
+# the keys go later, the pod still starts and that one datasource fails, not the whole
+# Grafana. Reads the Secret's key names, one per line, on stdin (never its values) and sets
+# remote_prom_datasource_block and remote_prom_env_block (envValueFrom entries).
+grafana_remote_prometheus_blocks() {
+  local keys pair name url var secret="$GRAFANA_REMOTE_PROMETHEUS_SECRET"
+  keys=$(cat)
+  remote_prom_datasource_block=""
+  remote_prom_env_block=""
+  for pair in $GRAFANA_REMOTE_PROMETHEUS; do
+    name="${pair%%=*}"
+    url="${pair#*=}"
+    if ! grep -qxF -- "${name}-username" <<<"$keys" || ! grep -qxF -- "${name}-password" <<<"$keys"; then
+      warn "Datasource Prometheus-${name} omitted: Secret ${NAMESPACE_OBSERVABILITY}/${secret} has no ${name}-username and ${name}-password"
+      warn "  (tools/k3s/grafana-remote-prometheus.sh puts them there, then re-run this script)"
+      continue
+    fi
+    var="GRAFANA_REMOTE_PROM_$(printf '%s' "$name" | tr 'a-z-' 'A-Z_')"
+    remote_prom_datasource_block+="    - name: Prometheus-${name}
+      uid: Prometheus-${name}
+      type: prometheus
+      access: proxy
+      url: \"${url}\"
+      isDefault: false
+      basicAuth: true
+      basicAuthUser: \"\$${var}_USERNAME\"
+      secureJsonData:
+        basicAuthPassword: \"\$${var}_PASSWORD\"
+      jsonData:
+        # Same as the local Prometheus datasource: the exporting Prometheus scrapes every 1m.
+        timeInterval: 1m
+"
+    remote_prom_env_block+="  ${var}_USERNAME:
+    secretKeyRef:
+      name: ${secret}
+      key: ${name}-username
+      optional: true
+  ${var}_PASSWORD:
+    secretKeyRef:
+      name: ${secret}
+      key: ${name}-password
+      optional: true
+"
+    info "Datasource Prometheus-${name} -> ${url}"
+  done
+  remote_prom_datasource_block="${remote_prom_datasource_block%$'\n'}"
+  remote_prom_env_block="${remote_prom_env_block%$'\n'}"
 }
 
 # --- Front Grafana with Pomerium ---
@@ -3802,6 +3891,31 @@ if [[ "$SKIP_GRAFANA" != "true" ]]; then
     warn "Postgres-UCE datasource omitted - the 'UCE - shops & activity' dashboard will have no datasource."
   fi
 
+  # Other clusters' Prometheus (GRAFANA_REMOTE_PROMETHEUS, grafana_remote_prometheus_blocks).
+  # Only the Secret's key names come back from the cluster; its values stay in the pipe to jq.
+  # Both blocks join the Postgres-UCE ones, so the document keeps one envValueFrom key; with
+  # no entry they stay as they were.
+  grafana_extra_datasources="$uce_pg_datasource_block"
+  grafana_env_value_from="$uce_pg_env_block"
+  if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
+    remote_prom_keys=$(kubectl -n "$NAMESPACE_OBSERVABILITY" get secret "$GRAFANA_REMOTE_PROMETHEUS_SECRET" -o json 2>/dev/null \
+      | jq -r '.data // {} | keys[]' 2>/dev/null || true)
+    if [[ -z "$remote_prom_keys" ]]; then
+      warn "Secret ${NAMESPACE_OBSERVABILITY}/${GRAFANA_REMOTE_PROMETHEUS_SECRET} is missing or empty; no remote Prometheus datasource this run."
+    fi
+    grafana_remote_prometheus_blocks <<<"$remote_prom_keys"
+    if [[ -n "$remote_prom_datasource_block" ]]; then
+      if [[ -n "$grafana_extra_datasources" ]]; then
+        grafana_extra_datasources+=$'\n'
+      fi
+      grafana_extra_datasources+="$remote_prom_datasource_block"
+      if [[ "$grafana_env_value_from" == "envValueFrom: {}" ]]; then
+        grafana_env_value_from="envValueFrom:"
+      fi
+      grafana_env_value_from+=$'\n'"${remote_prom_env_block}"
+    fi
+  fi
+
   cat > "$grafana_values" <<EOF
 adminPassword: ${GRAFANA_ADMIN_PASSWORD}
 
@@ -3809,7 +3923,7 @@ image:
   tag: "${GRAFANA_IMAGE_TAG}"
   sha: "${GRAFANA_IMAGE_SHA}"
 
-${uce_pg_env_block}
+${grafana_env_value_from}
 
 # Fix permission issues with local-path storage
 securityContext:
@@ -3845,7 +3959,7 @@ datasources:
         # assumes 15s, making rate-interval macro windows too small to span two
         # samples — every rate() panel silently renders empty at short ranges.
         timeInterval: 1m
-${uce_pg_datasource_block}
+${grafana_extra_datasources}
 dashboardProviders:
   dashboardproviders.yaml:
     apiVersion: 1
