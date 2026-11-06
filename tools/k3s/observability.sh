@@ -54,6 +54,11 @@ set -euo pipefail
 #                        in an iframe: grafana.ini security.allow_embedding, and the Pomerium
 #                        route answers Content-Security-Policy: frame-ancestors 'self' <origins>.
 #                        allow_embedding needs the SSO block of grafana.ini (a warning says so)
+#   GRAFANA_POMERIUM_JWT=true  Sign users in from the JWT Pomerium passes on every request
+#                        (grafana.ini auth.jwt, keys from https://<AUTH_HOST>/.well-known/pomerium/jwks.json,
+#                        audience pinned to GRAFANA_HOST, the same role mapping as Dex SSO).
+#                        Default false. A wrong setting locks the UI behind the route until
+#                        the property is removed and the script re-run
 #                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
@@ -331,6 +336,24 @@ if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
   done
   grafana_frame_csp="frame-ancestors 'self'${grafana_frame_csp}"
   unset frame_origin
+fi
+
+# --- Sign-in from Pomerium's JWT (GRAFANA_POMERIUM_JWT=true, off by default) ---
+# Pomerium passes a signed assertion on every request of the route (pass_identity_headers):
+# header X-Pomerium-Jwt-Assertion, aud and iss the route's host, the user's email and groups.
+# With this on, Grafana's auth.jwt signs the user in from it (no Grafana login step), with the
+# signing keys from the authenticate service: AUTH_HOST, the same default as identity.sh.
+# Every request through the route carries the header and Grafana rejects one it cannot
+# verify, so a wrong setting locks the UI until the property is removed and the script re-run.
+GRAFANA_POMERIUM_JWT="${GRAFANA_POMERIUM_JWT:-false}"
+if [[ "$GRAFANA_POMERIUM_JWT" != "true" && "$GRAFANA_POMERIUM_JWT" != "false" ]]; then
+  err "GRAFANA_POMERIUM_JWT='${GRAFANA_POMERIUM_JWT}' must be true or false"; exit 1
+fi
+if [[ -z "${AUTH_HOST:-}" && -n "${HOSTNAME:-}" ]]; then
+  AUTH_HOST="auth.${HOSTNAME}"
+fi
+if [[ "$GRAFANA_POMERIUM_JWT" == "true" && -z "${AUTH_HOST:-}" ]]; then
+  err "GRAFANA_POMERIUM_JWT=true needs the Pomerium authenticate host: set AUTH_HOST or HOSTNAME"; exit 1
 fi
 if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
   remote_prom_seen=" "
@@ -4257,6 +4280,25 @@ EOF
     allow_embedding: \"true\"
 "
       fi
+      if [[ "$GRAFANA_POMERIUM_JWT" == "true" ]]; then
+        # Pomerium's assertion: aud and iss are the route's host, groups as Dex gives them,
+        # so the role mapping is the generic_oauth one. auto_sign_up creates the user on the
+        # first request, matched to an existing one by email.
+        grafana_ini_extra+="  auth.jwt:
+    # GRAFANA_POMERIUM_JWT=true: sign in from the assertion Pomerium adds to every request.
+    enabled: \"true\"
+    header_name: X-Pomerium-Jwt-Assertion
+    email_claim: email
+    username_claim: email
+    jwk_set_url: https://${AUTH_HOST}/.well-known/pomerium/jwks.json
+    expect_claims: '{\"aud\": \"${GRAFANA_HOST}\"}'
+    auto_sign_up: \"true\"
+    role_attribute_path: \"contains(groups[*], '${github_org}:admins') && 'Admin' || contains(groups[*], '${github_org}') && 'Editor' || 'Viewer'\"
+    role_attribute_strict: \"false\"
+    allow_assign_grafana_admin: \"true\"
+"
+        info "Grafana signs users in from Pomerium's JWT (keys: https://${AUTH_HOST}/.well-known/pomerium/jwks.json, aud ${GRAFANA_HOST})"
+      fi
       if [[ -n "$grafana_ini_extra" ]]; then
         printf '%s' "$grafana_ini_extra" >> "$grafana_values"
       fi
@@ -4274,6 +4316,10 @@ EOF
     warn "  written with the Dex SSO block, which this run skipped (--skip-sso, no Dex client, or no GitHub org)."
     warn "  The Pomerium route still carries the CSP frame-ancestors header, but Grafana keeps sending"
     warn "  X-Frame-Options: deny (browsers that honour the CSP ignore it). Fix SSO and re-run."
+  fi
+  if [[ "$grafana_ini_written" != "true" && "$GRAFANA_POMERIUM_JWT" == "true" ]]; then
+    warn "GRAFANA_POMERIUM_JWT=true, but auth.jwt is NOT applied: grafana.ini is only written with the Dex"
+    warn "  SSO block (and needs its GitHub org for the roles), which this run skipped. Fix SSO and re-run."
   fi
 
   # With Pomerium in the sso namespace the UI goes through it (ensure_grafana_pomerium, after
@@ -4299,6 +4345,10 @@ ingress:
         - ${GRAFANA_HOST}
 EOF
     info "Grafana will be exposed at: https://${GRAFANA_HOST}/"
+  fi
+  if [[ "$GRAFANA_VIA_POMERIUM" != "true" && "$GRAFANA_POMERIUM_JWT" == "true" && "$grafana_ini_written" == "true" ]]; then
+    warn "GRAFANA_POMERIUM_JWT=true, but no Pomerium fronts Grafana here: no request carries the assertion,"
+    warn "  so auth.jwt has no effect (sign-in stays Dex SSO)."
   fi
   
   # The values above are rebuilt from scratch on every run, so anything this run could
