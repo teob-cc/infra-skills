@@ -57,9 +57,12 @@ anything changes.
 1. **Exporting cluster.** Set `PROMETHEUS_EXPORT_ALLOWED_CIDRS` to the address the reading
    cluster's traffic leaves from (its node's public IP, or its NAT address), then
    ```bash
-   tools/k3s/observability.sh <exporting-env>
+   tools/k3s/observability.sh <exporting-env> --export-only
    ```
-   Commit `secrets.sops/prometheus-export.yaml` in that env's envs repo.
+   `--export-only` puts up the Secret, the Middlewares and the Ingress and upgrades no
+   release; a full run does the same as part of the Prometheus step. It makes no DNS record:
+   a wildcard record covers the default host, otherwise run once without the flag or create
+   the record by hand. Commit `secrets.sops/prometheus-export.yaml` in that env's envs repo.
 2. **Link.** Copy the credential into the reading cluster. Both sides are given explicitly, so
    the two envs may live in different envs repos:
    ```bash

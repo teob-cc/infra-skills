@@ -26,6 +26,9 @@ set -euo pipefail
 #                        Alertmanager config) with the full rendered values
 #   --dry-run            With --rules-only semantics: render server-side, print the
 #                        ConfigMap diff against the live release, change nothing
+#   --export-only        Only put the Prometheus export up or down
+#                        (PROMETHEUS_EXPORT_ALLOWED_CIDRS): its Secret, Middlewares and
+#                        Ingress. No release is upgraded and no DNS record is made
 #
 # env.properties (optional):
 #   GRAFANA_ADMIN_PASSWORD  Grafana admin password; unset = keep the one in
@@ -86,6 +89,7 @@ Options:
   --sync-dashboards    Only upsert dashboards into Grafana
   --rules-only         Only upgrade the prometheus release (rules, scrape, Alertmanager)
   --dry-run            Like --rules-only, but only print the ConfigMap diff
+  --export-only        Only put the Prometheus export up or down; upgrades nothing
 
 Available environments:
 EOF
@@ -116,6 +120,7 @@ SKIP_SSO=false
 SYNC_DASHBOARDS=false
 RULES_ONLY=false
 DRY_RUN=false
+EXPORT_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -128,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     --sync-dashboards) SYNC_DASHBOARDS=true; shift ;;
     --rules-only) RULES_ONLY=true; shift ;;
     --dry-run) DRY_RUN=true; RULES_ONLY=true; shift ;;
+    --export-only) EXPORT_ONLY=true; shift ;;
     *) echo "Unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -1083,6 +1089,18 @@ fi
 helm repo update || warn "Some Helm repositories failed to update (non-fatal)"
 
 # Ensure DNS records
+# --export-only: the export of this Prometheus and nothing else, for a cluster where a full
+# run (three helm upgrades) is more than switching the export on or off should cost. The
+# host's DNS record is not made here: a wildcard covers the default host, otherwise run once
+# without the flag or create the record by hand.
+if [[ "$EXPORT_ONLY" == "true" ]]; then
+  if [[ "$RULES_ONLY" == "true" ]]; then
+    err "--export-only and --rules-only/--dry-run contradict each other"; exit 1
+  fi
+  ensure_prometheus_export
+  exit 0
+fi
+
 ensure_dns_records
 
 # Register Dex client for Grafana SSO
