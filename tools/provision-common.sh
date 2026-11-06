@@ -109,6 +109,23 @@ provision::default_age_key_file() {
   fi
 }
 
+# Point SOPS at that key file when the caller named no key of their own.
+#
+# Bare `sops` finds ~/.config/sops/age/keys.txt by itself on Linux only; on macOS its
+# default is ~/Library/Application Support/sops/age/keys.txt. tools/sops/decrypt.sh sets
+# SOPS_AGE_KEY_FILE for itself, but a provisioning script that calls `sops -d` directly
+# (restoring a Secret from its SOPS copy, merging into one) could not decrypt on a Mac
+# whose key sits where this repo's README puts it. Runs when this file is sourced, so
+# every such script gets the same default; a caller's own SOPS_AGE_KEY_FILE or
+# SOPS_AGE_KEY is left alone.
+provision::use_default_age_key() {
+  local default="${HOME:-}/.config/sops/age/keys.txt"
+  if [[ -z "${SOPS_AGE_KEY_FILE:-}" && -z "${SOPS_AGE_KEY:-}" && -f "$default" ]]; then
+    export SOPS_AGE_KEY_FILE="$default"
+  fi
+}
+provision::use_default_age_key
+
 # Print age public recipients derived from a keys.txt (non-sensitive)
 # If multiple private keys are present, prints all corresponding recipients.
 provision::age_list_public_recipients() {
