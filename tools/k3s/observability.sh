@@ -38,6 +38,14 @@ set -euo pipefail
 #   LOKI_RETENTION_PERIOD  e.g. 2160h; enables compactor retention. Default: keep forever
 #   GITHUB_ORG           Org for Grafana's role mapping; default: secrets.plain, then the
 #                        live Dex config
+#   PROMETHEUS_EXPORT_ALLOWED_CIDRS="203.0.113.0/24 198.51.100.7/32"
+#                        Serve this Prometheus's query API (path prefix /api/v1/ only) at
+#                        PROMETHEUS_EXPORT_HOST for another cluster's Grafana: Traefik
+#                        ipAllowList of these ranges plus basic auth (Secret
+#                        observability/prometheus-export, SOPS copy in the envs repo).
+#                        Unset = no export; a run removes the Ingress and middlewares.
+#   PROMETHEUS_EXPORT_HOST  default prometheus-export.<HOSTNAME>
+#                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
 #   ALLOW_GRAFANA_REGRESSION=true  let a run drop SSO, root_url or a datasource that the
@@ -263,6 +271,31 @@ LOKI_RETENTION_PERIOD="${LOKI_RETENTION_PERIOD:-}"
 # Ingress configuration
 INGRESS_CLASS="${INGRESS_CLASS:-traefik}"
 CLUSTER_ISSUER="${CLUSTER_ISSUER:-letsencrypt-prod}"
+
+# --- Prometheus export: another cluster's Grafana reads this Prometheus ---
+# PROMETHEUS_EXPORT_ALLOWED_CIDRS switches it on (ensure_prometheus_export). Unset, the
+# default, exports nothing, and a run takes down what an earlier run put up. Checked here,
+# before anything changes, so a typo fails the run instead of opening the endpoint wider.
+PROMETHEUS_EXPORT_ALLOWED_CIDRS="${PROMETHEUS_EXPORT_ALLOWED_CIDRS:-}"
+PROMETHEUS_EXPORT_SECRET="prometheus-export"
+PROMETHEUS_EXPORT_USER="grafana"
+if [[ -z "${PROMETHEUS_EXPORT_HOST:-}" && -n "${HOSTNAME:-}" ]]; then
+  PROMETHEUS_EXPORT_HOST="prometheus-export.${HOSTNAME}"
+fi
+if [[ -n "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+  for cidr in ${PROMETHEUS_EXPORT_ALLOWED_CIDRS//,/ }; do
+    if ! [[ "$cidr" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]]; then
+      err "PROMETHEUS_EXPORT_ALLOWED_CIDRS: '${cidr}' is not an IP or CIDR"; exit 1
+    fi
+    if [[ "$cidr" == "0.0.0.0/0" || "$cidr" == "::/0" ]]; then
+      warn "PROMETHEUS_EXPORT_ALLOWED_CIDRS contains ${cidr}: the export is open to the Internet, basic auth alone guards it"
+    fi
+  done
+  if ! [[ "${PROMETHEUS_EXPORT_HOST:-}" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+    err "PROMETHEUS_EXPORT_ALLOWED_CIDRS is set, but PROMETHEUS_EXPORT_HOST ('${PROMETHEUS_EXPORT_HOST:-}') is not a host name; set it or HOSTNAME"
+    exit 1
+  fi
+fi
 
 # --- StoreBack read-only Postgres datasource (powers the "UCE - shops & activity" dashboard) ---
 # DB + role were renamed uce -> storeback in 2026-07; these default to the post-rename names.
@@ -534,6 +567,189 @@ YAML
   fi
 }
 
+# --- Export this Prometheus to another cluster's Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS) ---
+#
+# The reading cluster's Grafana queries https://${PROMETHEUS_EXPORT_HOST}/api/v1/... with basic
+# auth (docs/GRAFANA-ACROSS-CLUSTERS.md). Next to prometheus-server, in the observability
+# namespace:
+#   * Secret prometheus-export, type kubernetes.io/basic-auth, keys `username` (grafana) and
+#     `password`: generated once, SOPS-encrypted into envs/<env>/secrets.sops/, restored from
+#     there when the cluster has lost it. Traefik reads a Secret of this type by its username
+#     and password keys. (An Opaque Secret with an htpasswd `users` key would have to hold that
+#     key alone: Traefik refuses an Opaque basicAuth Secret with more than one key.)
+#   * Middlewares prometheus-export-allowlist (ipAllowList of the CIDRs, nothing else) and
+#     prometheus-export-auth (basicAuth on that Secret).
+#   * Ingress prometheus-export: only the path prefix /api/v1/ of the host reaches Prometheus.
+# tools/k3s/grafana-remote-prometheus.sh copies the credential to the reading cluster.
+
+# Print the two Middlewares and the Ingress of the export (rendering only, no cluster access).
+prometheus_export_manifests() {
+  local ns="$NAMESPACE_OBSERVABILITY" ranges="" cidr
+  for cidr in ${PROMETHEUS_EXPORT_ALLOWED_CIDRS//,/ }; do
+    ranges+="      - \"${cidr}\""$'\n'
+  done
+  cat <<YAML
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: prometheus-export-allowlist
+  namespace: ${ns}
+spec:
+  ipAllowList:
+    sourceRange:
+${ranges%$'\n'}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: prometheus-export-auth
+  namespace: ${ns}
+spec:
+  basicAuth:
+    secret: ${PROMETHEUS_EXPORT_SECRET}
+    removeHeader: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-export
+  namespace: ${ns}
+  annotations:
+    cert-manager.io/cluster-issuer: ${CLUSTER_ISSUER}
+    cert-manager.io/common-name: ${PROMETHEUS_EXPORT_HOST}
+    traefik.ingress.kubernetes.io/router.middlewares: ${ns}-prometheus-export-allowlist@kubernetescrd,${ns}-prometheus-export-auth@kubernetescrd
+spec:
+  ingressClassName: ${INGRESS_CLASS}
+  rules:
+    - host: ${PROMETHEUS_EXPORT_HOST}
+      http:
+        paths:
+          - backend:
+              service:
+                name: prometheus-server
+                port:
+                  number: 80
+            path: /api/v1/
+            pathType: Prefix
+  tls:
+    - hosts:
+        - ${PROMETHEUS_EXPORT_HOST}
+      secretName: prometheus-export-tls
+YAML
+}
+
+# Normalise a Secret (JSON on stdin) to the export Secret object: name, namespace, type and
+# the two keys, nothing else of the live object.
+prometheus_export_secret_object() {
+  jq --arg n "$PROMETHEUS_EXPORT_SECRET" --arg ns "$NAMESPACE_OBSERVABILITY" \
+    '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/basic-auth",
+      metadata: {name: $n, namespace: $ns},
+      data: {username: .data.username, password: .data.password}}'
+}
+
+# Write the export Secret (JSON on stdin) to secrets.plain, apply it when asked, encrypt it into
+# secrets.sops and remove the plaintext; the same steps as grafana-mcp-token.sh's store_token.
+# A subshell with its own EXIT trap removes the plaintext whatever happens. Every step is checked
+# by hand: callers run this under `||`, where set -e does not stop anything.
+prometheus_export_store_secret() { # <apply: true|false>
+  local apply="$1" file="${PROMETHEUS_EXPORT_SECRET}.yaml"
+  local plain="${ENVS_ROOT}/${ENV_NAME}/secrets.plain/${file}"
+  local sops_file="${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${file}"
+  provision::assert_plaintext_ignored "$plain" || return 1
+  (
+    trap 'rm -f "$plain"' EXIT
+    umask 077
+    mkdir -p "$(dirname "$plain")" || exit 1
+    yq -p json -o yaml '.' - > "$plain" || exit 1
+    [[ "$(yq '.kind' "$plain")" == "Secret" ]] || { err "No Secret object to store"; exit 1; }
+    if [[ "$apply" == "true" ]]; then
+      kubectl apply -f "$plain" >/dev/null || { err "Could not apply the Secret ${NAMESPACE_OBSERVABILITY}/${PROMETHEUS_EXPORT_SECRET}"; exit 1; }
+      info "✓ Secret ${NAMESPACE_OBSERVABILITY}/${PROMETHEUS_EXPORT_SECRET} applied"
+    fi
+    "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$file" >/dev/null || { err "tools/sops/encrypt.sh failed on ${file}"; exit 1; }
+    if [[ "$(yq '[(.data // {}), (.stringData // {})] | map(to_entries) | flatten
+                 | map(select((.value | tostring | test("^ENC\\[")) | not)) | length' "$sops_file")" != "0" ]] ||
+       [[ "$(yq '(.data.password // .stringData.password // "") | test("^ENC\\[")' "$sops_file")" != "true" ]]; then
+      err "The password did not come out encrypted in ${sops_file}"; exit 1
+    fi
+    info "✓ Encrypted to ${sops_file#"${ENVS_ROOT}/"} - commit it in the envs repo"
+  )
+}
+
+# The export credential: reuse the cluster's Secret, restore it from the SOPS copy, or generate
+# it (first run, or an incomplete Secret). The password never leaves pipes: it is not printed,
+# not an argument, and the only file it touches is the git-ignored plaintext the store step
+# removes again.
+prometheus_export_ensure_secret() {
+  local ns="$NAMESPACE_OBSERVABILITY" json state
+  local sops_file="${ENVS_ROOT}/${ENV_NAME}/secrets.sops/${PROMETHEUS_EXPORT_SECRET}.yaml"
+  json=$(kubectl -n "$ns" get secret "$PROMETHEUS_EXPORT_SECRET" -o json 2>/dev/null || true)
+  if [[ -z "$json" && -f "$sops_file" ]]; then
+    log "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} missing; restoring it from ${sops_file#"${ENVS_ROOT}/"}"
+    if ! sops -d "$sops_file" | kubectl apply -f - >/dev/null; then
+      err "Could not restore ${ns}/${PROMETHEUS_EXPORT_SECRET} from ${sops_file#"${ENVS_ROOT}/"} (age key?); not generating a new one,"
+      err "which would cut off every reading cluster. Apply it (tools/sops/apply.sh ${ENV_NAME}) and re-run."
+      return 1
+    fi
+    json=$(kubectl -n "$ns" get secret "$PROMETHEUS_EXPORT_SECRET" -o json 2>/dev/null || true)
+  fi
+  state=$(printf '%s' "${json:-null}" | jq -r --arg u "$PROMETHEUS_EXPORT_USER" '
+    if . == null then "missing"
+    elif .type != "kubernetes.io/basic-auth" then "type \(.type)"
+    elif ((.data.username // "") | @base64d) != $u or (.data.password // "") == "" then "incomplete"
+    else "complete" end')
+  case "$state" in
+    complete)
+      info "✓ Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} holds the export credential (user ${PROMETHEUS_EXPORT_USER})"
+      if [[ ! -f "$sops_file" ]]; then
+        log "No SOPS copy of it yet; encrypting the cluster's Secret into ${sops_file#"${ENVS_ROOT}/"}"
+        printf '%s' "$json" | prometheus_export_secret_object | prometheus_export_store_secret false || \
+          warn "Could not keep a SOPS copy of ${ns}/${PROMETHEUS_EXPORT_SECRET}; the export works, but a rebuilt cluster would get a new password"
+      fi
+      return 0
+      ;;
+    "type "*)
+      err "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} has ${state}; Traefik's basicAuth needs kubernetes.io/basic-auth."
+      err "Delete it (kubectl -n ${ns} delete secret ${PROMETHEUS_EXPORT_SECRET}) and re-run; then re-link the reading clusters."
+      return 1
+      ;;
+    incomplete)
+      warn "Secret ${ns}/${PROMETHEUS_EXPORT_SECRET} is incomplete; generating a new password."
+      warn "Re-link every reading cluster afterwards (tools/k3s/grafana-remote-prometheus.sh)."
+      ;;
+    *) log "Generating the export credential (Secret ${ns}/${PROMETHEUS_EXPORT_SECRET}, user ${PROMETHEUS_EXPORT_USER})" ;;
+  esac
+  openssl rand -base64 48 | tr -d '\n=/+' | head -c 40 | \
+    jq -Rs --arg n "$PROMETHEUS_EXPORT_SECRET" --arg ns "$ns" --arg u "$PROMETHEUS_EXPORT_USER" \
+      '{apiVersion: "v1", kind: "Secret", type: "kubernetes.io/basic-auth",
+        metadata: {name: $n, namespace: $ns}, stringData: {username: $u, password: .}}' | \
+    prometheus_export_store_secret true
+}
+
+# Put the export up (property set) or take it down (unset; minio.sh's MINIO_ALLOWED_CIDRS
+# pattern). Taking it down keeps the Secret, so switching the export back on keeps the
+# credential the reading clusters hold. Best-effort: a failure warns and exposes nothing new.
+ensure_prometheus_export() {
+  local ns="$NAMESPACE_OBSERVABILITY"
+  if [[ -z "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+    kubectl -n "$ns" delete ingress prometheus-export --ignore-not-found >/dev/null 2>&1 || true
+    kubectl -n "$ns" delete middleware.traefik.io prometheus-export-allowlist prometheus-export-auth \
+      --ignore-not-found >/dev/null 2>&1 || true
+    return 0
+  fi
+  log "Exporting Prometheus at https://${PROMETHEUS_EXPORT_HOST}/api/v1/ for ${PROMETHEUS_EXPORT_ALLOWED_CIDRS} ..."
+  if ! prometheus_export_ensure_secret; then
+    warn "Prometheus export not set up: no usable credential. Nothing new is exposed."
+    return 0
+  fi
+  if ! prometheus_export_manifests | kubectl apply -f - >/dev/null; then
+    warn "Could not apply the export Ingress/Middlewares (Traefik CRDs missing?); see: kubectl -n ${ns} get ingress,middleware.traefik.io"
+    return 0
+  fi
+  info "✓ Prometheus export: https://${PROMETHEUS_EXPORT_HOST}/api/v1/ (basic auth, user ${PROMETHEUS_EXPORT_USER}; from ${PROMETHEUS_EXPORT_ALLOWED_CIDRS})"
+  info "  Link a reading cluster: tools/k3s/grafana-remote-prometheus.sh"
+}
+
 # --- Detect Tailscale IP ---
 detect_tailscale_ip() {
   local tailscale_ip=""
@@ -635,6 +851,23 @@ ensure_dns_records() {
     fi
   else
     info "Wildcard DNS exists, skipping individual Grafana DNS record"
+  fi
+
+  # The export host, the same way. The wildcard covers it only when it is one label under
+  # HOSTNAME (the default, prometheus-export.<HOSTNAME>).
+  if [[ -n "$PROMETHEUS_EXPORT_ALLOWED_CIDRS" ]]; then
+    local export_label="${PROMETHEUS_EXPORT_HOST%".${HOSTNAME:-}"}"
+    if [[ "$WILDCARD_EXISTS" == "true" && "$export_label" != "$PROMETHEUS_EXPORT_HOST" && "$export_label" != *.* ]]; then
+      info "Wildcard DNS exists, skipping individual DNS record for ${PROMETHEUS_EXPORT_HOST}"
+    else
+      log "Creating DNS record: $PROMETHEUS_EXPORT_HOST → $EXTERNAL_IP"
+      if provision::cloudflare_ensure_dns_record "$PROMETHEUS_EXPORT_HOST" "$EXTERNAL_IP"; then
+        info "✓ DNS record created/updated for $PROMETHEUS_EXPORT_HOST"
+      else
+        warn "Failed to create DNS record for $PROMETHEUS_EXPORT_HOST"
+        warn "You may need to create it manually in Cloudflare"
+      fi
+    fi
   fi
 }
 
@@ -3475,6 +3708,12 @@ EOF
     fi
   fi
   rm -f "$node_cm_file"
+
+  # Query API for other clusters' Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS); --rules-only
+  # leaves the export as it is, like everything else outside the prometheus release.
+  if [[ "$RULES_ONLY" != "true" ]]; then
+    ensure_prometheus_export
+  fi
 
   info "✓ Prometheus installed successfully"
   info "  Endpoint: http://prometheus-server.${NAMESPACE_OBSERVABILITY}.svc.cluster.local"
