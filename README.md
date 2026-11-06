@@ -129,6 +129,7 @@ The seams and how to add a provider: [docs/VERTICALS.md](docs/VERTICALS.md).
 - [GitOps Service Delivery](docs/GITOPS.md)
 - [Evaluator key intake](docs/EVALUATOR-KEYS.md)
 - [Kafka-journal operations (Redpanda + ScyllaDB)](docs/KAFKA-JOURNAL-OPS.md)
+- [Grafana across clusters (metrics export, remote datasources, framing)](docs/GRAFANA-ACROSS-CLUSTERS.md)
 
 ## License
 
