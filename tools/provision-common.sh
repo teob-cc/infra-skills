@@ -1144,19 +1144,28 @@ provision::pomerium_reload_routes() {
 }
 
 # Add or replace a route with given "from" URL in the environment's pomerium-routes.yaml
-# Usage: provision::pomerium_routes_add FROM_URL TO_URL [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true] [ALLOW_ANY=true]
+# Usage: provision::pomerium_routes_add FROM_URL TO_URL [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true] [ALLOW_ANY=true] [EXTRA_JSON={}]
+#   EXTRA_JSON: a JSON object of further route options merged over the route, e.g.
+#   '{"set_response_headers": {"Content-Security-Policy": "frame-ancestors '\''self'\''"}}'.
+#   The default {} leaves the route exactly as without it.
 provision::pomerium_routes_add() {
   local from_url="$1" to_url="$2" namespace_sso="${3:-sso}"
   local preserve_host="${4:-true}" pass_identity_headers="${5:-true}" allow_any="${6:-true}"
+  local extra="${7:-}"
+  [[ -n "$extra" ]] || extra='{}'
 
   if [[ -z "$from_url" || -z "$to_url" ]]; then
     provision::error "pomerium_routes_add: FROM_URL and TO_URL are required"
     return 1
   fi
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$extra"; then
+    provision::error "pomerium_routes_add: EXTRA_JSON must be a JSON object"
+    return 1
+  fi
   local route
   route=$(jq -cn --arg f "$from_url" --arg t "$to_url" --argjson ph "$preserve_host" \
-    --argjson pi "$pass_identity_headers" --argjson any "$allow_any" \
-    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi, allow_any_authenticated_user: $any}' 2>/dev/null) || {
+    --argjson pi "$pass_identity_headers" --argjson any "$allow_any" --argjson extra "$extra" \
+    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi, allow_any_authenticated_user: $any} + $extra' 2>/dev/null) || {
     provision::error "pomerium_routes_add: PRESERVE_HOST, PASS_ID and ALLOW_ANY must be true or false"
     return 1
   }

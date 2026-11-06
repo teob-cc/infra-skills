@@ -50,6 +50,10 @@ set -euo pipefail
 #                        the keys <name>-username/<name>-password of Secret
 #                        observability/grafana-remote-prometheus (grafana-remote-prometheus.sh
 #                        fills it); an entry whose keys are missing is left out with a warning
+#   GRAFANA_FRAME_ANCESTORS="https://portal.example.com ..."  Origins that may show Grafana
+#                        in an iframe: grafana.ini security.allow_embedding, and the Pomerium
+#                        route answers Content-Security-Policy: frame-ancestors 'self' <origins>.
+#                        allow_embedding needs the SSO block of grafana.ini (a warning says so)
 #                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
@@ -308,6 +312,26 @@ fi
 # and the key prefix in the Secret, so it is lower-case letters, digits and dashes.
 GRAFANA_REMOTE_PROMETHEUS="${GRAFANA_REMOTE_PROMETHEUS:-}"
 GRAFANA_REMOTE_PROMETHEUS_SECRET="grafana-remote-prometheus"
+
+# --- Framing: other origins may show this Grafana in an iframe ---
+# GRAFANA_FRAME_ANCESTORS="<origin> ..." (scheme://host[:port], a leading *. allowed). Grafana
+# gets security.allow_embedding, and the Pomerium route of its host answers
+# Content-Security-Policy: frame-ancestors 'self' <origins>, which browsers obey over the
+# X-Frame-Options: SAMEORIGIN Pomerium sends by default. The route is rewritten on every run
+# (provision::_pomerium_routes_upsert), so the header has to come from here. Unset: the route
+# and the values are what they were without it.
+GRAFANA_FRAME_ANCESTORS="${GRAFANA_FRAME_ANCESTORS:-}"
+grafana_frame_csp=""
+if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+  for frame_origin in $GRAFANA_FRAME_ANCESTORS; do
+    if ! [[ "$frame_origin" =~ ^https?://(\*\.)?[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$ ]]; then
+      err "GRAFANA_FRAME_ANCESTORS: '${frame_origin}' is not an origin (scheme://host[:port], no path)"; exit 1
+    fi
+    grafana_frame_csp+=" ${frame_origin}"
+  done
+  grafana_frame_csp="frame-ancestors 'self'${grafana_frame_csp}"
+  unset frame_origin
+fi
 if [[ -n "$GRAFANA_REMOTE_PROMETHEUS" ]]; then
   remote_prom_seen=" "
   remote_prom_url_re='^https?://[^[:space:]"$`\\]+$'
@@ -519,7 +543,8 @@ ensure_grafana_admin_login() {
 #
 # Compares the live release's user values with the values this run rendered and lists
 # what would disappear: the Dex SSO block, envFromSecret (the Dex client secret),
-# server.root_url, and every datasource by name. Only names and flags are compared,
+# server.root_url, security.allow_embedding (a framing page would go blank), and every
+# datasource by name (Prometheus-<name> included). Only names and flags are compared,
 # never secret values. Exits the script on a regression unless
 # ALLOW_GRAFANA_REGRESSION=true. No live release (first install) passes.
 grafana_values_guard() {
@@ -538,6 +563,9 @@ grafana_values_guard() {
          then "envFromSecret \($live.envFromSecret)" else empty end),
       (if ($live["grafana.ini"].server.root_url // "") != "" and ($new["grafana.ini"].server.root_url // "") == ""
          then "grafana.ini server.root_url" else empty end),
+      (if ($live["grafana.ini"].security.allow_embedding // "" | tostring) == "true"
+          and ($new["grafana.ini"].security.allow_embedding // "" | tostring) != "true"
+         then "grafana.ini security.allow_embedding (GRAFANA_FRAME_ANCESTORS)" else empty end),
       (($live|dsnames) - ($new|dsnames) | .[] | "datasource \(.)")
     ] | .[]')
   if [[ -z "$lost" ]]; then
@@ -648,8 +676,16 @@ spec:
         - ${GRAFANA_HOST}
       secretName: grafana-pomerium-tls
 YAML
+  # GRAFANA_FRAME_ANCESTORS: the route answers with the CSP that lets those origins frame
+  # Grafana. Without it the extra options are {} and the route is what it always was.
+  local route_extra="{}"
+  if [[ -n "$grafana_frame_csp" ]]; then
+    route_extra=$(jq -cn --arg csp "$grafana_frame_csp" '{set_response_headers: {"Content-Security-Policy": $csp}}')
+    info "Pomerium route for ${GRAFANA_HOST} answers Content-Security-Policy: ${grafana_frame_csp}"
+  fi
   if provision::pomerium_routes_add "https://${GRAFANA_HOST}" \
-       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true; then
+       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true \
+       "$route_extra"; then
     info "✓ Pomerium route ensured: https://${GRAFANA_HOST} -> grafana"
   else
     warn "Failed to ensure the Pomerium route for https://${GRAFANA_HOST}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
@@ -4161,7 +4197,9 @@ dashboards:
 
 EOF
 
-  # Add GitHub SSO configuration if Dex is available
+  # Add GitHub SSO configuration if Dex is available. The grafana.ini key exists only here, so
+  # what GRAFANA_FRAME_ANCESTORS asks of grafana.ini lands here too (grafana_ini_written).
+  grafana_ini_written=false
   if [[ "$SKIP_SSO" != "true" && -n "${DEX_CLIENT_SECRET_GRAFANA:-}" ]]; then
     # GitHub org for the role mapping. secrets.plain is only a local cache and is often
     # stale or missing (secrets.sops is the truth), and a missing org used to drop the
@@ -4209,7 +4247,21 @@ grafana.ini:
     role_attribute_strict: "false"
     allow_assign_grafana_admin: "true"
 EOF
-      
+      # Further grafana.ini sections go into this same block: a second grafana.ini key would
+      # make the document invalid (or silently replace this one). Nothing is appended when no
+      # property asks for it, so the values stay as they were.
+      grafana_ini_extra=""
+      if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+        grafana_ini_extra+="  security:
+    # GRAFANA_FRAME_ANCESTORS; the Pomerium route's CSP frame-ancestors limits who may frame it.
+    allow_embedding: \"true\"
+"
+      fi
+      if [[ -n "$grafana_ini_extra" ]]; then
+        printf '%s' "$grafana_ini_extra" >> "$grafana_values"
+      fi
+      grafana_ini_written=true
+
       info "✓ GitHub SSO configured for Grafana"
       info "  Organization: ${github_org}"
       info "  Dex issuer: https://${DEX_HOST}"
@@ -4217,7 +4269,13 @@ EOF
       warn "GitHub org or DEX_HOST not configured. Skipping SSO setup."
     fi
   fi
-  
+  if [[ "$grafana_ini_written" != "true" && -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
+    warn "GRAFANA_FRAME_ANCESTORS is set, but security.allow_embedding is NOT applied: grafana.ini is only"
+    warn "  written with the Dex SSO block, which this run skipped (--skip-sso, no Dex client, or no GitHub org)."
+    warn "  The Pomerium route still carries the CSP frame-ancestors header, but Grafana keeps sending"
+    warn "  X-Frame-Options: deny (browsers that honour the CSP ignore it). Fix SSO and re-run."
+  fi
+
   # With Pomerium in the sso namespace the UI goes through it (ensure_grafana_pomerium, after
   # the install) and the chart gets no ingress; without it the chart's ingress exposes Grafana.
   GRAFANA_VIA_POMERIUM=false
