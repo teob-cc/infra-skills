@@ -32,7 +32,7 @@
     - `mkdir -p ~/.config/sops/age`
     - `age-keygen -o ~/.config/sops/age/keys.txt`
     - Show your public key (recipient) to share: `age-keygen -y ~/.config/sops/age/keys.txt`
-    - The `tools/sops/*.sh` wrappers point SOPS at `~/.config/sops/age/keys.txt`. Bare `sops` reads it automatically on Linux only; on macOS its default is `~/Library/Application Support/sops/age/keys.txt`, so for manual calls `export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt`.
+    - Every script that sources `tools/provision-common.sh` (the `tools/sops/*.sh` wrappers and the provisioning scripts, which call `sops -d` themselves to restore or merge a Secret) points SOPS at `~/.config/sops/age/keys.txt` unless you set `SOPS_AGE_KEY_FILE` or `SOPS_AGE_KEY` yourself. Bare `sops` reads that file automatically on Linux only; on macOS its default is `~/Library/Application Support/sops/age/keys.txt`, so for manual calls `export SOPS_AGE_KEY_FILE=~/.config/sops/age/keys.txt`.
 
 ### Recommended Git hygiene for this repo
 - Keep plaintext out of Git. Ensure plaintext secrets are ignored:
