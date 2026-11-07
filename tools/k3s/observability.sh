@@ -60,8 +60,9 @@ set -euo pipefail
 #   GRAFANA_POMERIUM_JWT=true  Sign users in from the JWT Pomerium passes on every request
 #                        (grafana.ini auth.jwt, keys from https://<AUTH_HOST>/.well-known/pomerium/jwks.json,
 #                        audience pinned to GRAFANA_HOST, the same role mapping as Dex SSO).
-#                        Default false. A wrong setting locks the UI behind the route until
-#                        the property is removed and the script re-run
+#                        Default false. Through the route a user is then always the one
+#                        Pomerium names, with the role from groups on every request. A token
+#                        Grafana cannot verify falls back to the login page (no lockout)
 #                        (all of these: docs/GRAFANA-ACROSS-CLUSTERS.md)
 #
 # Environment:
@@ -349,8 +350,10 @@ fi
 # header X-Pomerium-Jwt-Assertion, aud and iss the route's host, the user's email and groups.
 # With this on, Grafana's auth.jwt signs the user in from it (no Grafana login step), with the
 # signing keys from the authenticate service: AUTH_HOST, the same default as identity.sh.
-# Every request through the route carries the header and Grafana rejects one it cannot
-# verify, so a wrong setting locks the UI until the property is removed and the script re-run.
+# Every request through the route carries the header, and a valid one wins over a Grafana
+# session: the user is whoever Pomerium names, with the role from groups on every request.
+# A token Grafana cannot verify (wrong AUTH_HOST, unreachable key set, audience mismatch)
+# falls back to the session or the login page, so a wrong setting has no effect, not a lockout.
 GRAFANA_POMERIUM_JWT="${GRAFANA_POMERIUM_JWT:-false}"
 if [[ "$GRAFANA_POMERIUM_JWT" != "true" && "$GRAFANA_POMERIUM_JWT" != "false" ]]; then
   err "GRAFANA_POMERIUM_JWT='${GRAFANA_POMERIUM_JWT}' must be true or false"; exit 1
