@@ -407,8 +407,8 @@ check_tailscale_key() {
 
 # --- Check: hardening defaults ---------------------------------------------
 # What the provisioning scripts set up and a hand edit or an old install can lose: the ArgoCD
-# and Harbor version pins (read from the scripts), the ArgoCD admin account, Harbor's private
-# projects (asked anonymously: a private project answers 401) and pgweb's NetworkPolicy.
+# and Harbor version pins (read from the scripts), the ArgoCD admin account and pgweb's
+# NetworkPolicy. Harbor's private projects have their own check (check_harbor_privacy).
 # Each item is only checked when its component is installed.
 check_hardening() {
   require_api "hardening" || return
@@ -429,15 +429,6 @@ check_hardening() {
     checked=$((checked + 1))
     pin_v="$(pin HARBOR_IMAGE_TAG harbor.sh)"
     [[ -n "$pin_v" && "${img##*:}" != "$pin_v" ]] && issues+=("harbor ${img##*:} (pin ${pin_v})")
-    kc get secret harbor-node-pull -n harbor >/dev/null 2>&1 || issues+=("no harbor/harbor-node-pull robot")
-    local host project code
-    host="$(kc get ingress harbor-ingress -n harbor -o jsonpath='{.spec.rules[0].host}')"
-    if [[ -n "$host" ]] && command -v curl >/dev/null 2>&1; then
-      for project in library dockerhub-proxy; do
-        code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://${host}/api/v2.0/projects/${project}" 2>/dev/null)"
-        [[ "$code" == "200" ]] && issues+=("harbor ${project} is public")
-      done
-    fi
   fi
 
   if kc get deploy pgweb -n postgres >/dev/null 2>&1; then
@@ -455,7 +446,56 @@ check_hardening() {
     record "hardening" "WARN" "${joined%; }" \
       "re-run the provisioning script of each component (argocd.sh, harbor.sh, postgres.sh); see docs/GITOPS.md"
   else
-    record "hardening" "OK" "pins, admin account, private projects, pgweb policy as provisioned ($checked component(s))" ""
+    record "hardening" "OK" "pins, admin account, pgweb policy as provisioned ($checked component(s))" ""
+  fi
+}
+
+# --- Check: Harbor private projects -----------------------------------------
+# The environment's registry is private: library and dockerhub-proxy refuse anonymous reads and
+# anonymous pulls, and the pullers that log in have their credential (harbor/harbor-node-pull for
+# containerd and ArgoCD, argocd/repo-harbor-charts for the app charts). Asked anonymously from
+# outside, so it needs no Harbor credential: a private project answers 401 to the API. For a
+# project that answers 200, one of its repositories is pulled anonymously as evidence.
+check_harbor_privacy() {
+  require_api "harbor-privacy" || return
+  kc get deploy harbor-core -n harbor >/dev/null 2>&1 || { record "harbor-privacy" "SKIP" "Harbor not installed" ""; return; }
+  local host issues=() project code repo enc ref token mcode
+  host="$(kc get ingress harbor-ingress -n harbor -o jsonpath='{.spec.rules[0].host}')"
+  kc get secret harbor-node-pull -n harbor >/dev/null 2>&1 || issues+=("no harbor/harbor-node-pull credential")
+  if kc get ns argocd >/dev/null 2>&1; then
+    kc get secret repo-harbor-charts -n argocd >/dev/null 2>&1 || issues+=("no argocd/repo-harbor-charts credential")
+  fi
+  if [[ -z "$host" ]] || ! command -v curl >/dev/null 2>&1; then
+    issues+=("visibility not checked (no harbor-ingress host or no curl)")
+  else
+    for project in library dockerhub-proxy; do
+      code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://${host}/api/v2.0/projects/${project}" 2>/dev/null)"
+      case "$code" in
+        401|403|404) continue ;;
+        200) ;;
+        *) issues+=("${project}: anonymous API read answered ${code:-no response}"); continue ;;
+      esac
+      repo="$(curl -s -m 10 "https://${host}/api/v2.0/projects/${project}/repositories?page_size=1" 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null)"
+      if [[ -z "$repo" ]]; then
+        issues+=("${project} is public")
+        continue
+      fi
+      enc="${repo#"${project}/"}"; enc="${enc//\//%252F}"
+      ref="$(curl -s -m 10 "https://${host}/api/v2.0/projects/${project}/repositories/${enc}/artifacts?page_size=1" 2>/dev/null | jq -r '.[0].digest // empty' 2>/dev/null)"
+      token="$(curl -s -m 10 "https://${host}/service/token?service=harbor-registry&scope=repository:${repo}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null)"
+      mcode="$(curl -s -o /dev/null -m 10 -I -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+        -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+        "https://${host}/v2/${repo}/manifests/${ref:-latest}" 2>/dev/null)"
+      issues+=("${project} is public (anonymous manifest HEAD of ${repo} -> ${mcode:-no response})")
+    done
+  fi
+  if [[ ${#issues[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${issues[@]}")"
+    record "harbor-privacy" "CRIT" "${joined%; }" \
+      "tools/k3s/harbor.sh <env> --privacy-only (writes the pull credential to the nodes and ArgoCD, makes the projects private, verifies)"
+  else
+    record "harbor-privacy" "OK" "library and dockerhub-proxy refuse anonymous access; pull credentials present" ""
   fi
 }
 
@@ -504,6 +544,7 @@ check_releases
 check_scanning
 check_floating_images
 check_hardening
+check_harbor_privacy
 check_k3s_server
 
 # --- Output ----------------------------------------------------------------

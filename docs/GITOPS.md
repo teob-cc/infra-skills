@@ -504,9 +504,14 @@ one pull-only robot, `robot$node-pull` (Secret `harbor/harbor-node-pull`, SOPS-e
 
 The projects turn private only once every node is known to hold the credential (the server was
 written and there are no agents) and ArgoCD, if installed, has its Secret; afterwards a running
-library image is pulled on the node, and the projects go back to public if that pull fails.
-`HARBOR_PRIVATE_PROJECTS=force` skips the node condition (agents joined with `join-worker.sh`),
-`=false` leaves the visibility alone, and `--skip-node-auth` keeps `harbor.sh` off the node. CI
+library image is pulled on the node and each project is checked from outside (anonymous manifest
+pull 401, `robot$node-pull` 200). Any unmet condition or failed check makes `harbor.sh` exit
+non-zero. The script never reopens a project: after a failed node pull the projects stay private
+and it prints the recovery steps (fix `registries.yaml`, re-run with `--privacy-only`); reopening
+is a manual, owner-approved break-glass. `HARBOR_PRIVATE_PROJECTS=force` skips the node condition
+(agents joined with `join-worker.sh`), `=false` leaves the visibility alone (logged as an
+opt-out), `--skip-node-auth` keeps `harbor.sh` off the node, and `--privacy-only` runs only this
+step on an installed Harbor. `doctor.sh` checks the same from outside (`harbor-privacy`, CRIT). CI
 logs in with its own robot (`harbor-robot-runner`) and is unaffected; so are the scripts, which
 query Harbor with that robot.
 

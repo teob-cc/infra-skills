@@ -165,8 +165,12 @@ its repository's CI (Step 10) before ArgoCD can start it.
 writes it into the server's `/etc/rancher/k3s/registries.yaml` over SSH (root at `TAILSCALE_IP`
 or `EXTERNAL_IP`; override with `NODE_SSH_USER` / `NODE_SSH_HOST`) and **restarts k3s** when that
 file changed - the API is away for up to a minute. With agent nodes, or with `--skip-node-auth`,
-the projects stay as they are until each agent has been (re)joined with `join-worker.sh` and the
-script is re-run with `HARBOR_PRIVATE_PROJECTS=force`. Pins: `HARBOR_CHART_VERSION`,
+the script **fails** (projects not made private) until each agent has been (re)joined with
+`join-worker.sh` and the script is re-run with `HARBOR_PRIVATE_PROJECTS=force`. Privacy is a
+postcondition: the run exits non-zero unless anonymous pulls get 401 and the pull robot gets in.
+On an installed Harbor, `harbor.sh <env> --privacy-only` does just this step (no Helm upgrade,
+so no accidental downgrade when the cluster runs ahead of the pins); `doctor.sh` reports a public
+project as CRIT (`harbor-privacy`). Pins: `HARBOR_CHART_VERSION`,
 `HARBOR_IMAGE_TAG` (docs/GITOPS.md).
 
 People log in with SSO, CI and the nodes with robot accounts. The local `admin` account is only

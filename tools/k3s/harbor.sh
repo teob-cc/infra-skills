@@ -30,12 +30,20 @@ set -euo pipefail
 #   - argocd/repo-harbor-charts (ArgoCD OCI credential for the app charts), when ArgoCD exists
 #     (argocd.sh creates it otherwise)
 #
-#   --skip-node-auth            don't touch the node (no SSH, no k3s restart); the projects stay
-#                               as they are unless HARBOR_PRIVATE_PROJECTS=force
+#   --privacy-only              run only Phase 4b and the privacy check on an installed Harbor:
+#                               no Helm upgrade, DNS, Dex or project/robot/OIDC configuration
+#   --skip-node-auth            don't touch the node (no SSH, no k3s restart); the projects are
+#                               not made private unless HARBOR_PRIVATE_PROJECTS=force
 #   HARBOR_PRIVATE_PROJECTS     true (default): private once every node has the credential, i.e.
 #                               the server was written and there are no agent nodes;
 #                               force: private regardless (agents joined with join-worker.sh,
-#                               which copies registries.yaml from the server); false: leave public
+#                               which copies registries.yaml from the server); false: leave the
+#                               visibility as it is (an explicit, logged opt-out)
+#
+# Privacy is a postcondition, not a best effort: unless HARBOR_PRIVATE_PROJECTS=false, the script
+# exits non-zero when a project stays public, a puller's credential is missing, anonymous pulls
+# still work, or the node cannot pull with its credential. It never reopens a project on its
+# own: a failed node pull leaves the projects private and prints the recovery steps.
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
 # shellcheck disable=SC1091
@@ -58,12 +66,16 @@ else
 fi
 
 SKIP_NODE_AUTH=false
+PRIVACY_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-node-auth) SKIP_NODE_AUTH=true; shift ;;
-    *) echo "Unknown option: $1 (known: --skip-node-auth)" >&2; exit 1 ;;
+    --privacy-only) PRIVACY_ONLY=true; shift ;;
+    *) echo "Unknown option: $1 (known: --skip-node-auth, --privacy-only)" >&2; exit 1 ;;
   esac
 done
+# The install/configure phases run unless --privacy-only.
+full_run() { [[ "$PRIVACY_ONLY" != "true" ]]; }
 
 # --- Validation ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
@@ -164,6 +176,10 @@ if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" ]]; then
     -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' 2>/dev/null | base64 -d 2>/dev/null || true)
   [[ -n "$HARBOR_ADMIN_PASSWORD" ]] && info "Keeping the admin password of the installed Harbor (harbor/harbor-core)"
 fi
+if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" && "$PRIVACY_ONLY" == "true" ]]; then
+  err "--privacy-only needs an installed Harbor: ${NAMESPACE_HARBOR}/harbor-core has no HARBOR_ADMIN_PASSWORD"
+  exit 1
+fi
 if [[ -z "${HARBOR_ADMIN_PASSWORD:-}" ]]; then
   info "HARBOR_ADMIN_PASSWORD not set - generating random password..."
   HARBOR_ADMIN_PASSWORD=$(openssl rand -base64 32 | tr -d '\n')
@@ -213,7 +229,7 @@ validate_prerequisites() {
   info "✓ All prerequisites validated"
 }
 
-validate_prerequisites
+full_run && validate_prerequisites
 
 # ============================================================================
 # Phase 1: DNS Management
@@ -243,7 +259,7 @@ ensure_dns_records() {
   info "✓ DNS records ensured"
 }
 
-ensure_dns_records
+full_run && ensure_dns_records
 
 # ============================================================================
 # Phase 2: Register Dex Client for Harbor
@@ -268,7 +284,7 @@ register_dex_client() {
   info "  Redirect URI: ${redirect_uris}"
 }
 
-register_dex_client
+full_run && register_dex_client
 
 # ============================================================================
 # Phase 3: Harbor Installation
@@ -395,7 +411,7 @@ install_harbor() {
   info "✓ Harbor installed successfully"
 }
 
-install_harbor
+full_run && install_harbor
 
 # ============================================================================
 # Phase 3b: harbor-db collation versions
@@ -441,7 +457,7 @@ ensure_harbor_db_collation() {
   info "✓ Indexes rebuilt and collation versions refreshed"
 }
 
-ensure_harbor_db_collation || warn "harbor-db collation step failed - see above"
+if full_run; then ensure_harbor_db_collation || warn "harbor-db collation step failed - see above"; fi
 
 # ============================================================================
 # Phase 4: Harbor Configuration
@@ -884,7 +900,7 @@ configure_harbor() {
   info "✓ Harbor configuration completed"
 }
 
-configure_harbor
+full_run && configure_harbor
 
 # ============================================================================
 # Phase 4b: Pull credentials and private projects
@@ -1104,30 +1120,117 @@ node_probe_image() {
      | (map(select(contains("@sha256:"))) + .) | first // empty'
 }
 
-set_project_public() { # <project> <true|false>
+set_project_private() { # <project>
   local out
-  out=$(harbor_api PUT "/projects/$1" "$(jq -cn --arg p "$2" '{metadata: {public: $p}}')")
+  out=$(harbor_api PUT "/projects/$1" '{"metadata":{"public":"false"}}')
   [[ "$(http_code "$out")" == "200" ]]
 }
 
-# Make the projects private when every puller holds the credential (see HARBOR_PRIVATE_PROJECTS).
+# HTTP code of a manifest HEAD on the registry: <repository> <reference> [user pass]. The token
+# comes from Harbor's token service, anonymously or with the credential; a private project hands
+# an anonymous caller a token without pull access, and the HEAD answers 401.
+registry_manifest_code() {
+  local repo="$1" ref="$2" user="${3:-}" pass="${4:-}" token url
+  url="https://${HARBOR_HOST}/service/token?service=harbor-registry&scope=repository:${repo}:pull"
+  if [[ -n "$user" ]]; then
+    token=$(curl -sS --max-time 15 -K <(printf 'user = "%s:%s"\n' "$(curl_cfg_quote "$user")" "$(curl_cfg_quote "$pass")") \
+      "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+  else
+    token=$(curl -sS --max-time 15 "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+  fi
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -I \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+    "https://${HARBOR_HOST}/v2/${repo}/manifests/${ref}" 2>/dev/null || echo 000
+}
+
+# One artifact of a project as "<repository> <digest>" (admin API), empty when it has no
+# repository. A proxy-cache project lists no artifacts at all (Harbor fetches them on demand),
+# so up to 20 repositories are tried, then the first one is returned with the tag "latest".
+project_sample_artifact() {
+  local project="$1" repo enc digest first=""
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    [[ -n "$first" ]] || first="$repo"
+    enc="${repo#"${project}/"}"; enc="${enc//\//%252F}"
+    digest=$(harbor_api GET "/projects/${project}/repositories/${enc}/artifacts?page_size=1" | sed '$d' | jq -r '.[0].digest // empty' 2>/dev/null || true)
+    if [[ -n "$digest" ]]; then printf '%s %s\n' "$repo" "$digest"; return 0; fi
+  done < <(harbor_api GET "/projects/${project}/repositories?page_size=20&sort=-update_time" | sed '$d' | jq -r '.[].name' 2>/dev/null || true)
+  [[ -z "$first" ]] || printf '%s latest\n' "$first"
+}
+
+# The postcondition, checked from outside: each project reports private to the admin API,
+# refuses anonymous API reads and anonymous manifest pulls, and serves the pull-only robot.
+verify_projects_private() {
+  local project out public repo digest code failed=0 bad
+  for project in "${HARBOR_PRIVATE_PROJECT_NAMES[@]}"; do
+    bad=0
+    out=$(harbor_api GET "/projects/${project}")
+    if [[ "$(http_code "$out")" == "404" ]]; then
+      info "  - ${project}: no such project"
+      continue
+    elif [[ "$(http_code "$out")" != "200" ]]; then
+      err "  ✗ ${project}: admin API answered HTTP $(http_code "$out")"; failed=1; continue
+    fi
+    public=$(http_body "$out" | jq -r '.metadata.public // "false"')
+    [[ "$public" == "false" ]] || { err "  ✗ ${project}: still public"; failed=1; continue; }
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${HARBOR_HOST}/api/v2.0/projects/${project}" 2>/dev/null || echo 000)
+    if [[ "$code" == "200" ]]; then err "  ✗ ${project}: anonymous API read answered 200"; bad=1; fi
+    read -r repo digest <<<"$(project_sample_artifact "$project")" || true
+    if [[ -z "${repo:-}" || -z "${digest:-}" ]]; then
+      if [[ "$bad" == "0" ]]; then info "  ✓ ${project}: private (no artifact to probe pulls with)"; else failed=1; fi
+      continue
+    fi
+    code=$(registry_manifest_code "$repo" "$digest")
+    if [[ "$code" != "401" ]]; then
+      err "  ✗ ${project}: anonymous manifest HEAD of ${repo} (${digest:0:19}) answered ${code} (want 401)"; bad=1
+    fi
+    code=$(registry_manifest_code "$repo" "$digest" "$NODE_PULL_USER" "$NODE_PULL_PASS")
+    # By digest the robot must get the manifest; by the fallback tag a 404 (no such tag
+    # upstream) still shows the credential passed.
+    if [[ "$code" != "200" && ! ( "$digest" == "latest" && "$code" == "404" ) ]]; then
+      err "  ✗ ${project}: ${NODE_PULL_USER} manifest HEAD of ${repo} answered ${code} (want 200)"; bad=1
+    fi
+    if [[ "$bad" == "0" ]]; then
+      info "  ✓ ${project}: private; anonymous pull 401, ${NODE_PULL_USER} pull 200 (${repo})"
+    else
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+# The steps to follow when the node cannot pull from the private projects. Printed, never run:
+# reopening a project is an owner decision, not an automatic rollback.
+print_node_pull_recovery() {
+  err "  The projects stay private. Running pods keep running; a pod that needs a fresh pull from"
+  err "  ${HARBOR_HOST} fails with ImagePullBackOff until the node pulls again. To recover:"
+  err "    1. check /etc/rancher/k3s/registries.yaml on ${NODE_SSH_HOST} holds configs.\"${HARBOR_HOST}\".auth"
+  err "       of ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET}, and that k3s started after it was written"
+  err "    2. re-run: tools/k3s/harbor.sh ${ENV_NAME} --privacy-only"
+  err "  Only with the owner's go-ahead, as a temporary break-glass, reopen one project in the"
+  err "  Harbor UI (Projects > <project> > Configuration > Public) and record it in the tracker."
+}
+
+# Make the projects private when every puller holds the credential (see HARBOR_PRIVATE_PROJECTS),
+# then check it from outside. Returns 1 when the projects are not provably private.
 ensure_private_projects() {
   local node_auth_rc="$1" project out public changed=()
   case "$HARBOR_PRIVATE_PROJECTS" in
     false)
-      info "HARBOR_PRIVATE_PROJECTS=false - leaving project visibility as it is"
+      warn "HARBOR_PRIVATE_PROJECTS=false - project visibility left as it is (explicit opt-out)"
       return 0 ;;
     force) ;;
     *)
       if [[ "$node_auth_rc" != "0" ]]; then
-        warn "Not making ${HARBOR_PRIVATE_PROJECT_NAMES[*]} private: not every node is known to hold the pull credential."
-        warn "  Fix the node step above (or join agents with join-worker.sh and re-run with HARBOR_PRIVATE_PROJECTS=force)."
-        return 0
+        err "Not making ${HARBOR_PRIVATE_PROJECT_NAMES[*]} private: not every node is known to hold the pull credential."
+        err "  Fix the node step above (or join agents with join-worker.sh and re-run with HARBOR_PRIVATE_PROJECTS=force)."
+        return 1
       fi ;;
   esac
   if kubectl get ns "$NAMESPACE_ARGOCD" >/dev/null 2>&1 && ! kubectl -n "$NAMESPACE_ARGOCD" get secret repo-harbor-charts >/dev/null 2>&1; then
-    warn "ArgoCD is installed but ${NAMESPACE_ARGOCD}/repo-harbor-charts is missing - not making the projects private"
-    return 0
+    err "ArgoCD is installed but ${NAMESPACE_ARGOCD}/repo-harbor-charts is missing - not making the projects private"
+    return 1
   fi
 
   for project in "${HARBOR_PRIVATE_PROJECT_NAMES[@]}"; do
@@ -1139,30 +1242,32 @@ ensure_private_projects() {
     public=$(http_body "$out" | jq -r '.metadata.public // "false"')
     if [[ "$public" == "false" ]]; then
       info "  ✓ ${project} is private"
-    elif set_project_public "$project" false; then
+    elif set_project_private "$project"; then
       info "  ✓ ${project} made private"
       changed+=("$project")
     else
       err "  Could not make ${project} private"
     fi
   done
-  [[ ${#changed[@]} -gt 0 ]] || return 0
 
-  # Prove the node can still pull; undo on failure, so running workloads keep restarting.
-  local image target="${NODE_SSH_USER}@${NODE_SSH_HOST}" sudo=""
+  # Prove the node can still pull with its credential: crictl pull asks the registry for the
+  # manifest even when the image is cached. On failure the projects stay private (see above).
+  local image target="${NODE_SSH_USER}@${NODE_SSH_HOST}" sudo="" rc=0
   [[ "$NODE_SSH_USER" != "root" ]] && sudo="sudo"
   image=$(node_probe_image)
   if [[ -z "$image" || "$SKIP_NODE_AUTH" == "true" ]]; then
-    info "  (no running library image to probe a node pull with)"
-    return 0
-  fi
-  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$sudo k3s crictl pull '$image'" >/dev/null 2>&1; then
+    info "  (no node pull probe: $([[ -z "$image" ]] && echo "no running ${HARBOR_HOST}/library image" || echo "--skip-node-auth"))"
+  elif ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$sudo k3s crictl pull '$image'" >/dev/null 2>&1; then
     info "  ✓ The node pulls ${image} with its credential"
   else
-    err "  The node cannot pull ${image} now - making ${changed[*]} public again"
-    for project in "${changed[@]}"; do set_project_public "$project" true || err "  Could not revert ${project}!"; done
-    return 1
+    err "  ✗ The node cannot pull ${image} with its credential${changed[*]:+ (made private now: ${changed[*]})}"
+    print_node_pull_recovery
+    rc=1
   fi
+
+  info "Checking privacy from outside..."
+  verify_projects_private || rc=1
+  return "$rc"
 }
 
 pull_credentials_and_private_projects() {
@@ -1187,7 +1292,11 @@ pull_credentials_and_private_projects() {
   ensure_private_projects "$node_auth_rc"
 }
 
-pull_credentials_and_private_projects || warn "Phase 4b incomplete - see above; the projects keep their visibility"
+PRIVACY_FAILED=false
+if ! pull_credentials_and_private_projects; then
+  PRIVACY_FAILED=true
+  err "Phase 4b failed - ${HARBOR_PRIVATE_PROJECT_NAMES[*]} are not provably private (see above); this run exits non-zero"
+fi
 
 # ============================================================================
 # Phase 5: Validation
@@ -1376,3 +1485,8 @@ info ""
 info "Harbor Admin Password (API access only):"
 info "  kubectl -n ${NAMESPACE_HARBOR} get secret harbor-core -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d"
 info ""
+
+if [[ "$PRIVACY_FAILED" == "true" ]]; then
+  err "Private projects NOT verified (Phase 4b above) - fix and re-run: tools/k3s/harbor.sh ${ENV_NAME} --privacy-only"
+  exit 1
+fi
