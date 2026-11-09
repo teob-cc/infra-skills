@@ -958,7 +958,7 @@ stringData:
   password: "${pass}"
 YAML
   )
-  kubectl apply -f "$plain" >/dev/null
+  kubectl apply -f "$plain" >/dev/null || return 1
   info "  ✓ Secret ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET} applied"
   if command -v sops >/dev/null 2>&1 && \
      "$REPO_ROOT/tools/sops/encrypt.sh" "$ENV_NAME" "$file" >/dev/null && \
@@ -968,12 +968,13 @@ YAML
   else
     warn "  Could not SOPS-encrypt it; the plaintext stays (git-ignored) at ${plain#"${ENVS_ROOT}/"}:"
     warn "  tools/sops/encrypt.sh ${ENV_NAME} ${file}, then delete the plaintext"
+    return 1
   fi
 }
 
 # Sets NODE_PULL_USER / NODE_PULL_PASS. Keeps a working credential (cluster Secret, else the
-# envs repo's SOPS copy); otherwise creates the robot, or gives an existing robot a new secret
-# when no copy of its current one is left.
+# envs repo's SOPS copy); otherwise creates the robot. An existing robot without a usable credential fails closed;
+# it is never rotated automatically.
 ensure_node_pull_credentials() {
   NODE_PULL_USER="" NODE_PULL_PASS=""
   if ! kubectl -n "$NAMESPACE_HARBOR" get secret "$NODE_PULL_SECRET" >/dev/null 2>&1; then
@@ -1000,18 +1001,9 @@ ensure_node_pull_credentials() {
   robot_id=$(http_body "$out" | jq -r --arg n "$NODE_PULL_ROBOT" \
     '[.[]? | select(.name == $n or (.name | endswith("$" + $n)))][0].id // empty' 2>/dev/null || true)
   if [[ -n "$robot_id" ]]; then
-    # The robot exists but no usable copy of its secret does: set a new one (8-128 chars,
-    # upper + lower + digit). Whatever used the old secret must take the new one.
-    local secret
-    secret="Np1$(openssl rand -hex 20)"
-    out=$(harbor_api PATCH "/robots/${robot_id}" "$(printf '%s' "$secret" | jq -Rc '{secret: .}')")
-    if [[ "$(http_code "$out")" != "200" ]]; then
-      err "Could not refresh the secret of robot id ${robot_id} (HTTP $(http_code "$out"))"
-      return 1
-    fi
-    NODE_PULL_USER=$(harbor_api GET "/robots/${robot_id}" | sed '$d' | jq -r '.name // empty')
-    NODE_PULL_PASS="$secret"
-    info "✓ Robot ${NODE_PULL_USER} existed without a usable secret copy - set a new secret"
+    err "Robot ${NODE_PULL_ROBOT} exists but its usable credential could not be recovered."
+    err "Restore its existing SOPS/cluster credential; rotation requires an explicit owner procedure."
+    return 1
   else
     local payload
     payload=$(jq -cn --arg n "$NODE_PULL_ROBOT" --arg projects "$(IFS=,; echo "${HARBOR_PRIVATE_PROJECT_NAMES[*]}")" '{
@@ -1101,8 +1093,12 @@ ensure_node_registry_auth() {
     info "✓ k3s restarted; API back"
   fi
 
-  local agents
-  agents=$(kubectl get nodes -o json | jq -r '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null) | .metadata.name] | join(" ")')
+  local agents nodes_json
+  if ! nodes_json=$(kubectl get nodes -o json 2>/dev/null) || [[ -z "$nodes_json" ]]; then
+    err "Cannot list the nodes - not known whether agent nodes need the credential"
+    return 1
+  fi
+  agents=$(printf '%s' "$nodes_json" | jq -r '[.items[] | select(.metadata.labels["node-role.kubernetes.io/control-plane"] == null) | .metadata.name] | join(" ")')
   if [[ -n "$agents" ]]; then
     warn "Agent node(s) not reached from here: ${agents}"
     warn "  tools/k3s/join-worker.sh <env> <worker> copies ${f} from the server to a worker."
@@ -1111,13 +1107,36 @@ ensure_node_registry_auth() {
   return 0
 }
 
-# A running pod's image from library (cached on the node), to prove a pull with the node's
-# credential after the projects turned private. Digest references first: a moved tag would
-# download a new image. Empty when there is none.
+# Candidate images to prove a pull with the node's credential: library images of pods on the
+# server node(s) (cached there, so no large download onto the root LV), digest references first
+# (a moved tag would download a new image), one per line. Only strict image references pass:
+# the string later goes into a root shell on the node, and Kubernetes does not validate it.
+node_probe_images() {
+  local servers
+  servers=$(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+  [[ -n "$servers" ]] || return 0
+  kubectl get pods -A -o json 2>/dev/null | jq -r --arg h "${HARBOR_HOST}/library/" --arg s "$servers" '
+    ($s | split(" ")) as $srv
+    | [.items[] | select(.spec.nodeName as $n | $srv | index($n)) | .spec.containers[].image
+       | select(startswith($h))
+       | select(test("^[A-Za-z0-9.-]+(/[A-Za-z0-9._-]+)+(:[A-Za-z0-9._-]{1,128})?(@sha256:[0-9a-f]{64})?$"))]
+    | unique | (map(select(contains("@sha256:"))) + map(select(contains("@sha256:") | not))) | .[]'
+}
+
+# The first candidate the pull robot can still read (retention may have removed a digest a
+# long-running pod uses: that is no evidence about the node's credential). Empty when none.
 node_probe_image() {
-  kubectl get pods -A -o json 2>/dev/null | jq -r --arg h "${HARBOR_HOST}/" \
-    '[.items[].spec.containers[].image | select(startswith($h + "library/"))]
-     | (map(select(contains("@sha256:"))) + .) | first // empty'
+  local image rest repo ref
+  while IFS= read -r image; do
+    [[ -n "$image" ]] || continue
+    rest="${image#"${HARBOR_HOST}/"}"
+    if [[ "$rest" == *@* ]]; then repo="${rest%@*}"; ref="${rest#*@}"; repo="${repo%:*}"
+    elif [[ "${rest##*/}" == *:* ]]; then repo="${rest%:*}"; ref="${rest##*:}"
+    else repo="$rest"; ref=latest; fi
+    if [[ "$(registry_manifest_code "$repo" "$ref" "$NODE_PULL_USER" "$NODE_PULL_PASS")" == "200" ]]; then
+      printf '%s\n' "$image"; return 0
+    fi
+  done < <(node_probe_images)
 }
 
 set_project_private() { # <project>
@@ -1129,19 +1148,44 @@ set_project_private() { # <project>
 # HTTP code of a manifest HEAD on the registry: <repository> <reference> [user pass]. The token
 # comes from Harbor's token service, anonymously or with the credential; a private project hands
 # an anonymous caller a token without pull access, and the HEAD answers 401.
-registry_manifest_code() {
-  local repo="$1" ref="$2" user="${3:-}" pass="${4:-}" token url
-  url="https://${HARBOR_HOST}/service/token?service=harbor-registry&scope=repository:${repo}:pull"
-  if [[ -n "$user" ]]; then
-    token=$(curl -sS --max-time 15 -K <(printf 'user = "%s:%s"\n' "$(curl_cfg_quote "$user")" "$(curl_cfg_quote "$pass")") \
-      "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+REGISTRY_ACCEPT='Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
+
+# A pull token for <repository> from Harbor's token service: anonymous, or with [user pass].
+registry_token() {
+  local url="https://${HARBOR_HOST}/service/token?service=harbor-registry&scope=repository:$1:pull"
+  if [[ -n "${2:-}" ]]; then
+    curl -sS --max-time 15 -K <(printf 'user = "%s:%s"\n' "$(curl_cfg_quote "$2")" "$(curl_cfg_quote "${3:-}")") \
+      "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
   else
-    token=$(curl -sS --max-time 15 "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true)
+    curl -sS --max-time 15 "$url" 2>/dev/null | jq -r '.token // empty' 2>/dev/null || true
   fi
+}
+
+# HTTP code of a HEAD on the registry: <repository> <manifests|blobs> <reference> [user pass].
+registry_head_code() {
+  local token
+  token=$(registry_token "$1" "${4:-}" "${5:-}")
   curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -I \
-    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
-    -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
-    "https://${HARBOR_HOST}/v2/${repo}/manifests/${ref}" 2>/dev/null || echo 000
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") -H "$REGISTRY_ACCEPT" \
+    "https://${HARBOR_HOST}/v2/$1/$2/$3" 2>/dev/null || echo 000
+}
+
+registry_manifest_code() { registry_head_code "$1" manifests "$2" "${3:-}" "${4:-}"; }
+
+# A blob digest (the image config) of <repository>@<reference>, read with <user pass>; for an
+# index, of its first platform manifest (attestation entries have platform.os "unknown").
+# Empty when the manifest cannot be read.
+registry_blob_digest() {
+  local repo="$1" ref="$2" token body sub
+  token=$(registry_token "$repo" "$3" "$4")
+  body=$(curl -sS --max-time 15 -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") -H "$REGISTRY_ACCEPT" \
+    "https://${HARBOR_HOST}/v2/${repo}/manifests/${ref}" 2>/dev/null || true)
+  sub=$(printf '%s' "$body" | jq -r '[.manifests[]? | select(.platform.os != "unknown")][0].digest // empty' 2>/dev/null || true)
+  if [[ -n "$sub" ]]; then
+    body=$(curl -sS --max-time 15 -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") -H "$REGISTRY_ACCEPT" \
+      "https://${HARBOR_HOST}/v2/${repo}/manifests/${sub}" 2>/dev/null || true)
+  fi
+  printf '%s' "$body" | jq -r '.config.digest // .layers[0].digest // empty' 2>/dev/null || true
 }
 
 # One artifact of a project as "<repository> <digest>" (admin API), empty when it has no
@@ -1156,7 +1200,9 @@ project_sample_artifact() {
     digest=$(harbor_api GET "/projects/${project}/repositories/${enc}/artifacts?page_size=1" | sed '$d' | jq -r '.[0].digest // empty' 2>/dev/null || true)
     if [[ -n "$digest" ]]; then printf '%s %s\n' "$repo" "$digest"; return 0; fi
   done < <(harbor_api GET "/projects/${project}/repositories?page_size=20&sort=-update_time" | sed '$d' | jq -r '.[].name' 2>/dev/null || true)
-  [[ -z "$first" ]] || printf '%s latest\n' "$first"
+  # No repository at all: probe a name nobody pushes. Anonymous must still get 401, and the robot
+  # 404 (authorised, no such manifest) or 200 (a proxy project fetching it upstream).
+  printf '%s latest\n' "${first:-${project}/library/hello-world}"
 }
 
 # The postcondition, checked from outside: each project reports private to the admin API,
@@ -1166,16 +1212,15 @@ verify_projects_private() {
   for project in "${HARBOR_PRIVATE_PROJECT_NAMES[@]}"; do
     bad=0
     out=$(harbor_api GET "/projects/${project}")
-    if [[ "$(http_code "$out")" == "404" ]]; then
-      info "  - ${project}: no such project"
-      continue
-    elif [[ "$(http_code "$out")" != "200" ]]; then
+    if [[ "$(http_code "$out")" != "200" ]]; then
       err "  ✗ ${project}: admin API answered HTTP $(http_code "$out")"; failed=1; continue
     fi
-    public=$(http_body "$out" | jq -r '.metadata.public // "false"')
+    public=$(http_body "$out" | jq -r '.metadata.public // "unknown"')
     [[ "$public" == "false" ]] || { err "  ✗ ${project}: still public"; failed=1; continue; }
     code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${HARBOR_HOST}/api/v2.0/projects/${project}" 2>/dev/null || echo 000)
-    if [[ "$code" == "200" ]]; then err "  ✗ ${project}: anonymous API read answered 200"; bad=1; fi
+    if [[ "$code" != "401" && "$code" != "403" ]]; then err "  ✗ ${project}: anonymous API read answered ${code} (want 401 or 403)"; bad=1; fi
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "https://${HARBOR_HOST}/api/v2.0/projects/${project}/repositories" 2>/dev/null || echo 000)
+    if [[ "$code" != "401" && "$code" != "403" ]]; then err "  ✗ ${project}: anonymous repository listing answered ${code} (want 401 or 403)"; bad=1; fi
     read -r repo digest <<<"$(project_sample_artifact "$project")" || true
     if [[ -z "${repo:-}" || -z "${digest:-}" ]]; then
       if [[ "$bad" == "0" ]]; then info "  ✓ ${project}: private (no artifact to probe pulls with)"; else failed=1; fi
@@ -1191,13 +1236,46 @@ verify_projects_private() {
     if [[ "$code" != "200" && ! ( "$digest" == "latest" && "$code" == "404" ) ]]; then
       err "  ✗ ${project}: ${NODE_PULL_USER} manifest HEAD of ${repo} answered ${code} (want 200)"; bad=1
     fi
+    local mcode="$code" blob="" blobs=""
+    if [[ "$mcode" == "200" ]]; then
+      blob=$(registry_blob_digest "$repo" "$digest" "$NODE_PULL_USER" "$NODE_PULL_PASS")
+      if [[ -z "$blob" ]]; then
+        err "  ✗ ${project}: ${NODE_PULL_USER} could not read the manifest body of ${repo}"; bad=1
+      else
+        code=$(registry_head_code "$repo" blobs "$blob")
+        [[ "$code" == "401" ]] || { err "  ✗ ${project}: anonymous blob HEAD ${blob:0:19} answered ${code} (want 401)"; bad=1; }
+        code=$(registry_head_code "$repo" blobs "$blob" "$NODE_PULL_USER" "$NODE_PULL_PASS")
+        # A proxy-cache project answers a blob HEAD from its local store only: 404 for a blob it
+        # has not cached yet still shows the credential passed (on the fallback tag only).
+        [[ "$code" == "200" || ( "$digest" == "latest" && "$code" == "404" ) ]] || { err "  ✗ ${project}: ${NODE_PULL_USER} blob HEAD ${blob:0:19} answered ${code} (want 200)"; bad=1; }
+        blobs=", blob 401/${code}"
+      fi
+    fi
     if [[ "$bad" == "0" ]]; then
-      info "  ✓ ${project}: private; anonymous pull 401, ${NODE_PULL_USER} pull 200 (${repo})"
+      info "  ✓ ${project}: private; anonymous API/listing/manifest${blobs:+/blob} denied; ${NODE_PULL_USER} manifest ${mcode}${blobs} (${repo})"
     else
       failed=1
     fi
   done
   return "$failed"
+}
+
+# ArgoCD fetches the app charts with argocd/repo-harbor-charts: it must carry the pull-only robot
+# and Harbor must accept it (a stale copy after a robot change would break every chart fetch).
+verify_argocd_chart_credential() {
+  kubectl get ns "$NAMESPACE_ARGOCD" >/dev/null 2>&1 || return 0
+  local user pass
+  user=$(kubectl -n "$NAMESPACE_ARGOCD" get secret repo-harbor-charts -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  pass=$(kubectl -n "$NAMESPACE_ARGOCD" get secret repo-harbor-charts -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  if [[ "$user" != "$NODE_PULL_USER" || "$pass" != "$NODE_PULL_PASS" ]]; then
+    err "  ✗ ${NAMESPACE_ARGOCD}/repo-harbor-charts does not hold ${NAMESPACE_HARBOR}/${NODE_PULL_SECRET} (user '${user:-none}')"
+    return 1
+  fi
+  if ! pull_credential_valid "$user" "$pass"; then
+    err "  ✗ Harbor refuses the credential in ${NAMESPACE_ARGOCD}/repo-harbor-charts"
+    return 1
+  fi
+  info "  ✓ ${NAMESPACE_ARGOCD}/repo-harbor-charts holds ${user} and Harbor accepts it"
 }
 
 # The steps to follow when the node cannot pull from the private projects. Printed, never run:
@@ -1239,7 +1317,7 @@ ensure_private_projects() {
       warn "  Project ${project} not found (HTTP $(http_code "$out")) - skipped"
       continue
     fi
-    public=$(http_body "$out" | jq -r '.metadata.public // "false"')
+    public=$(http_body "$out" | jq -r '.metadata.public // "unknown"')
     if [[ "$public" == "false" ]]; then
       info "  ✓ ${project} is private"
     elif set_project_private "$project"; then
@@ -1255,16 +1333,22 @@ ensure_private_projects() {
   local image target="${NODE_SSH_USER}@${NODE_SSH_HOST}" sudo="" rc=0
   [[ "$NODE_SSH_USER" != "root" ]] && sudo="sudo"
   image=$(node_probe_image)
+  local pull_out
   if [[ -z "$image" || "$SKIP_NODE_AUTH" == "true" ]]; then
-    info "  (no node pull probe: $([[ -z "$image" ]] && echo "no running ${HARBOR_HOST}/library image" || echo "--skip-node-auth"))"
-  elif ssh -o BatchMode=yes -o ConnectTimeout=10 "$target" "$sudo k3s crictl pull '$image'" >/dev/null 2>&1; then
+    info "  (no node pull probe: $([[ -z "$image" ]] && echo "no readable ${HARBOR_HOST}/library image on the server node" || echo "--skip-node-auth"))"
+  elif pull_out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$target" \
+      "$sudo k3s crictl pull $(printf '%q' "$image")" 2>&1); then
     info "  ✓ The node pulls ${image} with its credential"
-  else
-    err "  ✗ The node cannot pull ${image} with its credential${changed[*]:+ (made private now: ${changed[*]})}"
+  elif printf '%s' "$pull_out" | grep -qiE '401|403|unauthorized|authorization failed|denied'; then
+    err "  ✗ The node is refused pulling ${image} with its credential${changed[*]:+ (made private now: ${changed[*]})}"
     print_node_pull_recovery
+    rc=1
+  else
+    err "  ✗ The node pull of ${image} failed, not as an authorization refusal: $(printf '%s' "$pull_out" | tail -1 | cut -c1-200)"
     rc=1
   fi
 
+  verify_argocd_chart_credential || rc=1
   info "Checking privacy from outside..."
   verify_projects_private || rc=1
   return "$rc"
@@ -1278,6 +1362,9 @@ pull_credentials_and_private_projects() {
   ensure_node_pull_credentials || return 1
   if provision::argocd_harbor_charts_repo "$HARBOR_HOST" "$NAMESPACE_ARGOCD"; then
     info "✓ ArgoCD credential argocd/repo-harbor-charts ensured"
+  elif kubectl get ns "$NAMESPACE_ARGOCD" >/dev/null 2>&1; then
+    err "Could not write ${NAMESPACE_ARGOCD}/repo-harbor-charts although ArgoCD is installed"
+    return 1
   else
     info "ArgoCD not installed yet - argocd.sh creates argocd/repo-harbor-charts"
   fi
@@ -1292,11 +1379,12 @@ pull_credentials_and_private_projects() {
   ensure_private_projects "$node_auth_rc"
 }
 
-PRIVACY_FAILED=false
 if ! pull_credentials_and_private_projects; then
-  PRIVACY_FAILED=true
-  err "Phase 4b failed - ${HARBOR_PRIVATE_PROJECT_NAMES[*]} are not provably private (see above); this run exits non-zero"
+  err "Phase 4b failed - ${HARBOR_PRIVATE_PROJECT_NAMES[*]} are not provably private (see above)"
+  exit 1
 fi
+# Privacy-only must stop here: no unrelated validation, upgrade or install summary.
+if [[ "$PRIVACY_ONLY" == "true" ]]; then exit 0; fi
 
 # ============================================================================
 # Phase 5: Validation
@@ -1485,8 +1573,3 @@ info ""
 info "Harbor Admin Password (API access only):"
 info "  kubectl -n ${NAMESPACE_HARBOR} get secret harbor-core -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d"
 info ""
-
-if [[ "$PRIVACY_FAILED" == "true" ]]; then
-  err "Private projects NOT verified (Phase 4b above) - fix and re-run: tools/k3s/harbor.sh ${ENV_NAME} --privacy-only"
-  exit 1
-fi

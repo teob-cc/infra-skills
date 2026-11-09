@@ -504,8 +504,12 @@ one pull-only robot, `robot$node-pull` (Secret `harbor/harbor-node-pull`, SOPS-e
 
 The projects turn private only once every node is known to hold the credential (the server was
 written and there are no agents) and ArgoCD, if installed, has its Secret; afterwards a running
-library image is pulled on the node and each project is checked from outside (anonymous manifest
-pull 401, `robot$node-pull` 200). Any unmet condition or failed check makes `harbor.sh` exit
+library image of the server node is pulled there (one the robot can still read; image references are
+validated before they reach the node shell), `argocd/repo-harbor-charts` must hold the robot and be
+accepted by Harbor, and each project is checked from outside: anonymous API read, repository listing,
+manifest and blob all 401/403, `robot$node-pull` manifest and blob readable. An existing robot whose
+credential is lost is never rotated automatically (that would strand every puller); restore its
+SOPS copy or rotate by an explicit owner procedure. Tests: `python3 tools/tests/test-harbor-privacy.py`. Any unmet condition or failed check makes `harbor.sh` exit
 non-zero. The script never reopens a project: after a failed node pull the projects stay private
 and it prints the recovery steps (fix `registries.yaml`, re-run with `--privacy-only`); reopening
 is a manual, owner-approved break-glass. `HARBOR_PRIVATE_PROJECTS=force` skips the node condition

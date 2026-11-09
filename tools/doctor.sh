@@ -471,7 +471,16 @@ check_harbor_privacy() {
     for project in library dockerhub-proxy; do
       code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "https://${host}/api/v2.0/projects/${project}" 2>/dev/null)"
       case "$code" in
-        401|403|404) continue ;;
+        401|403)
+          # A denied metadata API alone does not prove the registry pull path denies access.
+          repo="${project}/library/eclipse-temurin"
+          [[ "$project" != "library" ]] || repo="library/github-runner"
+          token="$(curl -s -m 10 "https://${host}/service/token?service=harbor-registry&scope=repository:${repo}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null)"
+          mcode="$(curl -s -o /dev/null -m 10 -I -w '%{http_code}' \
+            -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
+            "https://${host}/v2/${repo}/manifests/latest" 2>/dev/null)"
+          [[ "$mcode" == "401" || "$mcode" == "403" ]] || issues+=("${project}: anonymous manifest HEAD answered ${mcode:-no response}")
+          continue ;;
         200) ;;
         *) issues+=("${project}: anonymous API read answered ${code:-no response}"); continue ;;
       esac
@@ -483,7 +492,7 @@ check_harbor_privacy() {
       enc="${repo#"${project}/"}"; enc="${enc//\//%252F}"
       ref="$(curl -s -m 10 "https://${host}/api/v2.0/projects/${project}/repositories/${enc}/artifacts?page_size=1" 2>/dev/null | jq -r '.[0].digest // empty' 2>/dev/null)"
       token="$(curl -s -m 10 "https://${host}/service/token?service=harbor-registry&scope=repository:${repo}:pull" 2>/dev/null | jq -r '.token // empty' 2>/dev/null)"
-      mcode="$(curl -s -o /dev/null -m 10 -I -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+      mcode="$(curl -s -o /dev/null -m 10 -I -w '%{http_code}' -K <(printf 'header = "Authorization: Bearer %s"\n' "$token") \
         -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
         "https://${host}/v2/${repo}/manifests/${ref:-latest}" 2>/dev/null)"
       issues+=("${project} is public (anonymous manifest HEAD of ${repo} -> ${mcode:-no response})")

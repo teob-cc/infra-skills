@@ -1072,12 +1072,13 @@ provision::argocd_harbor_charts_repo() {
   user=$(kubectl -n "$harbor_ns" get secret harbor-node-pull -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
   pass=$(kubectl -n "$harbor_ns" get secret harbor-node-pull -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
   [[ -n "$user" && -n "$pass" ]] || return 1
-  jq -n --arg ns "$argocd_ns" --arg url "${harbor_host}/library/charts" --arg u "$user" --arg p "$pass" '{
+  # The password reaches jq through the environment, not argv (readable by any local user in ps).
+  HARBOR_PULL_PASS="$pass" jq -n --arg ns "$argocd_ns" --arg url "${harbor_host}/library/charts" --arg u "$user" '{
     apiVersion: "v1", kind: "Secret",
     metadata: {name: "repo-harbor-charts", namespace: $ns,
                labels: {"argocd.argoproj.io/secret-type": "repository"}},
     stringData: {type: "helm", name: "harbor-charts", url: $url, enableOCI: "true",
-                 username: $u, password: $p}
+                 username: $u, password: env.HARBOR_PULL_PASS}
   }' | kubectl apply -f - >/dev/null
 }
 
