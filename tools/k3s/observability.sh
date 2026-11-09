@@ -39,6 +39,9 @@ set -euo pipefail
 #   LOG_SHIPPER=alloy    Ship logs with Grafana Alloy instead of Promtail (EOL 2026-03-02);
 #                        uninstalls the promtail release. Default: promtail
 #   LOKI_RETENTION_PERIOD  e.g. 2160h; enables compactor retention. Default: keep forever
+#   LOKI_CHUNKS_CACHE_MB / LOKI_RESULTS_CACHE_MB  memcached sizes in MB. Default: 512 / 64.
+#                        The chart default (8192 / 1024) reserves ~11 GiB per node for caches
+#                        that hold ~150 MiB on a single-binary filesystem Loki.
 #   GITHUB_ORG           Org for Grafana's role mapping; default: secrets.plain, then the
 #                        live Dex config
 #   PROMETHEUS_EXPORT_ALLOWED_CIDRS="203.0.113.0/24 198.51.100.7/32"
@@ -189,6 +192,8 @@ fi
 # Storage configuration with defaults
 LOKI_STORAGE_SIZE="${LOKI_STORAGE_SIZE:-10Gi}"
 LOKI_STORAGE_CLASS="${LOKI_STORAGE_CLASS:-local-path}"
+LOKI_CHUNKS_CACHE_MB="${LOKI_CHUNKS_CACHE_MB:-512}"
+LOKI_RESULTS_CACHE_MB="${LOKI_RESULTS_CACHE_MB:-64}"
 PROMETHEUS_STORAGE_SIZE="${PROMETHEUS_STORAGE_SIZE:-10Gi}"
 PROMETHEUS_STORAGE_CLASS="${PROMETHEUS_STORAGE_CLASS:-local-path}"
 GRAFANA_STORAGE_SIZE="${GRAFANA_STORAGE_SIZE:-5Gi}"
@@ -1160,6 +1165,17 @@ singleBinary:
     enabled: true
     size: ${LOKI_STORAGE_SIZE}
     storageClassName: ${LOKI_STORAGE_CLASS}
+
+# Memcached caches sized for a single-binary filesystem Loki. The chart default
+# (chunks 8192 MB, results 1024 MB, 500m each) requested ~11 GiB and 1 core per node
+# for ~150 MiB of use.
+chunksCache:
+  allocatedMemory: ${LOKI_CHUNKS_CACHE_MB}
+  allocatedCPU: 50m
+
+resultsCache:
+  allocatedMemory: ${LOKI_RESULTS_CACHE_MB}
+  allocatedCPU: 50m
 
 read:
   replicas: 0
