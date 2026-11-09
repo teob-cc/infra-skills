@@ -13,10 +13,11 @@ on:
         required: true
         type: string
       test_postgres:
-        description: "Test PostgreSQL connectivity"
+        # Opt-in: test's postgres-cluster is hibernated (no user; CORE-781), so the daily drift check does not test it.
+        description: "Test PostgreSQL connectivity (opt-in)"
         required: false
         type: boolean
-        default: true
+        default: false
       test_nexus:
         description: "Test Nexus connectivity"
         required: false
@@ -87,7 +88,7 @@ jobs:
           kubectl cluster-info || echo "Cannot reach cluster"
 
       - name: Test PostgreSQL Connectivity
-        if: ${{ inputs.test_postgres != false }}
+        if: ${{ inputs.test_postgres == true }}
         run: |
           echo "=== PostgreSQL Connectivity Test ==="
           
