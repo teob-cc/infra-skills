@@ -189,6 +189,7 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${POSTGRES_EFFECTIVE_CACHE_SIZE:=512MB}"
 : "${POSTGRES_MAINTENANCE_WORK_MEM:=64MB}"
 : "${POSTGRES_MAX_WAL_SIZE:=4GB}"
+: "${POSTGRES_MAX_CONNECTIONS:=100}"
 : "${ENFORCE_POMERIUM:=true}"
 # PostgreSQL operand image (CNPG postgres-containers). Use the immutable
 # MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
@@ -1726,7 +1727,7 @@ ${managed_block}${plugins_block}
   # PostgreSQL configuration
   postgresql:
     parameters:
-      max_connections: "100"
+      max_connections: "${POSTGRES_MAX_CONNECTIONS}"
       shared_buffers: "${POSTGRES_SHARED_BUFFERS}"
       effective_cache_size: "${POSTGRES_EFFECTIVE_CACHE_SIZE}"
       maintenance_work_mem: "${POSTGRES_MAINTENANCE_WORK_MEM}"
