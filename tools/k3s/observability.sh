@@ -1999,6 +1999,7 @@ serverFiles:
               kube_pod_status_ready{condition="false"} == 1
               and on (namespace, pod)
               kube_pod_status_phase{phase=~"Pending|Running|Unknown"} == 1
+              unless on (namespace, pod) (kube_pod_info and on (node) node:on_demand_parked)
             for: 20m
             labels: { severity: p2, app: infra }
             annotations:
@@ -2353,6 +2354,7 @@ serverFiles:
           - alert: ScrapeTargetDown
             expr: |
               up{job!~"alertmanager|mysql-exporter|redpanda|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
+              unless on (node) node:on_demand_parked
             for: 15m
             labels: { severity: p3, app: infra }
             annotations:
@@ -2372,9 +2374,22 @@ serverFiles:
       - name: infra-node
         interval: 1m
         rules:
+          # A node labelled infra-skills/on-demand=true is powered on only when it is
+          # needed (a GPU box, a burst worker). While such a node is not Ready it is
+          # parked, not broken: this series exists for it, and the node-down, scrape,
+          # pod and DaemonSet rules skip the node and what sits on it. Once the node is
+          # Ready the series ends and every rule applies to it like to any other node.
+          # kube-state-metrics exports the label through metricLabelsAllowlist below.
+          - record: node:on_demand_parked
+            expr: |
+              max by (node) (
+                kube_node_labels{label_infra_skills_on_demand="true"}
+                and on (node) kube_node_status_condition{condition="Ready",status="true"} == 0
+              )
           - alert: NodeExporterDown
             expr: |
               kube_node_info unless on (node) (up{service=~".*node-exporter"} == 1)
+              unless on (node) node:on_demand_parked
             for: 10m
             labels: { severity: p2, app: infra }
             annotations:
@@ -2642,9 +2657,14 @@ serverFiles:
                 usually an object kind is being created in a loop (Events, Jobs, ReplicaSets).
                 kubectl get --raw /metrics | grep apiserver_storage_objects lists counts by kind.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
+          # max by (instance) first: when the kubelet job's labels change (the node
+          # relabel this script patches in after an upgrade), old and new series overlap
+          # for a scrape or two, and label_replace over both gives two series with the
+          # same labels, which fails the evaluation.
           - alert: KubeletDown
             expr: |
-              kube_node_info unless on (node) label_replace(up{job="kubernetes-nodes"} == 1, "node", "\$1", "instance", "(.*)")
+              kube_node_info unless on (node) label_replace(max by (instance) (up{job="kubernetes-nodes"} == 1), "node", "\$1", "instance", "(.*)")
+              unless on (node) node:on_demand_parked
             for: 5m
             labels: { severity: p1, app: infra }
             annotations:
@@ -2680,7 +2700,9 @@ serverFiles:
                 k3s config.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#control-plane"
           - alert: KubeNodeNotReady
-            expr: kube_node_status_condition{condition="Ready",status="true"} == 0
+            expr: |
+              kube_node_status_condition{condition="Ready",status="true"} == 0
+              unless on (node) node:on_demand_parked
             for: 5m
             labels: { severity: p1, app: infra }
             annotations:
@@ -2822,11 +2844,27 @@ serverFiles:
                 at a time, so a single stuck pod blocks the rest. kubectl -n
                 {{ \$labels.namespace }} describe sts {{ \$labels.statefulset }}.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
+          # A DaemonSet pod on a parked on-demand node (see node:on_demand_parked) counts
+          # as unavailable when the DaemonSet tolerates the node's unreachable taint and
+          # as misscheduled when it does not, so both counts are summed and the pods on
+          # parked nodes are taken off the sum. The two "group by" keep the right-hand
+          # side to one series per DaemonSet while two kube-state-metrics pods overlap
+          # during a rollout; duplicates there would fail the evaluation.
           - alert: KubeDaemonSetUnavailable
             expr: |
-              kube_daemonset_status_number_unavailable > 0
+              (
+                kube_daemonset_status_number_unavailable + kube_daemonset_status_number_misscheduled
+                - on (namespace, daemonset) group_left () (
+                    count by (namespace, daemonset) (
+                      group by (namespace, daemonset, pod) (
+                        label_replace(kube_pod_info{created_by_kind="DaemonSet"}, "daemonset", "\$1", "created_by_name", "(.+)")
+                        and on (node) node:on_demand_parked
+                      )
+                    )
+                    or on (namespace, daemonset) 0 * group by (namespace, daemonset) (kube_daemonset_status_number_unavailable)
+                  )
+              ) > 0
               or (kube_daemonset_status_desired_number_scheduled - kube_daemonset_status_current_number_scheduled) > 0
-              or kube_daemonset_status_number_misscheduled > 0
             for: 15m
             labels: { severity: p2, app: infra }
             annotations:
@@ -3510,6 +3548,11 @@ prometheus-pushgateway:
 
 kube-state-metrics:
   enabled: true
+  # Node labels are not exported unless listed here. The on-demand marker becomes
+  # kube_node_labels{label_infra_skills_on_demand="true"}, which the node:on_demand_parked
+  # rule (infra-node group) reads to tell a parked worker from a dead one.
+  metricLabelsAllowlist:
+    - nodes=[infra-skills/on-demand]
 
 prometheus-node-exporter:
   enabled: true
@@ -3643,8 +3686,9 @@ BBEOF
       log "--- diff ${f} (live -> rendered) ---"
       diff -u "$dry_dir/$f.live.n" "$dry_dir/$f.new.n" || true
     done
-    yq '.groups[].rules[].alert' "$dry_dir/alerting_rules.live" 2>/dev/null | sort -u > "$dry_dir/alerts.live" || true
-    yq '.groups[].rules[].alert' "$dry_dir/alerting_rules.new" | sort -u > "$dry_dir/alerts.new"
+    # Recording rules have no .alert; leave them out of the alert count.
+    yq '.groups[].rules[] | select(has("alert")) | .alert' "$dry_dir/alerting_rules.live" 2>/dev/null | sort -u > "$dry_dir/alerts.live" || true
+    yq '.groups[].rules[] | select(has("alert")) | .alert' "$dry_dir/alerting_rules.new" | sort -u > "$dry_dir/alerts.new"
     log "Alerts added:   $(comm -13 "$dry_dir/alerts.live" "$dry_dir/alerts.new" | wc -l | tr -d ' ')"
     log "Alerts removed: $(comm -23 "$dry_dir/alerts.live" "$dry_dir/alerts.new" | tr '\n' ' ')"
     log "Scrape jobs:    $(yq '.scrape_configs[].job_name' "$dry_dir/prometheus.new" | tr '\n' ' ')"
@@ -3652,13 +3696,30 @@ BBEOF
     exit 0
   fi
 
+  # helm --wait holds a DaemonSet to a ready pod on every node. node-exporter tolerates
+  # every taint, so it also sits on a parked on-demand node (infra-skills/on-demand=true
+  # and not Ready, see docs/ALERTING.md), where its pod cannot become ready: the upgrade
+  # would sit out the whole timeout, fail, and skip the scrape-config patches below.
+  # With such a node in the cluster, upgrade without --wait and wait for the Deployments
+  # and the Alertmanager StatefulSet instead; the DaemonSet catches up when the node is back.
+  parked_nodes=$(kubectl get nodes -l infra-skills/on-demand=true --no-headers 2>/dev/null \
+    | awk '$2 ~ /^NotReady/ {printf "%s ", $1}' || true)
+  prometheus_wait="--wait"
+  if [[ -n "$parked_nodes" ]]; then
+    info "On-demand node(s) parked: ${parked_nodes}-- not waiting for DaemonSets"
+    prometheus_wait=""
+  fi
   helm upgrade --install prometheus prometheus-community/prometheus \
     --version "$PROMETHEUS_CHART_VERSION" \
     --namespace "$NAMESPACE_OBSERVABILITY" \
-    --wait \
+    ${prometheus_wait:+"$prometheus_wait"} \
     --timeout 10m \
     -f "$prometheus_values"
-  
+  if [[ -n "$parked_nodes" ]]; then
+    kubectl -n "$NAMESPACE_OBSERVABILITY" rollout status deployment,statefulset \
+      -l app.kubernetes.io/instance=prometheus --timeout=10m
+  fi
+
   # Workaround: Ensure postgres-exporter scrape config is applied
   # The Prometheus Helm chart may not always merge extraScrapeConfigs correctly
   info "Ensuring postgres-exporter scrape config is present..."

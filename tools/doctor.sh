@@ -115,13 +115,15 @@ record() {
 
 # --- Check: cluster & node health -----------------------------------------
 check_cluster() {
-  local nodes ready total notready
+  local nodes ready total notready parked note=""
   if [[ "$API_OK" != true ]]; then
     record "cluster" "CRIT" "cluster API unreachable (kubeconfig or cluster down)" \
       "check kubeconfig / that the workload cluster is up (tools/provision-hetzner-cloud.sh)"
     return
   fi
-  nodes="$(kc get nodes --no-headers)"
+  # The extra column is the on-demand label: a node powered on only when needed is
+  # parked, not failed, while it is not Ready (docs/ALERTING.md, "On-demand nodes").
+  nodes="$(kc get nodes --no-headers -L infra-skills/on-demand)"
   if [[ -z "$nodes" ]]; then
     record "cluster" "CRIT" "API reachable but no nodes returned" \
       "check node registration / RBAC for node list"
@@ -129,12 +131,14 @@ check_cluster() {
   fi
   total="$(echo "$nodes" | wc -l | tr -d ' ')"
   ready="$(echo "$nodes" | awk '$2=="Ready"' | wc -l | tr -d ' ')"
-  notready=$((total - ready))
+  parked="$(echo "$nodes" | awk '$2 ~ /^NotReady/ && $6=="true"' | wc -l | tr -d ' ')"
+  notready=$((total - ready - parked))
+  [[ "$parked" -gt 0 ]] && note=" ($parked on-demand parked)"
   if [[ "$notready" -gt 0 ]]; then
-    record "cluster" "CRIT" "$ready/$total nodes Ready ($notready not Ready)" \
+    record "cluster" "CRIT" "$ready/$total nodes Ready ($notready not Ready)${note}" \
       "kubectl describe node <name>; check kubelet / network mesh"
   else
-    record "cluster" "OK" "$ready/$total nodes Ready" ""
+    record "cluster" "OK" "$ready/$total nodes Ready${note}" ""
   fi
 }
 

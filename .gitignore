@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+# rendered by observability.sh --dry-run for the promtool tests
+tests/alert-rules/rules.yml
