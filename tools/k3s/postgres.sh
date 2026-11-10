@@ -190,6 +190,9 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${POSTGRES_MAINTENANCE_WORK_MEM:=64MB}"
 : "${POSTGRES_MAX_WAL_SIZE:=4GB}"
 : "${POSTGRES_MAX_CONNECTIONS:=100}"
+# wal_compression: lz4 (or zstd) compresses full-page images in WAL, which shrinks the WAL
+# archive of a write-heavy journal by a large share for little CPU. A reload applies it, no restart.
+: "${POSTGRES_WAL_COMPRESSION:=off}"
 : "${ENFORCE_POMERIUM:=true}"
 # PostgreSQL operand image (CNPG postgres-containers). Use the immutable
 # MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
@@ -1739,6 +1742,7 @@ ${managed_block}${plugins_block}
       work_mem: "4MB"
       min_wal_size: "1GB"
       max_wal_size: "${POSTGRES_MAX_WAL_SIZE}"
+      wal_compression: "${POSTGRES_WAL_COMPRESSION}"
     # SCRAM only (INFRA-65). CNPG appends "host all all all scram-sha-256" itself (PG >= 14);
     # these private-range lines spell the method out. "md5" here would also accept roles
     # whose stored password is still an MD5 hash (password_encryption is scram-sha-256 by
