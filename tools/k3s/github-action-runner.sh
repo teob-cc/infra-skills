@@ -905,14 +905,23 @@ create_runner_deployment() {
   # dockerd requires exclusive access to it. Use a registry-backed cache
   # instead (`--cache-from/--cache-to type=registry`), as the Rust workflow
   # does.
-  info "  Will mount hostPath volumes for the buildx and coursier caches"
-  info "  Cache will persist on node filesystem at /var/lib/github-runner-cache/${ENV_NAME}/"
+  #
+  # cargo-build holds what a Rust job chooses to keep between runs: its build directory and cargo's
+  # downloads (teob-rust's validate workflow links both into it, CORE-783). A runner pod's work
+  # directory is an emptyDir, so without it every run compiles every dependency again. It can reach
+  # tens of GB: RUNNER_CARGO_CACHE_DIR in env.properties puts it on a data disk. The workflow, not this
+  # script, takes a lock so that two runners never build in it at once, and bounds its size.
+  local cargo_cache_dir="${RUNNER_CARGO_CACHE_DIR:-/var/lib/github-runner-cache/${ENV_NAME}/cargo-build}"
+  info "  Will mount hostPath volumes for the buildx, coursier and cargo caches"
+  info "  Cache will persist on node filesystem at /var/lib/github-runner-cache/${ENV_NAME}/ (cargo: ${cargo_cache_dir})"
 
   local cache_volume_mounts="
         - name: buildx-cache
           mountPath: /tmp/.buildx-cache
         - name: coursier-cache
-          mountPath: /home/runner/.cache/coursier${maven_volume_mount}"
+          mountPath: /home/runner/.cache/coursier
+        - name: cargo-cache
+          mountPath: /home/runner/.cache/cargo-build${maven_volume_mount}"
 
   local cache_volumes="
         - name: buildx-cache
@@ -922,6 +931,10 @@ create_runner_deployment() {
         - name: coursier-cache
           hostPath:
             path: /var/lib/github-runner-cache/${ENV_NAME}/coursier
+            type: DirectoryOrCreate
+        - name: cargo-cache
+          hostPath:
+            path: ${cargo_cache_dir}
             type: DirectoryOrCreate${maven_volume}"
 
   # Convert comma-separated labels to YAML array
@@ -1079,15 +1092,18 @@ spec:
       # uid 1001. Without this the mount is unwritable and coursier silently falls back to
       # re-downloading everything on every job -- the failure mode looks like no cache at all.
       # Only the mountpoint is chowned; entries below it are written by the runner already.
+      # The cargo cache needs the same.
       initContainers:
         - name: coursier-cache-perms
           image: busybox:1.37
-          command: ["sh", "-c", "chown 1001:1001 /cache || true"]
+          command: ["sh", "-c", "chown 1001:1001 /cache /cargo-cache || true"]
           securityContext:
             runAsUser: 0
           volumeMounts:
             - name: coursier-cache
               mountPath: /cache
+            - name: cargo-cache
+              mountPath: /cargo-cache
       volumeMounts:${cache_volume_mounts}
       volumes:${cache_volumes}
 EOF
@@ -1343,6 +1359,7 @@ info "  ✓ Actions Runner Controller (namespace: ${NAMESPACE_RUNNER})"
 info "  ✓ Base builder image (harbor.${HOSTNAME}/library/base:latest)"
 info "  ✓ Runner Deployment: ${ENV_NAME}-runners"
 info "  ✓ Persistent cache:  Buildx (/var/lib/github-runner-cache/${ENV_NAME}/buildx)"
+info "  ✓ Persistent cache:  Cargo (${RUNNER_CARGO_CACHE_DIR:-/var/lib/github-runner-cache/${ENV_NAME}/cargo-build})"
 info ""
 
 # Get GitHub organization for summary

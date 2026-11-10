@@ -65,6 +65,9 @@ ACME_EMAIL=<acme-email>
 # Optional — CI runner pod sizing (defaults fit JVM builds on a 64 GiB node; two runners):
 # RUNNER_MEMORY_LIMIT=16Gi
 # DOCKERD_MEMORY_LIMIT=8Gi
+# Optional — host directory of the runners' cargo build cache (default /var/lib/github-runner-cache/<env>/cargo-build);
+# it can reach tens of GB, so point it at a data disk where the node has one:
+# RUNNER_CARGO_CACHE_DIR=/data/github-runner-cache/<env>/cargo-build
 # Optional — further GitHub orgs whose members may sign in through this env's Dex (their teams
 # become "<org>:<team>" groups), e.g. after another org's apps move here (/migrate-apps):
 # DEX_GITHUB_EXTRA_ORGS="<other-org>"
