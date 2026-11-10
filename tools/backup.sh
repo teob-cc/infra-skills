@@ -374,7 +374,11 @@ cnpg=$(k3s kubectl get pvc -A -l cnpg.io/cluster \
 set --
 for d in $cnpg; do set -- "$@" --exclude "$src/$d"; done
 for g in @EXCLUDES@; do set -- "$@" --exclude "$g"; done
-rdiff-backup "$@" --remote-schema '@SCHEMA@' "$src" '@DEST@'
+rc=0
+rdiff-backup "$@" --remote-schema '@SCHEMA@' "$src" '@DEST@' || rc=$?
+# Exit 2 is "warnings only": a file changed while it was read (a live PVC: Prometheus' WAL, a request
+# log), and the increment is complete. Any other non-zero code is a failure and stamps nothing.
+[ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || exit "$rc"
 /usr/local/bin/nas-backup-stamp '@REPO@'
 SWEEP
 )
