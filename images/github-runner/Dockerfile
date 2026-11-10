@@ -163,6 +163,17 @@ ARG YQ_VERSION=v4.44.6
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
+# Install the GitHub CLI. Workflows call `gh api` / `gh release create`; GitHub-hosted runners ship it,
+# this image did not, so those steps died with "gh: command not found" once jobs moved to our own runners.
+ARG GH_CLI_VERSION=2.103.3
+ARG GH_CLI_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" -o /tmp/gh.tgz \
+    && echo "${GH_CLI_SHA256}  /tmp/gh.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tgz -C /tmp \
+    && mv "/tmp/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && chmod +x /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tgz "/tmp/gh_${GH_CLI_VERSION}_linux_amd64"
+
 # Install the buildx CLI plugin. The base ships the docker CLI without it,
 # so anything asking for BuildKit -- `docker build --secret`, which is how a
 # build gets a registry credential that lands in no layer -- died with
@@ -189,6 +200,7 @@ RUN java -version \
     && cargo audit --version \
     && helm version \
     && yq --version \
+    && gh --version \
     && docker buildx version
 
 # Ensure PATH is available for runner user in all contexts
