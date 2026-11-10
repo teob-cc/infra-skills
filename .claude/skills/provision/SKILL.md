@@ -204,6 +204,14 @@ tools/k3s/runner-image.sh <env>            # --rebuild to force a new build, --s
 tools/k3s/base-image.sh <env>              # --rebuild to force a new build
 ```
 
+```bash
+# 5d. Optional: runners for the org's PUBLIC repos (the Default group never admits them). A runner
+#     group "public" for exactly PUBLIC_RUNNER_REPOS (env.properties), a pool labelled <env>-public
+#     with no cluster secrets and internet-only egress, and fork PRs held for approval. Their
+#     workflows use runs-on: [self-hosted, <env>-public] -- never GitHub-hosted runners.
+tools/k3s/public-runners.sh <env>          # --dry-run first
+```
+
 By hand, 5b is: `tools/k3s/registry-credentials.sh <env> <envs-repo-name>`, then
 `gh workflow run build-runner-image.yml -R <org>/<envs-repo-name> -f environment=<env>
 -f base_domain=<base-domain>` (both inputs required), wait (10–15 min), then
