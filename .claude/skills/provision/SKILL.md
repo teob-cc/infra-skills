@@ -197,7 +197,7 @@ tools/k3s/runner-image.sh <env>            # --rebuild to force a new build, --s
 ```
 
 ```bash
-# 5c. Runtime base image for JVM services: library/teob-base (Temurin 25 JRE + Node 22 +
+# 5c. Runtime base image for JVM services: library/teob-base (Temurin 25 JRE + Node 26 +
 #     Claude Code CLI, images/teob-base). Applications set dockerBaseImage / FROM to
 #     harbor.<base_domain>/library/teob-base:latest. Same mechanics as 5b via the caller
 #     workflow build-teob-base-image.yml in the envs repo.

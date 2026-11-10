@@ -42,6 +42,7 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     clang \
     pkg-config \
     libssl-dev \
+    libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Summerwind has no 2.338.0 tag yet. Replace the runner payload while preserving
@@ -58,10 +59,10 @@ RUN test "$(dpkg --print-architecture)" = amd64 \
     && test "$(/runnertmp/bin/Runner.Listener --version)" = "${ACTIONS_RUNNER_VERSION}"
 
 # Version variables (matching builder image)
-ENV SCALA3_VERSION=3.8.2
-ENV SBT_VERSION=1.12.6
+ENV SCALA3_VERSION=3.9.0
+ENV SBT_VERSION=1.13.1
 ENV YARN_VERSION=1.22.22
-ENV PNPM_VERSION=10.31.0
+ENV PNPM_VERSION=11.28.11
 ENV PATH="/usr/local/sbt/bin:$PATH"
 
 # Use bash for parameter expansion
@@ -77,11 +78,13 @@ RUN curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public | ap
 ENV JAVA_HOME=/usr/lib/jvm/temurin-25-jdk-amd64
 ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
-# Install Node.js 22 from the official tarball, pinned. NodeSource's setup_22.x installed whatever
-# was current on the rebuild day and lags upstream security releases (22.23.4, 2026-10-21, was
-# missing there when it shipped).
-ARG NODE_VERSION=22.23.4
-ARG NODE_SHA256=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
+# Install Node.js 26 (LTS "Lithium", Active LTS since 2026-10-28, supported to 2029-04) from the
+# official tarball, pinned.
+# NodeSource's setup_NN.x installed whatever was current on the rebuild day and lagged upstream
+# security releases (22.23.4, 2026-10-21, was missing there when it shipped).
+# (Node 20 is EOL; the actions themselves run on their own bundled node24.)
+ARG NODE_VERSION=26.13.0
+ARG NODE_SHA256=5848553868b402d3fabb5b09270649977780a390f832155721025a08b5104455
 RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" -o /tmp/node.tgz \
     && echo "${NODE_SHA256}  /tmp/node.tgz" | sha256sum -c - \
     && tar xzf /tmp/node.tgz -C /usr/local --strip-components=1 --no-same-owner \
@@ -90,6 +93,8 @@ RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 
     && npm install --global npm@11
 
 # Playwright: pin version and pre-install Chromium binary + OS deps into the image.
+# Held at 1.58.2: the baked Chromium must match the apps' @playwright/test (vstreams and teob-feeds
+# pin exactly 1.58.2). Bump here and in those apps together.
 ENV PLAYWRIGHT_VERSION=1.58.2
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN npm install --global @playwright/test@${PLAYWRIGHT_VERSION} \
@@ -115,7 +120,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no
     && cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
 
 # Install Scala (using GitHub releases like builder image)
-ARG SCALA3_SHA256=9afb0811530090e2927441f943c757b44b97e91416df07ab0410c7f8d952b437
+ARG SCALA3_SHA256=0815d7aa2838fc5c806d3f228ad6e1f6a4421f57fa5407dad3698b91b94b3ec0
 RUN mkdir -p /usr/share/scala \
     && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/scala/scala3/releases/download/${SCALA3_VERSION}/scala3-${SCALA3_VERSION}-x86_64-pc-linux.tar.gz" -o /tmp/scala.tgz \
     && echo "${SCALA3_SHA256}  /tmp/scala.tgz" | sha256sum -c - \
@@ -124,7 +129,7 @@ RUN mkdir -p /usr/share/scala \
     && ln -s /usr/share/scala/bin/* /usr/local/bin/
 
 # Install SBT (using GitHub releases like builder image)
-ARG SBT_SHA256=c546b0591039017adde7f340e8ef9f86b9152ee90cfabb29850b8284d1c820af
+ARG SBT_SHA256=4a20e36c1642b6d5be34ef641d2ed6c8c0d464e6145283730d5566716e4083be
 RUN mkdir -p "/usr/local/sbt" \
     && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/sbt/sbt/releases/download/v${SBT_VERSION}/sbt-${SBT_VERSION}.tgz" -o /tmp/sbt.tgz \
     && echo "${SBT_SHA256}  /tmp/sbt.tgz" | sha256sum -c - \
@@ -158,6 +163,17 @@ ARG YQ_VERSION=v4.44.6
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" -o /usr/local/bin/yq \
     && chmod +x /usr/local/bin/yq
 
+# Install the GitHub CLI. Workflows call `gh api` / `gh release create`; GitHub-hosted runners ship it,
+# this image did not, so those steps died with "gh: command not found" once jobs moved to our own runners.
+ARG GH_CLI_VERSION=2.103.3
+ARG GH_CLI_SHA256=4c806978ffce1cec70853302a56d70ac6da4f19bae7adca4e1a8ab00633dd91d
+RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.tar.gz" -o /tmp/gh.tgz \
+    && echo "${GH_CLI_SHA256}  /tmp/gh.tgz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tgz -C /tmp \
+    && mv "/tmp/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh \
+    && chmod +x /usr/local/bin/gh \
+    && rm -rf /tmp/gh.tgz "/tmp/gh_${GH_CLI_VERSION}_linux_amd64"
+
 # Install the buildx CLI plugin. The base ships the docker CLI without it,
 # so anything asking for BuildKit -- `docker build --secret`, which is how a
 # build gets a registry credential that lands in no layer -- died with
@@ -184,6 +200,7 @@ RUN java -version \
     && cargo audit --version \
     && helm version \
     && yq --version \
+    && gh --version \
     && docker buildx version
 
 # Ensure PATH is available for runner user in all contexts

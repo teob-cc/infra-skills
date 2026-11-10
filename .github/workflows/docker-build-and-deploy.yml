@@ -107,7 +107,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Log in to Harbor
         run: |
@@ -263,7 +263,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "owner=$RUNNER_ORG" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ steps.read-env.outputs.app_id }}
@@ -271,7 +271,7 @@ jobs:
           owner: ${{ steps.read-env.outputs.owner }}
 
       - name: Checkout GitOps repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ inputs.gitops_repo || format('{0}/infra-envs', github.repository_owner) }}
           token: ${{ steps.app-token.outputs.token }}
