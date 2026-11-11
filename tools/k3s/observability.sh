@@ -3955,6 +3955,30 @@ EOF
   fi
   rm -f "$node_cm_file"
 
+  # k3s serves the API server's metrics on the kubelet port too, so kubernetes-nodes stored a
+  # second copy of every apiserver_* and etcd_* series the kubernetes-api-servers job already
+  # keeps: about 67,000 of the 204,000 series on test (CORE-783). The rules read those two
+  # families from kubernetes-api-servers and only kubelet_* from kubernetes-nodes, so the
+  # copies are dropped at scrape time; both jobs and their `up` series stay.
+  info "Ensuring kubernetes-nodes drops the API server series it duplicates..."
+  dup_cm_file=$(mktemp)
+  kubectl get configmap -n "$NAMESPACE_OBSERVABILITY" prometheus-server -o yaml > "$dup_cm_file"
+  dup_prom_config=$(yq eval '.data."prometheus.yml"' "$dup_cm_file")
+  if echo "$dup_prom_config" | yq eval -e '[.scrape_configs[] | select(.job_name == "kubernetes-nodes") | .metric_relabel_configs[] | select(.action == "drop" and .regex == "(apiserver|etcd)_.*")] | length > 0' - >/dev/null 2>&1; then
+    info "✓ Duplicate API server series already dropped"
+  else
+    dup_updated_config=$(echo "$dup_prom_config" | yq eval '(.scrape_configs[] | select(.job_name == "kubernetes-nodes") | .metric_relabel_configs) += [{"source_labels": ["__name__"], "regex": "(apiserver|etcd)_.*", "action": "drop"}]' -)
+    if UPDATED_PROM_CONFIG="$dup_updated_config" yq eval '.data."prometheus.yml" = strenv(UPDATED_PROM_CONFIG)' "$dup_cm_file" | \
+        kubectl apply --server-side --field-manager=helm --force-conflicts -f - >/dev/null 2>&1; then
+      info "✓ kubernetes-nodes no longer stores apiserver_* and etcd_* series"
+      sleep 3  # Wait for configmap-reloader to pick up changes
+    else
+      warn "Failed to add the drop rule automatically"
+      warn "  kubectl edit configmap -n $NAMESPACE_OBSERVABILITY prometheus-server"
+    fi
+  fi
+  rm -f "$dup_cm_file"
+
   # Query API for other clusters' Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS); --rules-only
   # leaves the export as it is, like everything else outside the prometheus release.
   if [[ "$RULES_ONLY" != "true" ]]; then
