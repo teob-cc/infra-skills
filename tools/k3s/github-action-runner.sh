@@ -937,6 +937,81 @@ create_runner_deployment() {
             path: ${cargo_cache_dir}
             type: DirectoryOrCreate${maven_volume}"
 
+  # Docker storage that outlives a runner pod (RUNNER_DOCKER_STORE_DIR in env.properties; off when unset).
+  #
+  # Without it dockerd's data-root is the sidecar's own writable layer, gone with the pod: every job pulls its
+  # images and builds its image layers again, and writes them to the node's disk again (teob-rust: 13 GB and
+  # five minutes per run, CORE-783). One shared data-root is not an option, as said above. So the directory
+  # holds numbered slots, one more than there are runners, and the sidecar takes the first free one with a
+  # lock (flock) that it holds for as long as dockerd lives. A slot keeps images and the build cache; what a
+  # job left behind — containers, volumes, networks — is removed before the runner can take a job, by a
+  # short-lived dockerd on a private socket, and a slot over RUNNER_DOCKER_STORE_LIMIT_GB (default 30) is
+  # emptied. ARC puts "dockerd --host=... --group=... --mtu ..." in the container's args and leaves `command`
+  # alone, so the wrapper below receives exactly that as "\$@".
+  local docker_store_container="" docker_store_volume=""
+  if [[ -n "${RUNNER_DOCKER_STORE_DIR:-}" ]]; then
+    local docker_store_script
+    docker_store_script=$(sed -e "s/@SLOTS@/$((runner_replicas + 1))/" -e "s/@LIMIT_MB@/$(( ${RUNNER_DOCKER_STORE_LIMIT_GB:-30} * 1000 ))/" \
+      -e 's/^/                /' <<'STOREEOF'
+set -eu
+root=/docker-store
+while :; do
+  for slot in $(seq 1 @SLOTS@); do
+    exec 9> "$root/slot-$slot.lock"
+    if flock -n 9; then break 2; fi
+  done
+  sleep 2
+done
+data="$root/slot-$slot"
+mkdir -p "$data"
+echo "docker store: slot $slot"
+dockerd --host=unix:///tmp/clean.sock --data-root="$data" --exec-root=/tmp/clean-exec --pidfile=/tmp/clean.pid \
+  --iptables=false --ip6tables=false --bridge=none > /tmp/clean.log 2>&1 9>&- &
+pid=$!
+i=0
+until docker -H unix:///tmp/clean.sock info > /dev/null 2>&1; do
+  i=$((i + 1))
+  if [ "$i" -gt 90 ] || ! kill -0 "$pid" 2> /dev/null; then
+    echo "docker store: slot $slot does not open; starting it empty"; tail -n 20 /tmp/clean.log
+    kill "$pid" 2> /dev/null || true; wait "$pid" || true
+    rm -rf "$data"; mkdir -p "$data"
+    exec dockerd-entrypoint.sh "$@" --data-root="$data"
+  fi
+  sleep 1
+done
+d="docker -H unix:///tmp/clean.sock"
+$d ps -aq | xargs -r $d rm -fv > /dev/null
+$d network prune -f > /dev/null
+$d volume prune -af > /dev/null
+used=$(du -sm "$data" | cut -f1)
+if [ "$used" -gt @LIMIT_MB@ ]; then
+  echo "docker store: slot $slot holds $used MB; emptying it"
+  $d system prune -af --volumes > /dev/null
+  $d builder prune -af > /dev/null
+fi
+echo "docker store: slot $slot ready, $(du -sm "$data" | cut -f1) MB kept"
+kill "$pid"; wait "$pid" || true
+exec dockerd-entrypoint.sh "$@" --data-root="$data"
+STOREEOF
+)
+    docker_store_container="
+          command:
+            - sh
+            - -c
+            - |
+${docker_store_script}
+            - --
+          volumeMounts:
+            - name: docker-store
+              mountPath: /docker-store"
+    docker_store_volume="
+        - name: docker-store
+          hostPath:
+            path: ${RUNNER_DOCKER_STORE_DIR}
+            type: DirectoryOrCreate"
+    info "  Docker storage kept between jobs: ${RUNNER_DOCKER_STORE_DIR} ($((runner_replicas + 1)) slots, ${RUNNER_DOCKER_STORE_LIMIT_GB:-30} GB each at most)"
+  fi
+
   # Convert comma-separated labels to YAML array
   local labels_yaml=""
   IFS=',' read -ra LABEL_ARRAY <<< "$runner_labels"
@@ -1055,7 +1130,7 @@ spec:
             timeoutSeconds: 20
             failureThreshold: 3
         - name: docker
-          image: docker:29.3-dind
+          image: docker:29.3-dind${docker_store_container}
           livenessProbe:
             exec:
               command:
@@ -1105,7 +1180,7 @@ spec:
             - name: cargo-cache
               mountPath: /cargo-cache
       volumeMounts:${cache_volume_mounts}
-      volumes:${cache_volumes}
+      volumes:${cache_volumes}${docker_store_volume}
 EOF
   
   info "✓ Runner deployment created"

@@ -68,6 +68,10 @@ ACME_EMAIL=<acme-email>
 # Optional — host directory of the runners' cargo build cache (default /var/lib/github-runner-cache/<env>/cargo-build);
 # it can reach tens of GB, so point it at a data disk where the node has one:
 # RUNNER_CARGO_CACHE_DIR=/data/github-runner-cache/<env>/cargo-build
+# Optional — keep each runner's Docker images and build cache between jobs in numbered slots under this host
+# directory (one slot more than runners, each at most RUNNER_DOCKER_STORE_LIMIT_GB, default 30). Unset: every
+# job starts with an empty Docker daemon.
+# RUNNER_DOCKER_STORE_DIR=/data/github-runner-docker/<env>
 # Optional — further GitHub orgs whose members may sign in through this env's Dex (their teams
 # become "<org>:<team>" groups), e.g. after another org's apps move here (/migrate-apps):
 # DEX_GITHUB_EXTRA_ORGS="<other-org>"
