@@ -322,8 +322,10 @@ phase_freeze() {
   parents=$(for app in $APPS; do app_json "$app" | jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // empty | split(":")[0]'; done | sort -u)
   deps=$( (for app in $APPS; do app_resources "$app" | awk '$1=="Deployment"{print $2"/"$3}'; done; p '.extraWorkloads[]? | select(test("^Deployment/")) | sub("^Deployment/"; "")') | sort -u)
   crons=$( (for app in $APPS; do app_resources "$app" | awk '$1=="CronJob"{print $2"/"$3}'; done; p '.extraWorkloads[]? | select(test("^CronJob/")) | sub("^CronJob/"; "")') | sort -u)
-  # ArgoCD first: an automated sync that fires while the Deployments are at 0 (any pending commit
-  # does it) puts them straight back, and the source keeps writing during the delta.
+  # ArgoCD first, parents before children: a parent still on auto-sync re-applies a child it
+  # has just been patched off, which restores its replicas. And an automated sync that fires
+  # while the Deployments are at 0 (any pending commit does it) puts them straight back, and
+  # the source keeps writing during the delta.
   confirm "ArgoCD auto-sync off: $(echo $APPS $parents)" "scale to 0: $(echo $deps)" "suspend: $(echo $crons)"
   local st='{"applications":{},"deployments":[],"cronjobs":[]}' a x ns name v
   for a in $APPS $parents; do
@@ -334,7 +336,7 @@ phase_freeze() {
   for x in $crons; do ns=${x%/*}; name=${x#*/}; v=$(ks -n "$ns" get cronjob "$name" -o jsonpath='{.spec.suspend}')
     st=$(jq --arg ns "$ns" --arg n "$name" --argjson s "${v:-false}" '.cronjobs += [{ns:$ns, name:$n, suspend:$s}]' <<<"$st"); done
   printf '%s\n' "$st" > "$STATE"; log "freeze state saved to $STATE"
-  for a in $APPS $parents; do ks -n argocd patch applications.argoproj.io "$a" --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null && log "auto-sync off: $a"; done
+  for a in $parents $APPS; do ks -n argocd patch applications.argoproj.io "$a" --type merge -p '{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null && log "auto-sync off: $a"; done
   for x in $deps; do ks -n "${x%/*}" scale deploy "${x#*/}" --replicas=0 >/dev/null && log "scaled to 0: $x"; done
   for x in $crons; do ks -n "${x%/*}" patch cronjob "${x#*/}" --type merge -p '{"spec":{"suspend":true}}' >/dev/null && log "suspended: $x"; done
   local sel

@@ -436,16 +436,24 @@ ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo systemctl enable k3s-agent >/dev/null 2
 #     (tiny curls survive). A RETURN before KUBE-SERVICES makes :443→MASTER_VLAN_IP skip
 #     the DNAT and hit the master's HOST Traefik directly over Tailscale (single-encap,
 #     fits the path) — the same path that works when the node is parked.
-# (2) Tunnel/VXLAN DNAT (6443/8472) from the master's PUBLIC IP — only when the master
-#     advertises a non-Tailscale InternalIP. Skipped on current cit (master is on its
-#     Tailscale IP, so API/tunnel/VXLAN already reach it directly).
-# The master may report dual-stack InternalIPs; take the IPv4 one.
-MASTER_EXTERNAL_IP=$(kubectl get node -l node-role.kubernetes.io/control-plane \
-  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null \
-  | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
+# (2) Tunnel/VXLAN DNAT (6443/8472) to the master's Tailscale IP, from every non-Tailscale
+#     address the agent may dial: the master's InternalIP AND the apiserver endpoint (the
+#     `kubernetes` Service endpoint, which the remotedialer tunnel for logs/exec dials).
+#     They differ when the master runs on its Tailscale IP but advertises its public IP
+#     (tls-san): checking InternalIP alone skipped the NAT and `kubectl logs/exec` on the
+#     worker returned 502 (test and prod, 2026-11). Skipped when both are the Tailscale IP.
+# The master may report dual-stack addresses; take the IPv4 ones.
+ipv4_only() { tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true; }
+MASTER_INTERNAL_IP=$(kubectl get node -l node-role.kubernetes.io/control-plane \
+  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null | ipv4_only | head -1)
+MASTER_API_IPS=$(kubectl -n default get endpoints kubernetes \
+  -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | ipv4_only)
+TUNNEL_NAT_IPS=$(printf '%s\n' "$MASTER_INTERNAL_IP" $MASTER_API_IPS | grep -v -x -F -e "$MASTER_VLAN_IP_ADDR" -e '' | sort -u | tr '\n' ' ' || true)
+TUNNEL_NAT_IPS="${TUNNEL_NAT_IPS% }"
 NEED_TUNNEL_NAT=false
-if [[ -n "$MASTER_EXTERNAL_IP" && "$MASTER_EXTERNAL_IP" != "$MASTER_VLAN_IP_ADDR" ]]; then
+if [[ -n "$TUNNEL_NAT_IPS" ]]; then
   NEED_TUNNEL_NAT=true
+  info "Master reachable only over Tailscale; tunnel DNAT from: ${TUNNEL_NAT_IPS}"
 fi
 # Build the persisted rules.v4 (only rules we manage — a full iptables-save would capture
 # KUBE-*/CNI-* chains that fail to restore at boot). At boot, restore APPENDs to the
@@ -455,8 +463,10 @@ if [[ -n "${REGISTRY_HOSTS:-}" ]]; then
   PERSIST_BODY+=$'\n'"-A OUTPUT -d ${MASTER_VLAN_IP_ADDR}/32 -p tcp --dport 443 -j RETURN"
 fi
 if $NEED_TUNNEL_NAT; then
-  PERSIST_BODY+=$'\n'"-A OUTPUT -d ${MASTER_EXTERNAL_IP}/32 -p tcp --dport 6443 -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}:6443"
-  PERSIST_BODY+=$'\n'"-A OUTPUT -d ${MASTER_EXTERNAL_IP}/32 -p udp --dport 8472 -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}"
+  for nat_ip in $TUNNEL_NAT_IPS; do
+    PERSIST_BODY+=$'\n'"-A OUTPUT -d ${nat_ip}/32 -p tcp --dport 6443 -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}:6443"
+    PERSIST_BODY+=$'\n'"-A OUTPUT -d ${nat_ip}/32 -p udp --dport 8472 -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}"
+  done
   PERSIST_BODY+=$'\n'"-A POSTROUTING -d ${MASTER_VLAN_IP_ADDR}/32 -p tcp --dport 6443 -o tailscale0 -j MASQUERADE"
   PERSIST_BODY+=$'\n'"-A POSTROUTING -d ${MASTER_VLAN_IP_ADDR}/32 -p udp --dport 8472 -o tailscale0 -j MASQUERADE"
 fi
@@ -471,17 +481,19 @@ if [[ -n "${REGISTRY_HOSTS:-}" ]]; then
     iptables -t nat -I OUTPUT 1 -d ${MASTER_VLAN_IP_ADDR} -p tcp --dport 443 -j RETURN
   fi
 fi
-# (2) tunnel DNAT (only when the master advertises a non-Tailscale InternalIP)
+# (2) tunnel DNAT from each non-Tailscale master address (TUNNEL_NAT_IPS)
 if [[ "${NEED_TUNNEL_NAT}" == "true" ]]; then
   iptables -t nat -S OUTPUT | grep -E -- '--dport (6443|8472) .*DNAT' | grep -v -- "--to-destination ${MASTER_VLAN_IP_ADDR}" | sed 's/^-A //' | while read -r r; do iptables -t nat -D \$r; echo TUNNEL_CHANGED; done
-  addt() { local proto=\$1 dport=\$2 dnat=\$3
-    if ! iptables -t nat -C OUTPUT -d ${MASTER_EXTERNAL_IP} -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat 2>/dev/null; then
-      iptables -t nat -A OUTPUT -d ${MASTER_EXTERNAL_IP} -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat; echo TUNNEL_CHANGED; fi
+  addt() { local src=\$1 proto=\$2 dport=\$3 dnat=\$4
+    if ! iptables -t nat -C OUTPUT -d \$src -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat 2>/dev/null; then
+      iptables -t nat -A OUTPUT -d \$src -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat; echo TUNNEL_CHANGED; fi
     if ! iptables -t nat -C POSTROUTING -d ${MASTER_VLAN_IP_ADDR} -p \$proto --dport \$dport -o tailscale0 -j MASQUERADE 2>/dev/null; then
       iptables -t nat -A POSTROUTING -d ${MASTER_VLAN_IP_ADDR} -p \$proto --dport \$dport -o tailscale0 -j MASQUERADE; echo TUNNEL_CHANGED; fi
   }
-  addt tcp 6443 :6443
-  addt udp 8472 ""
+  for src in ${TUNNEL_NAT_IPS}; do
+    addt \$src tcp 6443 :6443
+    addt \$src udp 8472 ""
+  done
 fi
 # Persist across reboots.
 if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
