@@ -1013,23 +1013,24 @@ EOF
   echo "$client_secret"
 }
 
-# Make the live Dex GitHub connector admit members of these orgs too (their teams become
-# "<org>:<team>" groups for Pomerium policies), e.g. when another org's apps move into this
-# environment and keep their group policies. Adds missing orgs, never removes one, restarts Dex
-# only on a change. The ConfigMap is edited in place because identity.sh never reinstalls an
-# existing Dex (the static clients live only there).
-# Usage: provision::dex_ensure_github_orgs NAMESPACE_SSO ORG [ORG...]
-provision::dex_ensure_github_orgs() {
+# Make the live Dex GitHub connector admit exactly these orgs (their teams become "<org>:<team>"
+# groups for Pomerium policies): the environment's own org plus DEX_GITHUB_EXTRA_ORGS, e.g. when
+# another org's apps move into this environment and keep their group policies. Adds missing orgs
+# AND removes ones no longer listed, so dropping an org from env.properties takes effect on the
+# next identity.sh run. Restarts Dex only on a change. The ConfigMap is edited in place because
+# identity.sh never reinstalls an existing Dex (the static clients live only there).
+# Usage: provision::dex_set_github_orgs NAMESPACE_SSO ORG [ORG...]   (the first ORG is the own org)
+provision::dex_set_github_orgs() {
   local namespace_sso="$1"; shift
-  [[ $# -gt 0 ]] || return 0
+  [[ $# -gt 0 && -n "$1" ]] || { provision::error "dex_set_github_orgs: the environment's own org is required"; return 1; }
   local cfg want new cm_file
   cfg=$(kubectl -n "$namespace_sso" get configmap dex-config -o yaml 2>/dev/null | yq eval '.data."config.yaml"' -) || {
     provision::error "Dex ConfigMap 'dex-config' not found in '${namespace_sso}'"; return 1; }
-  want=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0))')
-  new=$(printf '%s' "$cfg" | WANT_ORGS="$want" yq eval '(.connectors[] | select(.type == "github") | .config.orgs) |= ((. // []) + (env(WANT_ORGS) | map({"name": .})) | unique_by(.name))' -) || return 1
+  want=$(printf '%s\n' "$@" | jq -R . | jq -sc 'map(select(length > 0)) | unique')
+  new=$(printf '%s' "$cfg" | WANT_ORGS="$want" yq eval '(.connectors[] | select(.type == "github") | .config.orgs) = (env(WANT_ORGS) | map({"name": .}))' -) || return 1
   if [[ "$(printf '%s' "$cfg" | yq eval -o=json -I=0 '[.connectors[] | select(.type == "github") | .config.orgs[].name] | sort' -)" == \
         "$(printf '%s' "$new" | yq eval -o=json -I=0 '[.connectors[] | select(.type == "github") | .config.orgs[].name] | sort' -)" ]]; then
-    provision::info "Dex GitHub orgs already include: $*"
+    provision::info "Dex GitHub orgs already exactly: $*"
     return 0
   fi
   cm_file=$(mktemp)
