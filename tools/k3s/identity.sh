@@ -424,8 +424,9 @@ provision_dex() {
       kubectl -n "$NAMESPACE_SSO" get pods -l app.kubernetes.io/name=dex
     fi
 
+    # The own org plus DEX_GITHUB_EXTRA_ORGS, exactly: an org dropped from env.properties is removed.
     # shellcheck disable=SC2086 # space-separated org list
-    provision::dex_ensure_github_orgs "$NAMESPACE_SSO" ${DEX_GITHUB_EXTRA_ORGS:-}
+    provision::dex_set_github_orgs "$NAMESPACE_SSO" "$github_org" ${DEX_GITHUB_EXTRA_ORGS:-}
     return 0
   fi
 
