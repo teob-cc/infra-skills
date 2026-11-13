@@ -108,6 +108,12 @@ fi
 SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -i "$SSH_KEY")
 
 SSH_HOST="$EXTERNAL_IP"
+# A given --ssh-user still needs a reachable host: a box joined from another LAN (home GPU
+# worker → Hetzner master) answers only on its Tailscale IP. Same fallback as join-worker.sh.
+if [[ -n "$SSH_USER" ]] && ! ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SSH_HOST}" "true" 2>/dev/null; then
+  warn "Worker not reachable at ${SSH_HOST}, falling back to Tailscale IP ${VLAN_IP_ADDR}"
+  SSH_HOST="$VLAN_IP_ADDR"
+fi
 if [[ -z "$SSH_USER" ]]; then
   for u in admin tim root; do
     if ssh "${SSH_OPTS[@]}" "$u@${SSH_HOST}" "true" 2>/dev/null; then
@@ -230,7 +236,10 @@ cp "$CONFIG_TOML" "$TEMPLATE"
 # Set nvidia as the default containerd runtime. Since this GPU node is tainted,
 # only GPU workloads are scheduled here, so making nvidia the default is safe.
 # This is required for the NVIDIA device plugin to detect GPUs.
-if ! grep -q "default_runtime_name" "$TEMPLATE"; then
+if grep -q "default_runtime_name" "$TEMPLATE"; then
+  # k3s wrote one already (v1.36+ auto-detects nvidia-container-runtime); make sure it says nvidia
+  sed -i 's/default_runtime_name = "[^"]*"/default_runtime_name = "nvidia"/' "$TEMPLATE"
+else
   # Insert default_runtime_name before the first runtimes block
   sed -i "/\[plugins.*containerd.*runtimes\.runc\]/i\\
 [plugins.'io.containerd.cri.v1.runtime'.containerd]\\
@@ -238,7 +247,11 @@ if ! grep -q "default_runtime_name" "$TEMPLATE"; then
 " "$TEMPLATE"
 fi
 
-# Append NVIDIA runtime block (v1 format for newer containerd)
+# Append the NVIDIA runtime block (v1 format for newer containerd) unless k3s generated it:
+# a second [..runtimes.'nvidia'] table makes containerd exit with "table nvidia already exists".
+if grep -Eq "runtimes\.['\"]?nvidia['\"]?\]" "$TEMPLATE"; then
+  echo "[OK] NVIDIA runtime block already in the generated config; not appending"
+else
 cat >> "$TEMPLATE" <<'EOF'
 
 [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.'nvidia']
@@ -247,6 +260,7 @@ cat >> "$TEMPLATE" <<'EOF'
   BinaryName = "/usr/bin/nvidia-container-runtime"
   SystemdCgroup = true
 EOF
+fi
 
 echo "[OK] NVIDIA runtime set as default in config.toml.tmpl"
 SCRIPT

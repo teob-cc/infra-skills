@@ -243,7 +243,7 @@ apiIngress:
   tls:
     enabled: true
     secretName: nexus-api-tls
-  ipWhitelist:
+  ipAllowList:
     customIPs:
 YAML
 
