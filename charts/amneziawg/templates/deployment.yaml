@@ -1,0 +1,176 @@
+{{- $endpoint := required "awg.endpoint is required (host:port clients dial)" .Values.awg.endpoint }}
+{{- $nexusHost := required "nexus.host is required" .Values.nexus.host }}
+{{- $portalHost := required "portal.host is required" .Values.portal.host }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amneziawg.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # One interface, one host port, one state file.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "amneziawg.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "amneziawg.labels" . | nindent 8 }}
+      annotations:
+        checksum/files: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        sysctls:
+          # Lets the unprivileged nginx bind 443 inside the pod.
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
+      containers:
+        - name: awg
+          image: {{ .Values.images.awg }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/bash", "/files/awg-entrypoint.sh"]
+          env:
+            - name: AWG_ADDRESS
+              value: "{{ .Values.awg.subnetPrefix }}1/24"
+            - name: AWG_MTU
+              value: {{ .Values.awg.mtu | quote }}
+          ports:
+            - name: awg
+              containerPort: {{ .Values.awg.listenPort }}
+              hostPort: {{ .Values.awg.hostPort }}
+              protocol: UDP
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_ADMIN", "MKNOD"]
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "ip link show awg0 up | grep -q awg0"]
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources.awg | nindent 12 }}
+          volumeMounts:
+            - { name: files, mountPath: /files, readOnly: true }
+            - { name: server, mountPath: /etc/awg, readOnly: true }
+            # amneziawg-go and the awg tool agree on one of these; mount the same volume at both.
+            - { name: uapi, mountPath: /var/run/amneziawg }
+            - { name: uapi, mountPath: /var/run/wireguard }
+        - name: nexus
+          image: {{ .Values.images.nginx }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          # Reload twice a day so a renewed certificate is picked up.
+          command:
+            - /bin/sh
+            - -c
+            - (while sleep 43200; do nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'
+          env:
+            - name: VPN_CIDR
+              value: "{{ .Values.awg.subnetPrefix }}0/24"
+            - name: NEXUS_HOST
+              value: {{ $nexusHost | quote }}
+            - name: NEXUS_UPSTREAM
+              value: {{ .Values.nexus.upstream | quote }}
+            - name: NEXUS_BASIC
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.nexus.credentialsSecret }}
+                  key: basic
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources.nginx | nindent 12 }}
+          volumeMounts:
+            - name: files
+              mountPath: /etc/nginx/templates/default.conf.template
+              subPath: default.conf.template
+              readOnly: true
+            - { name: tls, mountPath: /etc/nginx/tls, readOnly: true }
+        - name: portal
+          image: {{ .Values.images.portal }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["node", "/files/portal.mjs"]
+          env:
+            - { name: PORT, value: "8080" }
+            - { name: STATE_FILE, value: /data/peers.json }
+            - { name: UAPI_DIRS, value: /var/run/amneziawg }
+            - { name: SERVER_CONF, value: /etc/awg/awg0.conf }
+            - name: ENDPOINT
+              value: {{ $endpoint | quote }}
+            - name: SUBNET_PREFIX
+              value: {{ .Values.awg.subnetPrefix | quote }}
+            - name: CLIENT_ALLOWED_IPS
+              value: "{{ .Values.awg.subnetPrefix }}1/32"
+            - name: CLIENT_MTU
+              value: {{ .Values.awg.mtu | quote }}
+            - name: NEXUS_URL
+              value: "https://{{ $nexusHost }}"
+            - name: PUBLIC_HOST
+              value: {{ $portalHost | quote }}
+            - name: JWKS_URL
+              value: {{ default (printf "https://%s/.well-known/pomerium/jwks.json" $portalHost) .Values.portal.jwksUrl | quote }}
+            - name: ADMIN_GROUPS
+              value: {{ join "," .Values.portal.adminGroups | quote }}
+            - name: MAX_DEVICES
+              value: {{ .Values.portal.maxDevicesPerUser | quote }}
+            - name: TITLE
+              value: {{ .Values.portal.title | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            # Root with no capabilities: the UAPI socket is owner-only and cannot be chmodded.
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.resources.portal | nindent 12 }}
+          volumeMounts:
+            - { name: files, mountPath: /files, readOnly: true }
+            - { name: server, mountPath: /etc/awg, readOnly: true }
+            - { name: uapi, mountPath: /var/run/amneziawg }
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: files
+          configMap:
+            name: {{ .Release.Name }}-files
+        - name: server
+          secret:
+            secretName: {{ .Values.awg.serverSecret }}
+            defaultMode: 0400
+        - name: tls
+          secret:
+            secretName: {{ .Values.nexus.certificate.secretName }}
+        - name: uapi
+          emptyDir: {}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-state
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

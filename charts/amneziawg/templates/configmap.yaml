@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-files
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amneziawg.labels" . | nindent 4 }}
+data:
+  awg-entrypoint.sh: |
+    {{- .Files.Get "files/awg-entrypoint.sh" | nindent 4 }}
+  portal.mjs: |
+    {{- .Files.Get "files/portal.mjs" | nindent 4 }}
+  default.conf.template: |
+    {{- .Files.Get "files/nexus.conf.template" | nindent 4 }}

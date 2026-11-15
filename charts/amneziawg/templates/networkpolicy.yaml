@@ -1,0 +1,54 @@
+# Into the gateway pod: the tunnel port from anywhere, the portal from Pomerium only. The nginx
+# port is not listed, so it is reachable through the tunnel alone (tunnel traffic is decrypted
+# inside the pod and never crosses the pod's own policy).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "amneziawg.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "amneziawg.selector" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+          port: {{ .Values.awg.listenPort }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.portal.pomerium.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.portal.pomerium.podLabels | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 8080
+{{- if .Values.nexus.namespace }}
+---
+# Into Nexus: this pod only, on the repository port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-allow-vpn-gateway
+  namespace: {{ .Values.nexus.namespace }}
+  labels:
+    {{- include "amneziawg.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "amneziawg.selector" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nexus.port }}
+{{- end }}
