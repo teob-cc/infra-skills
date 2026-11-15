@@ -371,7 +371,8 @@ function send(res, status, body, type = 'text/html; charset=utf-8', extra = {}) 
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
     'x-frame-options': 'DENY',
-    'referrer-policy': 'no-referrer',
+    // Not no-referrer: that makes browsers send "Origin: null" on this page's own form posts.
+    'referrer-policy': 'same-origin',
     'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
     ...extra,
   });
@@ -396,6 +397,9 @@ function readForm(req) {
 
 // A state-changing request must come from this page: browsers send Origin on every POST.
 function sameOrigin(req) {
+  // Sec-Fetch-Site is set by the browser and cannot be set or changed by page script.
+  const site = req.headers['sec-fetch-site'];
+  if (typeof site === 'string') return site === 'same-origin';
   const origin = req.headers.origin;
   if (typeof origin !== 'string') return false;
   try {
