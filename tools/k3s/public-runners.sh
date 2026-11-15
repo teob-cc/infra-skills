@@ -26,6 +26,7 @@ set -euo pipefail
 #   PUBLIC_RUNNER_REPOS     public repos (space- or comma-separated) admitted to the group; required
 #   PUBLIC_RUNNER_GROUP     runner group name (default: public)
 #   PUBLIC_RUNNER_REPLICAS  runners in the pool (default: 1)
+#   RUNNER_SCRATCH_IN_MEMORY  true: /runner and the work directory are memory-backed (see github-action-runner.sh)
 #
 # Requires github-action-runner.sh to have run first (ARC, the GitHub App credentials, the runner image).
 # The GitHub App needs the organization permissions "Self-hosted runners: Read and write" and
@@ -175,6 +176,19 @@ if [[ "$DRY_RUN" != true ]]; then
   [[ "$m" =~ ^[0-9]{3,4}$ ]] && pod_mtu=$m
 fi
 
+# Runner and work directories in memory, as github-action-runner.sh (RUNNER_SCRATCH_IN_MEMORY=true).
+SCRATCH_SPEC="" SCRATCH_VOLUME=""
+if [[ "${RUNNER_SCRATCH_IN_MEMORY:-}" == "true" ]]; then
+  SCRATCH_SPEC="
+      volumeStorageMedium: Memory
+      volumeSizeLimit: ${RUNNER_DIR_MEMORY_LIMIT:-2Gi}"
+  SCRATCH_VOLUME="
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: ${RUNNER_WORK_MEMORY_LIMIT:-6Gi}"
+fi
+
 manifest=$(cat <<EOF
 apiVersion: actions.summerwind.dev/v1alpha1
 kind: RunnerDeployment
@@ -230,7 +244,7 @@ spec:
             periodSeconds: 30
             timeoutSeconds: 20
             failureThreshold: 3
-      terminationGracePeriodSeconds: 300
+      terminationGracePeriodSeconds: 300${SCRATCH_SPEC}
       dockerdContainerResources:
         limits:
           memory: "${DOCKERD_MEMORY_LIMIT:-8Gi}"
@@ -260,7 +274,7 @@ spec:
         - name: coursier-cache
           hostPath:
             path: /var/lib/github-runner-cache/${ENV_NAME}-public/coursier
-            type: DirectoryOrCreate
+            type: DirectoryOrCreate${SCRATCH_VOLUME}
 ---
 # Internet only: off every private range except DNS and Traefik (the env's public endpoints hairpin through it).
 apiVersion: networking.k8s.io/v1

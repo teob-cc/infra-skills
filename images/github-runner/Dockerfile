@@ -45,10 +45,13 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     libatomic1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Summerwind has no 2.338.0 tag yet. Replace the runner payload while preserving
+# Summerwind has no 2.338.x tag yet. Replace the runner payload while preserving
 # ARC's startup scripts and hooks; ARC moves externalstmp into place at startup.
-ARG ACTIONS_RUNNER_VERSION=2.338.0
-ARG ACTIONS_RUNNER_SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
+# Keep this at GitHub's latest release (gh api /repos/actions/runner/releases/latest): a pod whose
+# runner is behind self-updates before its first job, a ~700 MB download and unpack on EVERY
+# ephemeral pod (measured on prod 2026-11-15 with 2.338.0 against 2.338.2: 150 pods a day).
+ARG ACTIONS_RUNNER_VERSION=2.338.2
+ARG ACTIONS_RUNNER_SHA256=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
 RUN test "$(dpkg --print-architecture)" = amd64 \
     && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" -o /tmp/runner.tgz \
     && echo "${ACTIONS_RUNNER_SHA256}  /tmp/runner.tgz" | sha256sum -c - \

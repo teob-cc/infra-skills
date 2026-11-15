@@ -5,8 +5,8 @@ The runner carries Rust 1.99.0, rustfmt, Clippy, protobuf tooling and cargo-audi
 wsgrpc builds in a Debian 13 container so its runtime does not inherit Ubuntu's
 libc requirements.
 
-GitHub runner 2.338.0 is installed over the digest-pinned Summerwind Ubuntu 24.04
-base. Summerwind has no 2.338.0 image tag yet. The runner archive is checked against
+GitHub runner 2.338.2 is installed over the digest-pinned Summerwind Ubuntu 24.04
+base. Summerwind has no 2.338.x image tag yet. The runner archive is checked against
 the SHA-256 published by GitHub; ARC's scripts and container hooks are retained.
 When Summerwind publishes a matching image, replace the base and remove the
 payload replacement together.

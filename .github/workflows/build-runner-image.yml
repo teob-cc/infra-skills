@@ -170,8 +170,11 @@ jobs:
           # subdirectory so unrelated application caches stay untouched.
           sudo install -d -o "$(id -u)" -g "$(id -g)" /tmp/.buildx-cache/runner-image
           docker buildx build --platform linux/amd64 --cache-from type=local,src=/tmp/.buildx-cache/runner-image/current --load -t runner-candidate:${GITHUB_RUN_ID} "$CONTEXT"
-          docker run --rm --network none --entrypoint bash runner-candidate:${GITHUB_RUN_ID} -ec '
-            test "$(/runnertmp/bin/Runner.Listener --version)" = 2.338.0
+          # The runner version the image must carry is the one the Dockerfile pins, so a bump is one edit.
+          RUNNER_VERSION=$(sed -n "s/^ARG ACTIONS_RUNNER_VERSION=//p" "$DOCKERFILE")
+          test -n "$RUNNER_VERSION"
+          docker run --rm --network none -e RUNNER_VERSION="$RUNNER_VERSION" --entrypoint bash runner-candidate:${GITHUB_RUN_ID} -ec '
+            test "$(/runnertmp/bin/Runner.Listener --version)" = "$RUNNER_VERSION"
             test "$(rustc --version | cut -d" " -f2)" = 1.99.0
             cargo audit --version
             protoc --version
