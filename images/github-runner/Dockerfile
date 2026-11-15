@@ -100,10 +100,21 @@ RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 
 # pin exactly 1.58.2). Bump here and in those apps together.
 ENV PLAYWRIGHT_VERSION=1.58.2
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+# The browser download runs under a throwaway Node 22: under Node 26 the installer of Playwright 1.58.2 unpacks
+# Chromium and then never returns (no headless shell, no ffmpeg; the image build hung for 20 minutes on
+# 2026-11-15, reproduced with node:26.13.0 against node:22.23.4). Drop this with the next Playwright bump that
+# installs under the image's own Node.
+ARG PLAYWRIGHT_INSTALL_NODE_VERSION=22.23.4
+ARG PLAYWRIGHT_INSTALL_NODE_SHA256=b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406
 RUN npm install --global @playwright/test@${PLAYWRIGHT_VERSION} \
     && npx playwright install-deps chromium \
-    && mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" \
-    && npx playwright install chromium \
+    && mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" /tmp/pw-node \
+    && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 "https://nodejs.org/dist/v${PLAYWRIGHT_INSTALL_NODE_VERSION}/node-v${PLAYWRIGHT_INSTALL_NODE_VERSION}-linux-x64.tar.gz" -o /tmp/pw-node.tgz \
+    && echo "${PLAYWRIGHT_INSTALL_NODE_SHA256}  /tmp/pw-node.tgz" | sha256sum -c - \
+    && tar xzf /tmp/pw-node.tgz -C /tmp/pw-node --strip-components=1 --no-same-owner \
+    && timeout 600 /tmp/pw-node/bin/node "$(npm root --global)/@playwright/test/cli.js" install chromium \
+    && rm -rf /tmp/pw-node /tmp/pw-node.tgz \
+    && test -d "$PLAYWRIGHT_BROWSERS_PATH/chromium_headless_shell-"* \
     && chmod -R 777 "$PLAYWRIGHT_BROWSERS_PATH"
 
 # Install Yarn and PNPM
