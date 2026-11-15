@@ -1012,6 +1012,29 @@ ${docker_store_script}
     info "  Docker storage kept between jobs: ${RUNNER_DOCKER_STORE_DIR} ($((runner_replicas + 1)) slots, ${RUNNER_DOCKER_STORE_LIMIT_GB:-30} GB each at most)"
   fi
 
+  # Runner and work directories in memory (RUNNER_SCRATCH_IN_MEMORY=true in env.properties; off when unset).
+  # Both are per-pod emptyDirs that every ephemeral pod fills again and throws away: the runner payload ARC copies
+  # into /runner (~0.7 GB), then the checkout, the build output and node_modules under /runner/_work. On disk that
+  # was 85% of what the CI pods of a busy node wrote (measured 2026-11-15: 870 of 1,020 GB in a week, 413 pods),
+  # all of it wear with nothing kept. tmpfs pages count against the runner container's memory limit, so
+  # RUNNER_MEMORY_LIMIT has to cover the build plus RUNNER_WORK_MEMORY_LIMIT; a job that outgrows a volume gets
+  # ENOSPC, it does not take the node's memory. The caches (coursier, cargo, the Docker store) stay on disk: they
+  # are written once and read by every later job.
+  local scratch_spec="" scratch_volume=""
+  if [[ "${RUNNER_SCRATCH_IN_MEMORY:-}" == "true" ]]; then
+    # volumeStorageMedium/volumeSizeLimit are ARC's knobs for its own "runner" emptyDir; a volume named "work"
+    # replaces the "work" emptyDir it would add.
+    scratch_spec="
+      volumeStorageMedium: Memory
+      volumeSizeLimit: ${RUNNER_DIR_MEMORY_LIMIT:-2Gi}"
+    scratch_volume="
+        - name: work
+          emptyDir:
+            medium: Memory
+            sizeLimit: ${RUNNER_WORK_MEMORY_LIMIT:-6Gi}"
+    info "  Runner and work directories in memory: /runner ${RUNNER_DIR_MEMORY_LIMIT:-2Gi}, /runner/_work ${RUNNER_WORK_MEMORY_LIMIT:-6Gi} at most"
+  fi
+
   # Convert comma-separated labels to YAML array
   local labels_yaml=""
   IFS=',' read -ra LABEL_ARRAY <<< "$runner_labels"
@@ -1146,7 +1169,7 @@ spec:
             failureThreshold: 3
       # Increase termination grace period to allow dockerd to shut down gracefully
       # This helps prevent PreStopHook failures when pod is being terminated
-      terminationGracePeriodSeconds: 300
+      terminationGracePeriodSeconds: 300${scratch_spec}
       # Sized for JVM builds: a Scala 3 monorepo compile runs the sbt JVM past 6 GiB resident
       # (heap is capped by MaxRAMPercentage, but compiler, Zinc and metaspace are not), and the
       # cgroup then kills the runner mid-job with no log left on GitHub. Override per env in
@@ -1180,7 +1203,7 @@ spec:
             - name: cargo-cache
               mountPath: /cargo-cache
       volumeMounts:${cache_volume_mounts}
-      volumes:${cache_volumes}${docker_store_volume}
+      volumes:${cache_volumes}${docker_store_volume}${scratch_volume}
 EOF
   
   info "✓ Runner deployment created"

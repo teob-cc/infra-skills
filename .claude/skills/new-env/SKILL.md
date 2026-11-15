@@ -72,6 +72,12 @@ ACME_EMAIL=<acme-email>
 # directory (one slot more than runners, each at most RUNNER_DOCKER_STORE_LIMIT_GB, default 30). Unset: every
 # job starts with an empty Docker daemon.
 # RUNNER_DOCKER_STORE_DIR=/data/github-runner-docker/<env>
+# Optional — keep each runner pod's /runner and work directory in memory instead of on the node's disk (they are
+# refilled and thrown away by every job; on disk that is most of what CI writes). The memory counts against
+# RUNNER_MEMORY_LIMIT; the caps default to 2Gi and 6Gi. The public pool (public-runners.sh) follows the same switch.
+# RUNNER_SCRATCH_IN_MEMORY=true
+# RUNNER_DIR_MEMORY_LIMIT=2Gi
+# RUNNER_WORK_MEMORY_LIMIT=6Gi
 # Optional — further GitHub orgs whose members may sign in through this env's Dex (their teams
 # become "<org>:<team>" groups), e.g. after another org's apps move here (/migrate-apps):
 # DEX_GITHUB_EXTRA_ORGS="<other-org>"
