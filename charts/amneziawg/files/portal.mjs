@@ -314,9 +314,45 @@ function page(user, { live, liveError, created, error } = {}) {
         If you lose it, revoke the device and add it again.</p>
         <pre id="conf">${esc(created.config)}</pre>
         <p><a class="button" download="${esc(created.fileName)}" href="data:text/plain;base64,${Buffer.from(created.config).toString('base64')}">Download ${esc(created.fileName)}</a></p>
-        <p>Import the file into the AmneziaVPN or AmneziaWG client. Plain WireGuard clients cannot use it.</p>
+        <p>Next: <a href="#install">install the AmneziaWG client</a> and import this file.</p>
       </section>`
     : '';
+  const gatewayIp = cfg.clientAllowedIps.split('/')[0];
+  const nexusHost = cfg.nexusUrl ? new URL(cfg.nexusUrl).host : '';
+  const install = `<section id="install"><h2>Install a client</h2>
+    <p>The config is for <strong>AmneziaWG</strong>, a WireGuard variant that gets through networks where WireGuard is blocked.
+    The standard WireGuard app cannot open it. Use the app called <strong>AmneziaWG</strong>, not AmneziaVPN:
+    this tunnel carries one address only, and AmneziaVPN may try to send all your traffic into it.</p>
+    <div class="scroll"><table><thead><tr><th>System</th><th>Get the app</th><th>Import the config</th></tr></thead><tbody>
+      <tr><td>macOS 12+, iPhone, iPad</td>
+          <td><a href="https://apps.apple.com/app/amneziawg/id6478942365" rel="noopener">App Store: AmneziaWG</a></td>
+          <td>Import tunnel(s) from file, pick the .conf, allow the VPN configuration, then Activate.</td></tr>
+      <tr><td>Windows 10/11</td>
+          <td><a href="https://github.com/amnezia-vpn/amneziawg-windows-client/releases/latest" rel="noopener">GitHub: amneziawg-windows-client</a> (the installer for your CPU, usually amd64)</td>
+          <td>Import tunnel(s) from file, pick the .conf, then Activate.</td></tr>
+      <tr><td>Android</td>
+          <td><a href="https://play.google.com/store/apps/details?id=org.amnezia.awg" rel="noopener">Google Play: AmneziaWG</a></td>
+          <td>Plus button, Import from file or archive, pick the .conf, then switch it on.</td></tr>
+      <tr><td>Linux, CI machines</td>
+          <td><a href="https://github.com/amnezia-vpn/amneziawg-tools" rel="noopener">amneziawg-tools</a> plus the
+              <a href="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module" rel="noopener">kernel module</a> or
+              <a href="https://github.com/amnezia-vpn/amneziawg-go" rel="noopener">amneziawg-go</a></td>
+          <td>Save the file as <code>/etc/amnezia/amneziawg/nexus.conf</code>, then <code>sudo awg-quick up nexus</code>.</td></tr>
+    </tbody></table></div>
+    ${cfg.nexusUrl ? `<h2>Check that it works</h2>
+    <p>With the tunnel active, this must print <code>HTTP/2 200</code>:</p>
+    <pre>curl -sI ${esc(cfg.nexusUrl)}/service/rest/v1/status | head -1</pre>
+    <ul>
+      <li><strong>Could not resolve host</strong>, or the name resolves to a public address: your router or DNS filters names that
+          point at private addresses. Add this line to <code>/etc/hosts</code>
+          (Windows: <code>C:\\Windows\\System32\\drivers\\etc\\hosts</code>): <code>${esc(gatewayIp)} ${esc(nexusHost)}</code></li>
+      <li><strong>Timeout</strong>: the tunnel is not up. In the app the tunnel should show a recent handshake; on this page
+          “Last connected” should stop saying “never”. If it does not, your network may block UDP to <code>${esc(cfg.endpoint)}</code>.</li>
+      <li><strong>Everything else on your machine stops working</strong> while connected: you imported the file into AmneziaVPN
+          or changed AllowedIPs. Use the AmneziaWG app with the file unchanged.</li>
+    </ul>` : ''}
+    <p class="muted">One config per machine: the same file on two machines makes both connections drop in turns.
+    Lost the file or the machine? Revoke the device above and create a new one.</p></section>`;
   const nexus = cfg.nexusUrl
     ? `<section><h2>Nexus over the VPN</h2>
         <p>While connected, <code>${esc(cfg.nexusUrl)}</code> serves the repositories read-only with no credentials.
@@ -338,6 +374,7 @@ function page(user, { live, liveError, created, error } = {}) {
   th { color: var(--muted); font-weight: 600; font-size: 13px; }
   pre { background: var(--box); border: 1px solid var(--line); border-radius: 6px; padding: 12px; overflow-x: auto; font-size: 13px; }
   code { font-size: 13px; }
+  a { color: var(--accent); } li { margin: 6px 0; } td { white-space: normal; } th, td:first-child { white-space: nowrap; }
   input[type=text] { font: inherit; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); min-width: 220px; }
   button, .button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: #fff; cursor: pointer; text-decoration: none; display: inline-block; }
   button.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
@@ -357,6 +394,7 @@ ${mine >= cfg.maxDevices
     ? `<p class="muted">You have ${mine} devices, which is the limit. Revoke one to add another.</p>`
     : `<form method="post" action="/devices"><input type="text" name="name" required maxlength="40" pattern="[A-Za-z0-9 ._\\-]{1,40}" placeholder="e.g. work-laptop"> <button>Create key</button></form>
        <p class="muted">One key per machine. Letters, digits, space, dot, dash and underscore.</p>`}
+${install}
 ${nexus}
 </body></html>`;
 }
