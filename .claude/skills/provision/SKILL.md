@@ -295,6 +295,18 @@ Both use static local PVs under `/data` pinned to the main node, and support `--
 `--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive. After
 first install, rerun `tools/k3s/observability.sh <env>` to load their scrape jobs and alerts.
 
+**AmneziaWG gateway for Nexus** — lets people outside the cluster use Nexus over a tunnel instead of
+an IP allowlist. Run it after Nexus (it creates a read-only Nexus account):
+```bash
+tools/k3s/amneziawg.sh <env>            # --status shows the interface and the device list
+```
+A tunnel peer reaches one address, a proxy that serves Nexus read-only with no client credentials
+at `nexus-vpn.<HOSTNAME>`; the pod forwards nothing else. People create and revoke their own device
+keys at `vpn.<HOSTNAME>`, a Pomerium route for the groups in `AWG_GROUPS` (default
+`<org>:vpn,<org>:admins`; create the `vpn` team first). Clients need the AmneziaWG app; the page
+has install steps. The node firewall must allow the UDP port in `AWG_HOST_PORT` (default 51820).
+Removing someone from the group stops new keys only: an admin revokes their devices on the page.
+
 **WireGuard** (wg-portal VPN with web management) — only if the environment has a `wg.<HOSTNAME>`
 route and a `wg-portal-secrets` secret:
 ```bash
