@@ -1,0 +1,28 @@
+# Rendered by the envsubst step of the nginx image, which substitutes only variables set in the
+# container environment; the $variables of nginx itself are left alone.
+server {
+  listen 443 ssl;
+  http2 on;
+  server_name ${NEXUS_HOST};
+
+  ssl_certificate     /etc/nginx/tls/tls.crt;
+  ssl_certificate_key /etc/nginx/tls/tls.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+
+  # Tunnel peers only. Other pods are also kept out by the NetworkPolicy.
+  allow ${VPN_CIDR};
+  deny all;
+
+  client_max_body_size 1m;
+  proxy_read_timeout 300s;
+
+  location / {
+    proxy_pass ${NEXUS_UPSTREAM};
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    # Whatever the client sent is replaced by the read-only account.
+    proxy_set_header Authorization "Basic ${NEXUS_BASIC}";
+  }
+}

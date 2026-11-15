@@ -30,9 +30,11 @@ set -uo pipefail
 #  12. redpanda  (optional)  Redpanda operator + broker (kafka-journal stack)
 #  13. scylla    (optional)  Scylla operator + node (kafka-journal stack)
 #  14. nexus     (optional)  artifact repository
-#  15. wireguard (optional)  wg-portal VPN
-#  16. network-policies      platform NetworkPolicies, after the components they fence
-#  17. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
+#  15. amneziawg (optional) AmneziaWG gateway: read-only Nexus over a tunnel, key page behind
+#                            Pomerium; after nexus, which it creates an account in
+#  16. wireguard (optional)  wg-portal VPN
+#  17. network-policies      platform NetworkPolicies, after the components they fence
+#  18. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
 #
 # After redpanda/scylla ran, observability is re-applied automatically so their scrape jobs
 # and alert groups load. A step whose output shows a transient error (API connection lost,
@@ -71,10 +73,10 @@ PROG="$(basename "$0")"
 
 # --- Ordered step definitions (parallel arrays; bash 3.2 compatible) ---------
 # STEP_NAMES[i] is both the step id and the tools/k3s/<name>.sh basename.
-STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image base-image minio postgres mysql redpanda scylla nexus wireguard network-policies backup)
-STEP_TIERS=(core     core    core   core                 core   core          core         core       optional optional optional optional optional optional optional core             optional)
+STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image base-image minio postgres mysql redpanda scylla nexus amneziawg wireguard network-policies backup)
+STEP_TIERS=(core     core    core   core                 core   core          core         core       optional optional optional optional optional optional optional  optional core             optional)
 # Script each step delegates to, relative to the repo root.
-STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/base-image.sh tools/k3s/minio.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/wireguard.sh tools/k3s/network-policies.sh tools/backup.sh)
+STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/base-image.sh tools/k3s/minio.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/amneziawg.sh tools/k3s/wireguard.sh tools/k3s/network-policies.sh tools/backup.sh)
 
 # Optional steps the environment opted into (env.properties UP_OPTIONAL_STEPS, space or
 # comma separated). Read after load_env, see env_wants().

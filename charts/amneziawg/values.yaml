@@ -1,0 +1,69 @@
+# AmneziaWG gateway for Nexus access.
+#
+# One pod, three containers sharing a network namespace:
+#   awg     userspace AmneziaWG interface (amneziawg-go), published on a host UDP port
+#   nexus   nginx on the tunnel address; proxies to Nexus with a fixed read-only account
+#   portal  key page behind Pomerium; users create and revoke their own devices
+#
+# The pod does not forward packets. A VPN peer can reach the nexus container and nothing else,
+# so a leaked device key gives read-only Nexus access and no network foothold.
+
+images:
+  awg: amneziavpn/amneziawg-go:3.1.20260828
+  nginx: nginxinc/nginx-unprivileged:1.28-alpine
+  portal: node:22-alpine
+  pullPolicy: IfNotPresent
+
+awg:
+  # Tunnel network: a /24. The gateway takes .1, devices get .2 to .254.
+  subnetPrefix: "10.77.0."
+  listenPort: 51820      # inside the pod; must match ListenPort in the server Secret
+  hostPort: 51820        # UDP port on the node that clients dial
+  mtu: 1280
+  # host:port written into client configs, e.g. "203.0.113.10:51820". Required.
+  endpoint: ""
+  # Secret with key awg0.conf: [Interface] PrivateKey, ListenPort and the obfuscation
+  # parameters (Jc, Jmin, Jmax, S1, S2, H1..H4). Created by tools/k3s/amneziawg.sh.
+  serverSecret: awg-server
+
+nexus:
+  # Hostname clients use inside the tunnel. Its DNS A record must point at <subnetPrefix>1 and
+  # the certificate is issued over DNS-01 (the address is private). Required.
+  host: ""
+  upstream: http://nexus.nexus.svc.cluster.local:8081
+  # Namespace Nexus runs in; a NetworkPolicy there admits this pod. Empty: no policy is created.
+  namespace: nexus
+  port: 8081
+  # Secret with key basic: base64 of "user:password" for a read-only Nexus account.
+  credentialsSecret: awg-nexus-reader
+  certificate:
+    issuerName: letsencrypt-prod
+    issuerKind: ClusterIssuer
+    secretName: awg-nexus-tls
+
+portal:
+  # Public hostname of the key page (the Pomerium route). Required.
+  host: ""
+  # Pomerium's signing keys. Empty: https://<portal.host>/.well-known/pomerium/jwks.json
+  jwksUrl: ""
+  # Groups whose members see and can revoke every device, e.g. ["my-org:admins"].
+  adminGroups: []
+  maxDevicesPerUser: 5
+  title: VPN keys
+  # Pomerium pods allowed to reach the portal.
+  pomerium:
+    namespace: sso
+    podLabels:
+      app.kubernetes.io/name: pomerium
+
+persistence:
+  storageClass: ""
+  size: 32Mi
+
+resources:
+  awg: { requests: { cpu: 20m, memory: 32Mi }, limits: { memory: 256Mi } }
+  nginx: { requests: { cpu: 10m, memory: 24Mi }, limits: { memory: 128Mi } }
+  portal: { requests: { cpu: 10m, memory: 48Mi }, limits: { memory: 192Mi } }
+
+nodeSelector: {}
+tolerations: []
