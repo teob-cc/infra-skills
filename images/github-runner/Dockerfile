@@ -96,14 +96,17 @@ RUN curl -fsSL --retry 5 --retry-all-errors --connect-timeout 20 --max-time 300 
     && npm install --global npm@11
 
 # Playwright: pin version and pre-install Chromium binary + OS deps into the image.
-# Held at 1.58.2: the baked Chromium must match the apps' @playwright/test (vstreams and teob-feeds
-# pin exactly 1.58.2). Bump here and in those apps together.
-ENV PLAYWRIGHT_VERSION=1.58.2
+# The baked Chromium must match the apps' @playwright/test (teob-feeds pins it exactly and its ui-e2e workflow
+# runs on this image's Node). Bump here and in those apps together.
+# Not below 1.60.0 while the image is on Node 24.16+ or 26: the browser installer of older versions unpacks
+# Chromium and never returns (microsoft/playwright#41133; the image build hung on 1.58.2 on 2026-11-15).
+ENV PLAYWRIGHT_VERSION=1.65.1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN npm install --global @playwright/test@${PLAYWRIGHT_VERSION} \
     && npx playwright install-deps chromium \
     && mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" \
-    && npx playwright install chromium \
+    && timeout 900 npx playwright install chromium \
+    && test -d "$PLAYWRIGHT_BROWSERS_PATH"/chromium_headless_shell-* \
     && chmod -R 777 "$PLAYWRIGHT_BROWSERS_PATH"
 
 # Install Yarn and PNPM
