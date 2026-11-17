@@ -193,6 +193,13 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 # wal_compression: lz4 (or zstd) compresses full-page images in WAL, which shrinks the WAL
 # archive of a write-heavy journal by a large share for little CPU. A reload applies it, no restart.
 : "${POSTGRES_WAL_COMPRESSION:=off}"
+# checkpoint_timeout: time between checkpoints. A table whose few rows are rewritten all day gets
+# its hot pages flushed at every checkpoint, so 30min writes them a sixth as often as 5min, for a
+# longer crash recovery (up to that much WAL to replay). A reload applies it, no restart.
+: "${POSTGRES_CHECKPOINT_TIMEOUT:=5min}"
+# log_temp_files: log every temporary file of at least this many kB (0 = all, -1 = off), to find
+# the queries whose sorts spill past work_mem. A reload applies it, no restart.
+: "${POSTGRES_LOG_TEMP_FILES:=-1}"
 : "${ENFORCE_POMERIUM:=true}"
 # PostgreSQL operand image (CNPG postgres-containers). Use the immutable
 # MM.mm-TIMESTAMP-TYPE-OS tag: the bare MM.mm tags (e.g. 16.6) are the deprecated
@@ -1743,6 +1750,8 @@ ${managed_block}${plugins_block}
       min_wal_size: "1GB"
       max_wal_size: "${POSTGRES_MAX_WAL_SIZE}"
       wal_compression: "${POSTGRES_WAL_COMPRESSION}"
+      checkpoint_timeout: "${POSTGRES_CHECKPOINT_TIMEOUT}"
+      log_temp_files: "${POSTGRES_LOG_TEMP_FILES}"
     # SCRAM only (INFRA-65). CNPG appends "host all all all scram-sha-256" itself (PG >= 14);
     # these private-range lines spell the method out. "md5" here would also accept roles
     # whose stored password is still an MD5 hash (password_encryption is scram-sha-256 by
