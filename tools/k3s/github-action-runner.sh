@@ -1035,6 +1035,23 @@ ${docker_store_script}
     info "  Runner and work directories in memory: /runner ${RUNNER_DIR_MEMORY_LIMIT:-2Gi}, /runner/_work ${RUNNER_WORK_MEMORY_LIMIT:-6Gi} at most"
   fi
 
+  # /tmp in memory (RUNNER_TMP_MEMORY_LIMIT in env.properties, for example 1Gi; on the pod overlay when unset).
+  # Tests that keep databases or other fsync-heavy files in /tmp write many times the size of the live files
+  # (measured 2026-11-17 on one Scala and Node build: 2.7 GB written per run for 52 MB of files). The pages count
+  # against RUNNER_MEMORY_LIMIT like the work directory. The mount hides whatever the runner image ships in /tmp.
+  local tmp_mount="" tmp_volume=""
+  if [[ -n "${RUNNER_TMP_MEMORY_LIMIT:-}" ]]; then
+    tmp_mount="
+        - name: tmp
+          mountPath: /tmp"
+    tmp_volume="
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: ${RUNNER_TMP_MEMORY_LIMIT}"
+    info "  /tmp in memory: ${RUNNER_TMP_MEMORY_LIMIT} at most"
+  fi
+
   # Convert comma-separated labels to YAML array
   local labels_yaml=""
   IFS=',' read -ra LABEL_ARRAY <<< "$runner_labels"
@@ -1202,8 +1219,8 @@ spec:
               mountPath: /cache
             - name: cargo-cache
               mountPath: /cargo-cache
-      volumeMounts:${cache_volume_mounts}
-      volumes:${cache_volumes}${docker_store_volume}${scratch_volume}
+      volumeMounts:${tmp_mount}${cache_volume_mounts}
+      volumes:${cache_volumes}${docker_store_volume}${scratch_volume}${tmp_volume}
 EOF
   
   info "✓ Runner deployment created"

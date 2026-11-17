@@ -78,6 +78,9 @@ ACME_EMAIL=<acme-email>
 # RUNNER_SCRATCH_IN_MEMORY=true
 # RUNNER_DIR_MEMORY_LIMIT=2Gi
 # RUNNER_WORK_MEMORY_LIMIT=6Gi
+# Optional — keep each runner pod's /tmp in memory too, capped at this size (tests that keep databases in /tmp
+# write many times the size of the files). Counts against RUNNER_MEMORY_LIMIT; hides what the image ships in /tmp.
+# RUNNER_TMP_MEMORY_LIMIT=1Gi
 # Optional — further GitHub orgs whose members may sign in through this env's Dex (their teams
 # become "<org>:<team>" groups), e.g. after another org's apps move here (/migrate-apps):
 # DEX_GITHUB_EXTRA_ORGS="<other-org>"
