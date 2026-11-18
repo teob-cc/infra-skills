@@ -1,8 +1,9 @@
 # Rendered by the envsubst step of the nginx image, which substitutes only variables set in the
 # container environment; the $variables of nginx itself are left alone.
 server {
+  # HTTP/1.1 only. HTTP/2 stays off until the image carries nginx 1.30.7 or newer
+  # (CVE-2026-123633, CVE-2026-123007); Maven and npm clients do not need it.
   listen 443 ssl;
-  http2 on;
   server_name ${NEXUS_HOST};
 
   ssl_certificate     /etc/nginx/tls/tls.crt;
