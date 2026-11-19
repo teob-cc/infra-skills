@@ -217,6 +217,15 @@ POSTGRES_SIZE_ALERT_EXCLUDE="${POSTGRES_SIZE_ALERT_EXCLUDE:-}"
 # mounted at /etc/alertmanager/resend-key/api_key and read via
 # smtp_auth_password_file.
 ALERTMANAGER_SMTP_HOST="${ALERTMANAGER_SMTP_HOST:-smtp.resend.com:465}"
+# Alert triage (charts/alert-triage, docs/ALERT-TRIAGE.md): a service in the cluster that
+# asks HolmesGPT about each firing p1/p2 alert and posts the finding to Slack. Off by
+# default. Set the service's webhook URL in env.properties to switch it on, e.g.
+#   ALERTMANAGER_TRIAGE_WEBHOOK_URL="http://alert-triage.holmes.svc.cluster.local:8080/webhook"
+# Alertmanager then also sends p1 and p2 alerts there (firing only), and the service's
+# own alert rules (charts/alert-triage/alerts/alert-triage.yml) are loaded. Deploy the
+# service first: a webhook nobody answers makes AlertmanagerNotificationsFailing fire.
+# The URL is an address inside the cluster and carries no credential.
+ALERTMANAGER_TRIAGE_WEBHOOK_URL="${ALERTMANAGER_TRIAGE_WEBHOOK_URL:-}"
 
 # Dead-man's switch for the alerting pipeline itself. The infra-alerting group fires
 # an always-on Watchdog alert; when a heartbeat URL is configured, Alertmanager POSTs
@@ -1546,6 +1555,33 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   # Argo CD, Nexus, Grafana) for PlatformServiceErrorsHigh.
   PLATFORM_TRAEFIK_SERVICES_RE="(${NAMESPACE_SSO}|${NAMESPACE_HARBOR:-harbor}|${NAMESPACE_ARGOCD}|${NAMESPACE_NEXUS:-nexus}|${NAMESPACE_OBSERVABILITY})-.*@kubernetes"
 
+  # Alert triage webhook (see ALERTMANAGER_TRIAGE_WEBHOOK_URL above). Optional: with the
+  # variable empty all three variables below are empty and the rendered Alertmanager
+  # config and alerting rules are exactly what they are without it.
+  TRIAGE_ROUTE=""
+  TRIAGE_RECEIVER_BLOCK=""
+  TRIAGE_ALERTS_FRAGMENT=""
+  triage_url_re='^https?://[A-Za-z0-9._:/-]+$'
+  if [[ -n "$ALERTMANAGER_TRIAGE_WEBHOOK_URL" ]]; then
+    if [[ ! "$ALERTMANAGER_TRIAGE_WEBHOOK_URL" =~ $triage_url_re ]]; then
+      err "ALERTMANAGER_TRIAGE_WEBHOOK_URL='${ALERTMANAGER_TRIAGE_WEBHOOK_URL}' is not a plain http(s) URL (no query, no credentials)"
+      exit 1
+    fi
+    info "Alert triage on: firing p1 and p2 alerts also go to ${ALERTMANAGER_TRIAGE_WEBHOOK_URL}"
+    # First route, with continue: every later leg sees the alert as before. The Watchdog
+    # has no p1/p2 severity and does not match. Default timing (repeat 4h) on purpose:
+    # the service investigates a group once per 4 hours anyway.
+    TRIAGE_ROUTE="        - matchers: [severity=~\"p1|p2\"]
+          receiver: alert-triage
+          continue: true"
+    TRIAGE_RECEIVER_BLOCK="      - name: alert-triage
+        webhook_configs:
+          - url: '${ALERTMANAGER_TRIAGE_WEBHOOK_URL}'
+            send_resolved: false
+            max_alerts: 50"
+    TRIAGE_ALERTS_FRAGMENT="${REPO_ROOT}/charts/alert-triage/alerts/alert-triage.yml"
+  fi
+
   # Dead-man's switch (see ALERTMANAGER_DEADMAN_URL above). The Secret must exist
   # before the chart mounts it, so this runs ahead of the values file.
   DEADMAN_ENABLED=false
@@ -1863,6 +1899,7 @@ ${DEADMAN_SECRET_MOUNT}
       group_interval: 5m
       repeat_interval: 4h
       routes:
+${TRIAGE_ROUTE}
         # The always-firing Watchdog (infra-alerting group) must never reach a human
         # channel: it goes to the dead-man heartbeat when one is configured, else to
         # a null receiver. First route, no continue.
@@ -1915,6 +1952,7 @@ ${DEADMAN_SECRET_MOUNT}
               {{ range .Alerts }}{{ .Annotations.summary }}
               {{ if .Annotations.runbook }}runbook: {{ .Annotations.runbook }}{{ end }}
               {{ end }}
+${TRIAGE_RECEIVER_BLOCK}
       - name: watchdog-null
 ${DEADMAN_RECEIVER_BLOCK}
     inhibit_rules:
@@ -3631,8 +3669,11 @@ EOF
 
   # Merge env-provided alert groups (fragments with a top-level 'groups:' list)
   # from envs/shared/alerts/ and envs/<env>/alerts/ into the generated values.
+  # The alert triage service's own rules come from its chart, and only when the env has
+  # switched the webhook on (TRIAGE_ALERTS_FRAGMENT is empty otherwise).
   for alerts_fragment in "${ENVS_ROOT}/shared/alerts/"*.yml "${ENVS_ROOT}/shared/alerts/"*.yaml \
-                         "${ENVS_ROOT}/${ENV_NAME}/alerts/"*.yml "${ENVS_ROOT}/${ENV_NAME}/alerts/"*.yaml; do
+                         "${ENVS_ROOT}/${ENV_NAME}/alerts/"*.yml "${ENVS_ROOT}/${ENV_NAME}/alerts/"*.yaml \
+                         "${TRIAGE_ALERTS_FRAGMENT}"; do
     [[ -f "$alerts_fragment" ]] || continue
     info "Merging alert groups from ${alerts_fragment#"${ENVS_ROOT}/"}"
     yq eval-all -i '(select(fileIndex==0).serverFiles."alerting_rules.yml".groups) += (select(fileIndex==1).groups) | select(fileIndex==0)' \

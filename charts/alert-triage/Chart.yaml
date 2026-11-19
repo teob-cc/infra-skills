@@ -1,0 +1,6 @@
+apiVersion: v2
+name: alert-triage
+description: Alertmanager webhook to HolmesGPT to Slack, with dedup, caps and an escalation flag (docs/ALERT-TRIAGE.md)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

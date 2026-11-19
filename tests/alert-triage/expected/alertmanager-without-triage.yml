@@ -1,0 +1,80 @@
+global:
+  smtp_auth_password_file: /etc/alertmanager/resend-key/api_key
+  smtp_auth_username: resend
+  smtp_from: alerts@example.com
+  smtp_require_tls: true
+  smtp_smarthost: smtp.resend.com:465
+inhibit_rules:
+- equal:
+  - alertname
+  - app
+  source_matchers:
+  - severity="p1"
+  target_matchers:
+  - severity=~"p2|p3"
+receivers:
+- email_configs:
+  - headers:
+      Subject: '[{{ .CommonLabels.severity | toUpper }}] [{{ .CommonLabels.env }}]
+        {{ .CommonLabels.alertname }} ({{ .Status | toUpper }})'
+    send_resolved: true
+    to: ops@example.com
+  name: ops-email
+- name: ops-telegram
+  telegram_configs:
+  - bot_token_file: /etc/alertmanager/telegram/bot_token
+    chat_id_file: /etc/alertmanager/telegram/chat_id
+    message: |
+      <b>[{{ .CommonLabels.severity | toUpper }}] [{{ .CommonLabels.env }}] {{ .CommonLabels.alertname }}</b>
+      status: {{ .Status }}
+      {{ range .Alerts }}{{ .Annotations.summary }}
+      {{ if .Annotations.runbook }}runbook: {{ .Annotations.runbook }}{{ end }}
+      {{ end }}
+    parse_mode: HTML
+    send_resolved: true
+- name: watchdog-null
+route:
+  group_by:
+  - alertname
+  - severity
+  - app
+  group_interval: 5m
+  group_wait: 30s
+  receiver: ops-email
+  repeat_interval: 4h
+  routes:
+  - group_interval: 1m
+    group_wait: 0s
+    matchers:
+    - alertname="Watchdog"
+    receiver: watchdog-null
+    repeat_interval: 1m
+  - continue: true
+    group_wait: 0s
+    matchers:
+    - severity="p1"
+    receiver: ops-email
+    repeat_interval: 1h
+  - group_wait: 0s
+    matchers:
+    - severity="p1"
+    receiver: ops-telegram
+    repeat_interval: 1h
+  - continue: true
+    matchers:
+    - severity="p2"
+    receiver: ops-email
+  - matchers:
+    - severity="p2"
+    receiver: ops-telegram
+  - continue: true
+    matchers:
+    - severity="p3"
+    receiver: ops-email
+  - matchers:
+    - severity="p3"
+    receiver: ops-telegram
+    repeat_interval: 24h
+templates:
+- /etc/alertmanager/*.tmpl
+
