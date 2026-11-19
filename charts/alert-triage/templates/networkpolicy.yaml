@@ -1,0 +1,51 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $np := .Values.networkPolicy }}
+# This pod only. In: Alertmanager on the webhook port, Prometheus on the metrics port. Out: DNS,
+# HolmesGPT in the same namespace, and HTTPS outside the private ranges (Slack; a NetworkPolicy
+# cannot name a host). Policies add up: what a namespace-wide policy allows this pod, it keeps.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "alert-triage.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "alert-triage.selector" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $np.alertmanager.namespace }}}
+          podSelector:
+            matchLabels: {{ toJson $np.alertmanager.podLabels }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.ports.webhook }}}
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $np.prometheus.namespace }}}
+          podSelector:
+            matchLabels: {{ toJson $np.prometheus.podLabels }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.ports.metrics }}}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: {{ $np.dnsNamespace }}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - podSelector:
+            matchLabels: {{ toJson $np.holmes.podLabels }}
+      ports:
+        - {protocol: TCP, port: {{ $np.holmes.port }}}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: {{ toJson $np.slack.exceptCidrs }}
+      ports:
+        - {protocol: TCP, port: {{ $np.slack.port }}}
+{{- end }}

@@ -1,0 +1,237 @@
+# promtool unit tests for charts/alert-triage/alerts/alert-triage.yml: each alert fires on synthetic
+# series shaped like the service's own counters, and stays quiet on a healthy service, on one
+# failure and on ordinary dedup skips. Run from the repository root:
+#   docker run --rm -v "$PWD":/w -w /w/tests/alert-rules --entrypoint promtool \
+#     quay.io/prometheus/prometheus:v3.14.0 test rules alert-triage-test.yml
+rule_files:
+  - ../../charts/alert-triage/alerts/alert-triage.yml
+evaluation_interval: 1m
+
+tests:
+  # 1. Healthy: investigations succeed, a few dedup skips, one failed investigation in the hour.
+  - name: healthy service with one failure is quiet
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x180
+      - series: alert_triage_investigations_total{namespace="holmes",outcome="ok"}
+        values: 0+1x180
+      - series: alert_triage_failures_total{namespace="holmes",stage="holmes"}
+        values: 0x30 1x150
+      - series: alert_triage_failures_total{namespace="holmes",stage="slack"}
+        values: 0x180
+      - series: alert_triage_skipped_total{namespace="holmes",reason="dedup"}
+        values: 0+2x180
+      - series: alert_triage_skipped_total{namespace="holmes",reason="cap_hour"}
+        values: 0x180
+      - series: alert_triage_skipped_total{namespace="holmes",reason="cap_day"}
+        values: 0x180
+      - series: alert_triage_state_failsafe{namespace="holmes"}
+        values: 0x180
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 170m
+        alertname: AlertTriageCapReached
+        exp_alerts: []
+
+  # 2. HolmesGPT down: every investigation fails, one every 10 minutes. Fires on the third failure
+  #    and stops an hour after the last one.
+  - name: HolmesGPT down fires AlertTriageFailing
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x200
+      - series: alert_triage_failures_total{namespace="holmes",stage="holmes"}
+        values: 0x9 1x9 2x9 3x9 4x9 5x150
+      - series: alert_triage_failures_total{namespace="holmes",stage="slack"}
+        values: 0x200
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: AlertTriageFailing
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p2
+              namespace: holmes
+            exp_annotations:
+              summary: Alert triage failed 3 times in an hour
+              description: |
+                The alert triage service in namespace holmes failed 3 times in
+                the last hour: HolmesGPT did not answer, answered with an error or ran into the timeout, or Slack refused
+                a post. Alerts still reach Slack, Telegram and email from Alertmanager itself; what is missing is the
+                finding. Which one: sum by (stage) (increase(alert_triage_failures_total[1h])). stage="holmes": is
+                HolmesGPT up, does its model answer (the gateway's budget, the provider key)? stage="slack": the token
+                in the service's Slack Secret, and whether the app is in both channels. The reason of each failure is
+                in the log: kubectl -n holmes logs deploy/alert-triage | grep '"error"'.
+                Runbook: docs/ALERT-TRIAGE.md.
+      - eval_time: 180m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+
+  # 3. Slack refuses the posts (two per escalated finding): the two stages add up.
+  - name: Slack failures count as well
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x60
+      - series: alert_triage_failures_total{namespace="holmes",stage="holmes"}
+        values: 0x60
+      - series: alert_triage_failures_total{namespace="holmes",stage="slack"}
+        values: 0x9 2x9 4x40
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: AlertTriageFailing
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p2
+              namespace: holmes
+            exp_annotations:
+              summary: Alert triage failed 4 times in an hour
+              description: |
+                The alert triage service in namespace holmes failed 4 times in
+                the last hour: HolmesGPT did not answer, answered with an error or ran into the timeout, or Slack refused
+                a post. Alerts still reach Slack, Telegram and email from Alertmanager itself; what is missing is the
+                finding. Which one: sum by (stage) (increase(alert_triage_failures_total[1h])). stage="holmes": is
+                HolmesGPT up, does its model answer (the gateway's budget, the provider key)? stage="slack": the token
+                in the service's Slack Secret, and whether the app is in both channels. The reason of each failure is
+                in the log: kubectl -n holmes logs deploy/alert-triage | grep '"error"'.
+                Runbook: docs/ALERT-TRIAGE.md.
+
+  # 4. No ready pod: quiet during a restart of a few minutes, fires after 10.
+  - name: no ready pod
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x10 0x3 1x10 0x30
+      - series: kube_deployment_status_replicas_ready{namespace="observability",deployment="grafana"}
+        values: 1x60
+    alert_rule_test:
+      - eval_time: 13m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 36m
+        alertname: AlertTriageFailing
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p2
+              namespace: holmes
+              deployment: alert-triage
+            exp_annotations: &no_pod
+              summary: The alert triage service has no ready pod
+              description: |
+                Deployment alert-triage has had no ready pod for 10 minutes, or does not exist, while Alertmanager is
+                configured to send it p1 and p2 alerts. No alert is investigated, and Alertmanager's webhook
+                notifications fail (AlertmanagerNotificationsFailing follows). Usual causes: one of the two Secrets the
+                pod mounts is missing, or the state volume is not bound. kubectl get pods -A -l
+                app.kubernetes.io/name=alert-triage; kubectl describe on the pod. To switch triage off instead: remove
+                ALERTMANAGER_TRIAGE_WEBHOOK_URL from the env's env.properties and run observability.sh --rules-only.
+                Runbook: docs/ALERT-TRIAGE.md.
+
+  # 5. The webhook is switched on but the service was never deployed: the Deployment's series does
+  #    not exist. Fires; with kube-state-metrics itself gone it stays quiet (another alert's job).
+  - name: Deployment missing
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="observability",deployment="grafana"}
+        values: 1x20 _x20
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AlertTriageFailing
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p2
+              deployment: alert-triage
+            exp_annotations: *no_pod
+      - eval_time: 40m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+
+  # 6. State file unreadable: the gauge is 1 for the fail-safe hour.
+  - name: fail-safe state
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x90
+      - series: alert_triage_state_failsafe{namespace="holmes"}
+        values: 0x5 1x60 0x25
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: AlertTriageFailing
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p2
+              namespace: holmes
+            exp_annotations:
+              summary: Alert triage cannot read or write its state file and investigates nothing
+              description: |
+                The alert triage service in namespace holmes could not read or write
+                /state/state.json. It fails safe: the hourly cap counts as used for one hour from the failure, so no
+                alert is investigated meanwhile (each skipped alert is in the log with escalate=true). An unreadable
+                file is replaced by the next successful write; a volume that is full or read-only is not.
+                kubectl -n holmes logs deploy/alert-triage | grep '"event":"state"'.
+                Runbook: docs/ALERT-TRIAGE.md.
+      - eval_time: 80m
+        alertname: AlertTriageFailing
+        exp_alerts: []
+
+  # 7. A storm: 24 alert groups skipped by the hourly cap within 10 minutes. Fires at once (p3),
+  #    and ends an hour after the last skip.
+  - name: cap reached
+    interval: 1m
+    input_series:
+      - series: kube_deployment_status_replicas_ready{namespace="holmes",deployment="alert-triage"}
+        values: 1x120
+      - series: alert_triage_skipped_total{namespace="holmes",reason="cap_hour"}
+        values: 0x10 3 6 9 12 15 18 21 24x100
+      - series: alert_triage_skipped_total{namespace="holmes",reason="cap_day"}
+        values: 0x120
+      - series: alert_triage_skipped_total{namespace="holmes",reason="dedup"}
+        values: 0+5x120
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AlertTriageCapReached
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AlertTriageCapReached
+        exp_alerts:
+          - exp_labels:
+              app: alert-triage
+              severity: p3
+              namespace: holmes
+            exp_annotations:
+              summary: "Alert triage skipped alerts 24 times in an hour: cap reached"
+              description: |
+                The alert triage service in namespace holmes did not investigate
+                p1 or p2 alerts 24 times in the last hour because its hourly or daily cap was
+                used up (a repeat notification of the same alert counts again). The caps bound the model spend; nothing is queued. The service posted one line in Slack and
+                marked every skipped alert with escalate=true in its log. Many different alerts at once usually have
+                one cause: look at the first alerts of the hour. Which cap:
+                sum by (reason) (increase(alert_triage_skipped_total[1h])). The caps are capPerHour and capPerDay in
+                the chart's values. Runbook: docs/ALERT-TRIAGE.md.
+      - eval_time: 100m
+        alertname: AlertTriageCapReached
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: AlertTriageFailing
+        exp_alerts: []

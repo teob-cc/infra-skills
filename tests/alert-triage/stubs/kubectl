@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/alert-triage/alertmanager-webhook.sh (the same stand-in as tests/alertmanager-config): no cluster is contacted.
+# It answers the few reads observability.sh --dry-run makes, and fails the test on any
+# call that would write, which is how the test shows that a dry run writes nothing.
+set -uo pipefail
+printf '%s\n' "$*" >> "${STUB_LOG:?}"
+args=" $* "
+case "$args" in
+  *" apply "*|*" create "*|*" delete "*|*" patch "*|*" label "*|*" annotate "*|*" scale "*|*" rollout "*|*" exec "*|*" replace "*|*" edit "*)
+    echo "WRITE $*" >> "${STUB_LOG}.writes"
+    echo "stub kubectl: refusing a write: $*" >&2
+    exit 97 ;;
+esac
+secret_present() { # <name> <STUB_* value>
+  [[ "$args" == *" get secret $1 "* ]] || return 1
+  [[ "$2" == "absent" ]] && exit 1
+  if [[ "$args" == *" -o json "* ]]; then
+    case "$2" in
+      present) printf '{"data":{"token":"%s","url":"c3R1Yg=="}}\n' "${STUB_TOKEN_B64:-c3R1Yg==}" ;;
+      no-token-key) printf '{"data":{"other":"c3R1Yg=="}}\n' ;;
+    esac
+  fi
+  exit 0
+}
+case "$args" in
+  *" config current-context "*) echo "stub-${ENV_NAME:-fake}"; exit 0 ;;
+  *" get ns "*) exit 0 ;;
+esac
+secret_present alertmanager-slack "${STUB_SLACK_SECRET:-absent}"
+secret_present alertmanager-deadman "${STUB_DEADMAN_SECRET:-absent}"
+case "$args" in
+  *" get secret "*) exit 0 ;;          # resend-api-key, alertmanager-telegram: present
+  *" get configmap "*) echo '{}'; exit 0 ;;   # no live ConfigMap to diff against
+  *" get nodes "*) exit 0 ;;
+esac
+exit 1

@@ -1,0 +1,85 @@
+# Alert rules for the alert triage service (charts/alert-triage, docs/ALERT-TRIAGE.md). A fragment
+# with a top-level `groups:` list: tools/k3s/observability.sh merges it into Prometheus' alerting
+# rules when the env sets ALERTMANAGER_TRIAGE_WEBHOOK_URL, and not otherwise. Dry run against
+# synthetic series: tests/alert-rules/alert-triage-test.yml (promtool test rules).
+#
+# The service's counters are scraped by the job `kubernetes-pods` (pod annotations in the chart).
+# Its own two alerts are in the chart's skip list, so the service never investigates them.
+groups:
+  - name: alert-triage
+    interval: 1m
+    rules:
+      - alert: AlertTriageFailing
+        expr: |
+          sum by (namespace) (increase(alert_triage_failures_total[1h])) >= 3
+        labels:
+          app: alert-triage
+          severity: p2
+        annotations:
+          summary: "Alert triage failed {{ $value | printf \"%.0f\" }} times in an hour"
+          description: |
+            The alert triage service in namespace {{ $labels.namespace }} failed {{ $value | printf "%.0f" }} times in
+            the last hour: HolmesGPT did not answer, answered with an error or ran into the timeout, or Slack refused
+            a post. Alerts still reach Slack, Telegram and email from Alertmanager itself; what is missing is the
+            finding. Which one: sum by (stage) (increase(alert_triage_failures_total[1h])). stage="holmes": is
+            HolmesGPT up, does its model answer (the gateway's budget, the provider key)? stage="slack": the token
+            in the service's Slack Secret, and whether the app is in both channels. The reason of each failure is
+            in the log: kubectl -n {{ $labels.namespace }} logs deploy/alert-triage | grep '"error"'.
+            Runbook: docs/ALERT-TRIAGE.md.
+
+      - alert: AlertTriageFailing
+        expr: |
+          kube_deployment_status_replicas_ready{deployment="alert-triage"} == 0
+          or
+          (
+            absent(kube_deployment_status_replicas_ready{deployment="alert-triage"})
+            and on () count(kube_deployment_status_replicas_ready) > 0
+          )
+        for: 10m
+        labels:
+          app: alert-triage
+          severity: p2
+        annotations:
+          summary: The alert triage service has no ready pod
+          description: |
+            Deployment alert-triage has had no ready pod for 10 minutes, or does not exist, while Alertmanager is
+            configured to send it p1 and p2 alerts. No alert is investigated, and Alertmanager's webhook
+            notifications fail (AlertmanagerNotificationsFailing follows). Usual causes: one of the two Secrets the
+            pod mounts is missing, or the state volume is not bound. kubectl get pods -A -l
+            app.kubernetes.io/name=alert-triage; kubectl describe on the pod. To switch triage off instead: remove
+            ALERTMANAGER_TRIAGE_WEBHOOK_URL from the env's env.properties and run observability.sh --rules-only.
+            Runbook: docs/ALERT-TRIAGE.md.
+
+      - alert: AlertTriageFailing
+        expr: |
+          max by (namespace) (alert_triage_state_failsafe) == 1
+        for: 5m
+        labels:
+          app: alert-triage
+          severity: p2
+        annotations:
+          summary: Alert triage cannot read or write its state file and investigates nothing
+          description: |
+            The alert triage service in namespace {{ $labels.namespace }} could not read or write
+            /state/state.json. It fails safe: the hourly cap counts as used for one hour from the failure, so no
+            alert is investigated meanwhile (each skipped alert is in the log with escalate=true). An unreadable
+            file is replaced by the next successful write; a volume that is full or read-only is not.
+            kubectl -n {{ $labels.namespace }} logs deploy/alert-triage | grep '"event":"state"'.
+            Runbook: docs/ALERT-TRIAGE.md.
+
+      - alert: AlertTriageCapReached
+        expr: |
+          sum by (namespace) (increase(alert_triage_skipped_total{reason=~"cap_hour|cap_day"}[1h])) > 0
+        labels:
+          app: alert-triage
+          severity: p3
+        annotations:
+          summary: "Alert triage skipped alerts {{ $value | printf \"%.0f\" }} times in an hour: cap reached"
+          description: |
+            The alert triage service in namespace {{ $labels.namespace }} did not investigate
+            p1 or p2 alerts {{ $value | printf "%.0f" }} times in the last hour because its hourly or daily cap was
+            used up (a repeat notification of the same alert counts again). The caps bound the model spend; nothing is queued. The service posted one line in Slack and
+            marked every skipped alert with escalate=true in its log. Many different alerts at once usually have
+            one cause: look at the first alerts of the hour. Which cap:
+            sum by (reason) (increase(alert_triage_skipped_total[1h])). The caps are capPerHour and capPerDay in
+            the chart's values. Runbook: docs/ALERT-TRIAGE.md.

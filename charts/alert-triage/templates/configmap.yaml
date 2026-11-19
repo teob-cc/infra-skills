@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-files
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "alert-triage.labels" . | nindent 4 }}
+data:
+  triage.mjs: |
+    {{- .Files.Get "files/triage.mjs" | nindent 4 }}

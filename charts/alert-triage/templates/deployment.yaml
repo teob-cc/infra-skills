@@ -1,0 +1,118 @@
+{{- $cluster := required "cluster is required: the name written in every Slack message and log line" .Values.cluster }}
+{{- if and .Values.grafanaUrl (not (regexMatch "^https://[A-Za-z0-9._~:/?#@!&=+%,;-]+$" .Values.grafanaUrl)) }}
+{{- fail "grafanaUrl must be an https URL without <, > or |" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "alert-triage.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # One state file, one investigation at a time: never two pods.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "alert-triage.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "alert-triage.labels" . | nindent 8 }}
+      annotations:
+        checksum/files: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.ports.metrics | quote }}
+        prometheus.io/path: /metrics
+    spec:
+      # No Kubernetes rights: the service talks to HolmesGPT and Slack only.
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # An investigation in flight is not waited for at shutdown; the next start reports it.
+      terminationGracePeriodSeconds: 10
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alert-triage
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}{{ with .Values.image.digest }}@{{ . }}{{ end }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["node", "/files/triage.mjs"]
+          env:
+            - { name: CLUSTER, value: {{ $cluster | quote }} }
+            - { name: LISTEN_PORT, value: {{ .Values.ports.webhook | quote }} }
+            - { name: METRICS_PORT, value: {{ .Values.ports.metrics | quote }} }
+            - { name: HOLMES_URL, value: {{ required "holmes.url is required" .Values.holmes.url | quote }} }
+            - { name: HOLMES_MODEL, value: {{ .Values.holmes.model | quote }} }
+            - { name: HOLMES_TIMEOUT_SECONDS, value: {{ .Values.holmes.timeoutSeconds | quote }} }
+            - { name: HOLMES_RESPONSE_FORMAT, value: {{ .Values.holmes.responseFormat | quote }} }
+            - { name: HOLMES_API_KEY_FILE, value: /secrets/holmes/{{ .Values.holmes.apiKeySecret.key }} }
+            - { name: SLACK_TOKEN_FILE, value: /secrets/slack/{{ .Values.slack.tokenSecret.key }} }
+            - { name: SLACK_CHANNEL_FINDINGS, value: {{ .Values.slack.findingsChannel | quote }} }
+            - { name: SLACK_CHANNEL_ESCALATIONS, value: {{ .Values.slack.escalationsChannel | quote }} }
+            - { name: GRAFANA_URL, value: {{ .Values.grafanaUrl | quote }} }
+            - { name: SEVERITIES, value: {{ join "," .Values.severities | quote }} }
+            - { name: ESCALATE_SEVERITIES, value: {{ join "," .Values.escalateSeverities | quote }} }
+            - { name: DEDUP_HOURS, value: {{ .Values.dedupHours | quote }} }
+            - { name: FAILED_DEDUP_MINUTES, value: {{ .Values.failedDedupMinutes | quote }} }
+            - { name: CAP_PER_HOUR, value: {{ .Values.capPerHour | quote }} }
+            - { name: CAP_PER_DAY, value: {{ .Values.capPerDay | quote }} }
+            - { name: REPEAT_COUNT, value: {{ .Values.repeatCount | quote }} }
+            - { name: CAP_LINE_DELAY_SECONDS, value: {{ .Values.capLineDelaySeconds | quote }} }
+            - { name: SKIP_ALERTNAMES, value: {{ join "," .Values.skip.alertnames | quote }} }
+            - { name: ON_DEMAND_NODES, value: {{ join "," .Values.skip.onDemandNodes | quote }} }
+            - { name: NODE_DOWN_ALERTS, value: {{ join "," .Values.skip.nodeDownAlerts | quote }} }
+            - { name: STATE_FILE, value: /state/state.json }
+          ports:
+            - { name: webhook, containerPort: {{ .Values.ports.webhook }} }
+            - { name: metrics, containerPort: {{ .Values.ports.metrics }} }
+          readinessProbe:
+            httpGet: { path: /healthz, port: webhook }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: webhook }
+            periodSeconds: 30
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: files, mountPath: /files, readOnly: true }
+            - { name: state, mountPath: /state }
+            - { name: holmes-key, mountPath: /secrets/holmes, readOnly: true }
+            - { name: slack-token, mountPath: /secrets/slack, readOnly: true }
+      volumes:
+        - name: files
+          configMap:
+            name: {{ .Release.Name }}-files
+        - name: state
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-state
+        - name: holmes-key
+          secret:
+            secretName: {{ .Values.holmes.apiKeySecret.name }}
+            items:
+              - { key: {{ .Values.holmes.apiKeySecret.key }}, path: {{ .Values.holmes.apiKeySecret.key }} }
+        - name: slack-token
+          secret:
+            secretName: {{ .Values.slack.tokenSecret.name }}
+            items:
+              - { key: {{ .Values.slack.tokenSecret.key }}, path: {{ .Values.slack.tokenSecret.key }} }
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

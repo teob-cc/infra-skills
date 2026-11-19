@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "alert-triage.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "alert-triage.selector" . | nindent 4 }}
+  ports:
+    - { name: webhook, port: {{ .Values.ports.webhook }}, targetPort: webhook }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-state
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "alert-triage.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}

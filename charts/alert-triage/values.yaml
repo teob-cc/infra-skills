@@ -1,0 +1,115 @@
+# Alert triage: receives Alertmanager's webhook, asks HolmesGPT about each firing alert group once
+# per window, posts the finding to Slack and writes one JSON log line per investigation.
+# docs/ALERT-TRIAGE.md has the behaviour, the log line and the rollout order.
+#
+# The service is one file without dependencies (files/triage.mjs), mounted from a ConfigMap and
+# run on the stock Node image: there is no image to build. Install it in the namespace HolmesGPT
+# runs in. Two Secrets must exist in that namespace before the first sync (neither is in this
+# chart, and the chart never reads their values):
+#   holmes.apiKeySecret   the key HolmesGPT's API expects (the Secret HolmesGPT itself reads)
+#   slack.tokenSecret     the bot token (xoxb-...) of a Slack app with the scope chat:write that
+#                         was added to both channels below
+
+# Name of the cluster, written in every Slack message and log line. Required.
+cluster: ""
+
+image:
+  # node:22-alpine, pinned by its index digest (2026-11-12).
+  repository: docker.io/library/node
+  tag: 22-alpine
+  digest: sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a
+  pullPolicy: IfNotPresent
+
+holmes:
+  # POST /api/chat of HolmesGPT's HTTP server. The upstream chart's Service is <release>-holmes,
+  # port 80, in front of pod port 5050.
+  url: http://holmes-holmes.holmes.svc.cluster.local/api/chat
+  # A key of HolmesGPT's model list. Empty: HolmesGPT's default model.
+  model: ""
+  # One investigation is given up after this long. HolmesGPT has no total time limit of its own.
+  timeoutSeconds: 300
+  # Ask for the answer as a JSON schema (response_format). The instruction asks for the same JSON
+  # in words, so false still works; set it if the model path refuses response_format with tools.
+  responseFormat: true
+  apiKeySecret:
+    name: holmes-api-key
+    key: api-key
+
+slack:
+  tokenSecret:
+    name: alert-triage-slack
+    key: token
+  # Findings, next to the raw alerts Alertmanager posts there itself.
+  findingsChannel: "#infra-alerts"
+  # One line per escalation.
+  escalationsChannel: "#infra-watchdog"
+
+# The one link a message may carry, e.g. https://grafana.example.com/alerting/list. Empty: no link.
+grafanaUrl: ""
+
+# Which alerts are investigated, and how often.
+severities: [p1, p2]
+# A finding for these severities is always marked escalate=true.
+escalateSeverities: [p1]
+# One investigation per alert group (alertname, app, namespace) in this window.
+dedupHours: 4
+# The window after an investigation that gave no usable finding (HolmesGPT error, timeout, malformed
+# answer): the group may be tried again this soon. Its place in the caps stays used.
+failedDedupMinutes: 30
+# Investigations per cluster. Above a cap nothing is queued: the alert is skipped and escalated.
+capPerHour: 6
+capPerDay: 40
+# A group that starts firing this many times in 24 hours is escalated.
+repeatCount: 3
+# The line "N alerts not investigated, cap reached" is posted this long after the first skipped
+# alert (so that it counts what a storm skipped meanwhile), and once an hour at most.
+capLineDelaySeconds: 120
+
+skip:
+  # Never investigated. The service's own two alerts are here so that it does not investigate
+  # its own failure.
+  alertnames: [Watchdog, AlertTriageFailing, AlertTriageCapReached]
+  # Node-down alerts of these nodes (label `node`) are not investigated: an on-demand node that
+  # is switched off is not an incident.
+  onDemandNodes: []
+  nodeDownAlerts: [KubeNodeNotReady, NodeExporterDown]
+
+# The dedup windows and the cap counters, as one small JSON file. It survives a pod restart; if
+# it cannot be read the service fails safe (the hourly cap counts as used for one hour).
+persistence:
+  storageClass: ""
+  size: 16Mi
+
+ports:
+  webhook: 8080   # POST /webhook (Alertmanager), GET /healthz
+  metrics: 9102   # GET /metrics (Prometheus)
+
+# This pod's own NetworkPolicy, added to whatever the namespace already has (policies add up;
+# none can take away what another allows).
+networkPolicy:
+  enabled: true
+  # In: Alertmanager to the webhook port, Prometheus to the metrics port. Nothing else.
+  alertmanager:
+    namespace: observability
+    podLabels: {app.kubernetes.io/name: alertmanager}
+  prometheus:
+    namespace: observability
+    podLabels: {app.kubernetes.io/name: prometheus}
+  # Out: DNS, HolmesGPT's pod port, and Slack.
+  dnsNamespace: kube-system
+  holmes:
+    podLabels: {app: holmes}
+    port: 5050
+  # A NetworkPolicy cannot name slack.com, so this is TCP 443 to every address outside the
+  # ranges below (private, link-local, carrier-grade NAT): the pod can open HTTPS to the
+  # internet, and to nothing inside the cluster or the node's networks through this rule.
+  slack:
+    port: 443
+    exceptCidrs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+
+resources:
+  requests: {cpu: 10m, memory: 48Mi}
+  limits: {memory: 128Mi}
+
+nodeSelector: {}
+tolerations: []
