@@ -60,6 +60,7 @@ spec:
             - { name: SEVERITIES, value: {{ join "," .Values.severities | quote }} }
             - { name: ESCALATE_SEVERITIES, value: {{ join "," .Values.escalateSeverities | quote }} }
             - { name: DEDUP_HOURS, value: {{ .Values.dedupHours | quote }} }
+            - { name: FAILED_DEDUP_MINUTES, value: {{ .Values.failedDedupMinutes | quote }} }
             - { name: CAP_PER_HOUR, value: {{ .Values.capPerHour | quote }} }
             - { name: CAP_PER_DAY, value: {{ .Values.capPerDay | quote }} }
             - { name: REPEAT_COUNT, value: {{ .Values.repeatCount | quote }} }

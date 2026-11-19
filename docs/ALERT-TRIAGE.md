@@ -27,7 +27,8 @@ Kubernetes rights and stores nothing but a small state file.
    `Watchdog`, the service's own two alerts, and node-down alerts (`KubeNodeNotReady`,
    `NodeExporterDown`) of the nodes listed in `skip.onDemandNodes`.
 2. **Dedup.** Alerts are grouped by (`alertname`, `app`, `namespace`). A group is investigated
-   once per 4 hours (`dedupHours`). A repeat notification, or another pod of the same group,
+   once per 4 hours (`dedupHours`; 30 minutes after an investigation without a usable finding).
+   A repeat notification, or another pod of the same group,
    inside the window is skipped.
 3. **Caps.** At most 6 investigations an hour and 40 a day (`capPerHour`, `capPerDay`). Above a
    cap the alert is skipped, not queued, and marked for escalation. One line
@@ -54,8 +55,10 @@ Kubernetes rights and stores nothing but a small state file.
    | `slack_failed` | Slack refused the post after 3 tries; the finding is in the log only |
    | `interrupted` | the service was restarted while the investigation ran |
 
-A failed investigation uses its place in the caps and in the 4 hour window: it may have cost
-tokens, and it is escalated.
+An investigation that gave no usable finding (HolmesGPT error, timeout, malformed answer) keeps
+its place in the caps, because it may have cost tokens, and is escalated. Its group gets a short
+window of 30 minutes (`failedDedupMinutes`) instead of 4 hours, so an outage of HolmesGPT or of
+its model does not blind an alert group for 4 hours.
 
 "Started firing 3 times" counts different start times of the group's alerts. A repeat
 notification of the same firing is not a new one.
@@ -143,7 +146,15 @@ In the namespace HolmesGPT runs in (the examples say `holmes`).
    the script renders exactly what it rendered before.
 
 Keep this order. Alertmanager counts a webhook nobody answers as a failed notification, and
-`AlertmanagerNotificationsFailing` (p1) fires on those.
+`AlertmanagerNotificationsFailing` (p1) fires on those: its counter
+`alertmanager_notifications_failed_total` has the labels `integration` and `reason` only
+(Alertmanager 0.34), so that rule cannot tell this webhook from the dead-man's webhook. Only a
+pod that is not running fails the webhook. The service answers Alertmanager at once, before it
+asks HolmesGPT, so an outage of HolmesGPT or Slack does not fail it; those show as
+`AlertTriageFailing` (p2).
+
+If the pod cannot be brought back quickly, switch the webhook off (two or three minutes):
+remove the line from `env.properties` and run `observability.sh <env> --rules-only`.
 
 **Switch it off** in the reverse order: remove the line from `env.properties`, run
 `observability.sh <env> --rules-only`, then remove the Application.
@@ -152,9 +163,15 @@ Keep this order. Alertmanager counts a webhook nobody answers as a failed notifi
 
 The chart's NetworkPolicy selects this pod only. In: Alertmanager on the webhook port (8080),
 Prometheus on the metrics port (9102). Out: DNS, HolmesGPT's pod port (5050), and TCP 443 to
-every address outside the private ranges. A NetworkPolicy cannot name `slack.com`, so the last
-rule is wider than Slack: the pod can open HTTPS connections to the internet. It holds two
-credentials (HolmesGPT's API key, the Slack bot token) and no others.
+every address outside the private ranges.
+
+**The last rule is wider than Slack.** A NetworkPolicy cannot name `slack.com`, so as far as the
+network goes the pod can open HTTPS connections to any public address. What keeps it to Slack is
+the code: the only address outside the cluster it connects to is
+`https://slack.com/api/chat.postMessage`, fixed in `triage.mjs`. It is not a setting, and no
+address is ever taken from an alert or from HolmesGPT's answer; HolmesGPT's address comes from
+the chart's values only. The pod holds two credentials (HolmesGPT's API key, the Slack bot
+token) and no others.
 
 Policies add up. If the namespace has a policy for all pods that allows more (for example to
 the Kubernetes API), this pod is allowed that too; it has no token to use there
@@ -197,6 +214,9 @@ The service does not investigate these two itself (`skip.alertnames`).
 - **`response_format`.** The service asks HolmesGPT for a JSON schema and also asks for the same
   JSON in words. If the model path refuses `response_format` together with tools, set
   `holmes.responseFormat: false`; the answer is parsed the same way.
+- **The image comes from Docker Hub** (`node:22-alpine` by digest). A cluster whose nodes may not
+  pull from Docker Hub sets `image.repository` to its own registry's copy or proxy of it and, if
+  that registry is private, needs a pull secret the chart does not have yet.
 - **One pod.** The Deployment is `Recreate` with one replica; during a rollout Alertmanager
   retries the webhook.
 

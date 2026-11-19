@@ -53,6 +53,9 @@ severities: [p1, p2]
 escalateSeverities: [p1]
 # One investigation per alert group (alertname, app, namespace) in this window.
 dedupHours: 4
+# The window after an investigation that gave no usable finding (HolmesGPT error, timeout, malformed
+# answer): the group may be tried again this soon. Its place in the caps stays used.
+failedDedupMinutes: 30
 # Investigations per cluster. Above a cap nothing is queued: the alert is skipped and escalated.
 capPerHour: 6
 capPerDay: 40

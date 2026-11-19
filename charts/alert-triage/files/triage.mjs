@@ -10,6 +10,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+const SLACK_API_URL = 'https://slack.com/api/chat.postMessage';
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
 const CONFIDENCES = ['high', 'medium', 'low'];
@@ -38,7 +39,9 @@ export function configFromEnv(e = process.env) {
     holmesModel: get('HOLMES_MODEL', ''),
     holmesTimeoutMs: Number(get('HOLMES_TIMEOUT_SECONDS', '300')) * 1000,
     holmesResponseFormat: get('HOLMES_RESPONSE_FORMAT', 'true') === 'true',
-    slackApiUrl: get('SLACK_API_URL', 'https://slack.com/api/chat.postMessage'),
+    // Fixed on purpose: the one address outside the cluster this service ever connects to. Not a
+    // setting, and never taken from an alert or from HolmesGPT's answer.
+    slackApiUrl: SLACK_API_URL,
     slackTokenFile: get('SLACK_TOKEN_FILE'),
     channelFindings: get('SLACK_CHANNEL_FINDINGS', '#infra-alerts'),
     channelEscalations: get('SLACK_CHANNEL_ESCALATIONS', '#infra-watchdog'),
@@ -47,6 +50,8 @@ export function configFromEnv(e = process.env) {
     severities: list('SEVERITIES', 'p1,p2'),
     escalateSeverities: list('ESCALATE_SEVERITIES', 'p1'),
     dedupMs: Number(get('DEDUP_HOURS', '4')) * HOUR,
+    // After an investigation without a usable finding the group may be tried again sooner.
+    failedDedupMs: Number(get('FAILED_DEDUP_MINUTES', '30')) * 60_000,
     capHour: Number(get('CAP_PER_HOUR', '6')),
     capDay: Number(get('CAP_PER_DAY', '40')),
     repeatCount: Number(get('REPEAT_COUNT', '3')),
@@ -381,6 +386,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
       model: cfg.holmesModel || 'default', duration_ms: now() - t0, slack_posted: slackPosted,
       escalate, escalate_reasons: reasons, ...(error ? { error } : {}),
     });
+    return outcome;
   }
 
   // One at a time: HolmesGPT has no limit on parallel requests of its own.
@@ -389,10 +395,14 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
   const enqueue = (item) => {
     inProgress += 1;
     chain = chain.then(async () => {
-      try { await investigate(item); } catch (err) {
+      let outcome = 'failed';
+      try { outcome = await investigate(item); } catch (err) {
         inc('alert_triage_failures_total', { stage: 'holmes' });
         log({ event: 'error', level: 'error', ...alertFields(item), message: errorText(err), escalate: true, escalate_reasons: ['holmes_failed'] });
       }
+      // No usable finding (error, timeout, malformed answer): the place in the caps stays used, but
+      // the group gets the short window, so an outage of HolmesGPT does not blind it for hours.
+      if (outcome !== 'ok' && state.groups[item.key]) state.groups[item.key].window = cfg.failedDedupMs;
       state.pending = state.pending.filter((p) => p.id !== item.id);
       inProgress -= 1;
       persist();
@@ -406,6 +416,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
     for (const item of interrupted) {
       inc('alert_triage_investigations_total', { outcome: 'interrupted' });
       inc('alert_triage_escalations_total', { reason: 'interrupted' });
+      if (state.groups[item.key]) state.groups[item.key].window = cfg.failedDedupMs;
       log({ event: 'investigation', ...alertFields(item), outcome: 'interrupted', finding: null, confidence: null, tokens: { prompt: 0, completion: 0, total: 0, cached: 0 }, slack_posted: false, escalate: true, escalate_reasons: ['interrupted'] });
     }
     const names = interrupted.map((i) => slackSafe(i.alertname, 80)).join(', ');
@@ -484,7 +495,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
         startsAt: g.starts.size ? new Date(Math.min(...g.starts)).toISOString() : null,
         repeat: known.firings.length >= cfg.repeatCount,
       };
-      if (known.last && t - known.last < cfg.dedupMs) {
+      if (known.last && t - known.last < (known.window ?? cfg.dedupMs)) {
         // Already investigated in this window. A new firing that makes the group a repeater is
         // still told to the watchdog, once per firing.
         const reasons = newFiring && item.repeat ? ['repeat'] : [];
@@ -503,6 +514,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
       }
       state.investigations.push(t);
       known.last = t;
+      known.window = cfg.dedupMs;
       state.pending.push(item);
       result.accepted += 1;
       enqueue(item);

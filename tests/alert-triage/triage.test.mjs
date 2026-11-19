@@ -40,7 +40,7 @@ async function bed(t, overrides = {}) {
     holmesAnswer: () => ({ analysis: JSON.stringify(GOOD), conversation_history: [{ role: 'tool', content: 'SECRET-POD-LOG '.repeat(500) }], tool_calls: [{ result: 'raw log' }], metadata: { costs: { prompt_tokens: 12000, completion_tokens: 300, total_tokens: 12300, cached_tokens: 9000, total_cost: 0 }, usage: { prompt_tokens: 5000, completion_tokens: 100, total_tokens: 5100 } } }),
     slack: (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); },
   };
-  const holmesServer = await listen((req, res, body) => { b.holmesRequests.push({ headers: req.headers, url: req.url, body: JSON.parse(body) }); b.holmes(req, res); });
+  const holmesServer = await listen((req, res, body) => { b.holmesPort = holmesServer.address().port; b.holmesRequests.push({ headers: req.headers, url: req.url, body: JSON.parse(body) }); b.holmes(req, res); });
   const slackServer = await listen((req, res, body) => {
     const post = { headers: req.headers, body: JSON.parse(body) };
     b.slackAttempts = (b.slackAttempts ?? 0) + 1;
@@ -52,10 +52,11 @@ async function bed(t, overrides = {}) {
     ...configFromEnv({
       CLUSTER: 'test', HOLMES_URL: `http://127.0.0.1:${holmesServer.address().port}/api/chat`, HOLMES_MODEL: 'claude-haiku-5-5',
       HOLMES_API_KEY_FILE: path.join(dir, 'holmes-key'), SLACK_TOKEN_FILE: path.join(dir, 'slack-token'),
-      SLACK_API_URL: `http://127.0.0.1:${slackServer.address().port}/api/chat.postMessage`,
       GRAFANA_URL: 'https://grafana.example.com/alerting/list', STATE_FILE: path.join(dir, 'state.json'),
       LISTEN_PORT: '0', METRICS_PORT: '0', ON_DEMAND_NODES: 'gpu-worker',
     }),
+    // Not settable from the environment (see the configuration test): only a test can point it elsewhere.
+    slackApiUrl: `http://127.0.0.1:${slackServer.address().port}/api/chat.postMessage`,
     slackRetryDelaysMs: [5, 5], capLineDelayMs: 2 * MIN, ...overrides,
   };
   b.start = () => createTriage(b.cfg, { now: () => b.clock, write: (line) => b.lines.push(JSON.parse(line)) });
@@ -228,10 +229,21 @@ test('escalation: HolmesGPT down (connection refused and HTTP 500)', async (t) =
   assert.equal(b.posts('#infra-watchdog').length, 2);
   assert.equal(b.metric('alert_triage_failures_total{stage="holmes"}'), 2);
   assert.equal(b.metric('alert_triage_investigations_total{outcome="failed"}'), 2);
-  // A failed investigation used its place in the window and in the caps.
+  // A failed investigation keeps its place in the caps, and the group waits 30 minutes, not 4 hours.
+  b.cfg.holmesUrl = b.holmesRequests[0] && `http://127.0.0.1:${b.holmesPort}/api/chat`;
+  b.holmes = (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(b.holmesAnswer())); };
+  b.clock += 29 * MIN;
   await fire(b, {});
   assert.equal(b.log('skip')[0].reason, 'dedup');
   assert.equal(b.metric('alert_triage_cap_used{window="hour"}'), 2);
+  b.clock += 2 * MIN;
+  await fire(b, {});
+  assert.deepEqual(b.log('investigation').at(-1).outcome, 'ok');
+  assert.equal(b.metric('alert_triage_cap_used{window="hour"}'), 3);
+  // Now it has a finding: the 4 hour window applies again.
+  b.clock += 3 * HOUR;
+  await fire(b, {});
+  assert.equal(b.log('skip').at(-1).reason, 'dedup');
 });
 
 test('escalation: HolmesGPT does not answer within the timeout', async (t) => {
@@ -256,6 +268,11 @@ test('a malformed HolmesGPT answer becomes a low-confidence finding and is escal
   assert.equal(lines[0].finding.raw, 'I looked around. <!channel> see https://evil.example/x');
   assert.match(b.posts('#infra-alerts')[0], /the answer was not in the expected form.*\nI looked around\. &lt;!channel&gt; see hxxps:\/\/evil\.example\/x/);
   assert.equal(b.metric('alert_triage_investigations_total{outcome="malformed"}'), 4);
+  // No usable finding: the group may be tried again after 30 minutes.
+  b.holmesAnswer = () => ({ analysis: JSON.stringify(GOOD) });
+  b.clock += 31 * MIN;
+  await fire(b, { name: 'Malformed0' });
+  assert.equal(b.log('investigation').at(-1).outcome, 'ok');
 });
 
 test('parseFinding: JSON, fenced JSON, JSON inside prose; nothing else', () => {
@@ -510,6 +527,10 @@ test('configuration: required values, and a Grafana link that cannot carry marku
   const cfg = configFromEnv(base);
   assert.deepEqual([cfg.capHour, cfg.capDay, cfg.dedupMs, cfg.holmesTimeoutMs, cfg.repeatCount, cfg.maxMessageChars], [6, 40, 4 * HOUR, 300_000, 3, 3000]);
   assert.deepEqual(cfg.severities, ['p1', 'p2']);
+  assert.equal(cfg.failedDedupMs, 30 * MIN);
+  // The Slack address is fixed in the code: the environment cannot point the bot token elsewhere.
+  assert.equal(cfg.slackApiUrl, 'https://slack.com/api/chat.postMessage');
+  assert.equal(configFromEnv({ ...base, SLACK_API_URL: 'https://evil.example/api' }).slackApiUrl, 'https://slack.com/api/chat.postMessage');
   assert.throws(() => configFromEnv({ ...base, CLUSTER: '' }), /missing env CLUSTER/);
   assert.throws(() => configFromEnv({ ...base, GRAFANA_URL: 'https://g.example/|x> <!channel' }), /GRAFANA_URL/);
   assert.throws(() => configFromEnv({ ...base, GRAFANA_URL: 'http://g.example/' }), /GRAFANA_URL/);
