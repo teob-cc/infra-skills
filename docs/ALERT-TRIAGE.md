@@ -32,7 +32,8 @@ Kubernetes rights and stores nothing but a small state file.
    inside the window is skipped.
 3. **Caps.** At most 6 investigations an hour and 40 a day (`capPerHour`, `capPerDay`). Above a
    cap the alert is skipped, not queued, and marked for escalation. One line
-   `N alerts not investigated, cap reached` is posted, 2 minutes after the first skipped alert
+   `N alerts not investigated, cap reached` (N counts alert groups, not notifications) is posted,
+   2 minutes after the first skipped alert
    (so that it counts what a storm skipped meanwhile) and once an hour at most. A `p1` does not
    pass the cap.
 4. **Asks HolmesGPT**, one investigation at a time, with the alert's labels and annotations and
@@ -60,8 +61,9 @@ its place in the caps, because it may have cost tokens, and is escalated. Its gr
 window of 30 minutes (`failedDedupMinutes`) instead of 4 hours, so an outage of HolmesGPT or of
 its model does not blind an alert group for 4 hours.
 
-"Started firing 3 times" counts different start times of the group's alerts. A repeat
-notification of the same firing is not a new one.
+"Started firing 3 times" counts incidents of the group, not instances and not notifications. An
+incident with five pods is one firing, and so is a repeat notification of it. A new firing is
+counted when every instance in a notification started after the group was last seen firing.
 
 ## The log line
 
@@ -197,7 +199,7 @@ Counters start from zero at a restart; the caps do not (they come from the state
 | Alert | Severity | Fires when |
 | --- | --- | --- |
 | `AlertTriageFailing` | p2 | 3 or more failures (HolmesGPT or Slack) in an hour; or no ready pod for 10 minutes; or the state file is unusable for 5 minutes |
-| `AlertTriageCapReached` | p3 | an alert was skipped by a cap in the last hour |
+| `AlertTriageCapReached` | p3 | an alert was skipped by a cap in the last hour (its number counts notifications) |
 
 The service does not investigate these two itself (`skip.alertnames`).
 

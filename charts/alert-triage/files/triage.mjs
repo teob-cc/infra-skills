@@ -212,7 +212,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
   const log = (entry) => write(JSON.stringify({ ts: new Date(now()).toISOString(), cluster: cfg.cluster, ...entry }));
 
   // --- state -----------------------------------------------------------------------------------
-  let state = { version: 1, investigations: [], groups: {}, pending: [], cap: { lineAt: 0, since: 0, skipped: 0, names: [], reason: '' } };
+  let state = { version: 1, investigations: [], groups: {}, pending: [], cap: { lineAt: 0, since: 0, skipped: 0, keys: [], names: [], reason: '' } };
   let failsafeUntil = 0; // while now < this, the hourly cap counts as used
   const startedAt = now();
   try {
@@ -234,7 +234,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
     state.investigations = state.investigations.filter((ts) => t - ts < DAY);
     for (const [key, g] of Object.entries(state.groups)) {
       g.firings = g.firings.filter((ts) => t - ts < DAY);
-      if (!g.firings.length && t - g.last >= Math.max(cfg.dedupMs, DAY)) delete state.groups[key];
+      if (!g.firings.length && t - Math.max(g.last, g.seen ?? 0) >= Math.max(cfg.dedupMs, DAY)) delete state.groups[key];
     }
     try {
       fs.writeFileSync(`${cfg.stateFile}.tmp`, JSON.stringify(state));
@@ -432,7 +432,7 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
     const cap = state.cap;
     if (!cap.skipped || now() < Math.max(cap.since + cfg.capLineDelayMs, cap.lineAt + HOUR)) return;
     const { skipped, names, reason } = cap;
-    state.cap = { lineAt: now(), since: 0, skipped: 0, names: [], reason: '' };
+    state.cap = { lineAt: now(), since: 0, skipped: 0, keys: [], names: [], reason: '' };
     persist();
     const limit = reason === 'cap_day' ? `${cfg.capDay} a day` : `${cfg.capHour} an hour`;
     const shown = names.slice(0, 10).map((n) => slackSafe(n, 80)).join(', ') + (names.length > 10 ? ', …' : '');
@@ -484,11 +484,14 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
     const ordered = [...groups.values()].sort((a, b) => cfg.escalateSeverities.includes(b.severity) - cfg.escalateSeverities.includes(a.severity));
     for (const g of ordered) {
       const known = state.groups[g.key] ?? (state.groups[g.key] = { last: 0, firings: [] });
+      // A firing is one incident of the group, however many instances it has and whenever each of
+      // them started: a new one only when every instance in this notification started after the
+      // group was last seen firing (Alertmanager sends all firing instances each time).
+      const earliest = g.starts.size ? Math.min(...g.starts) : null;
+      const newFiring = !known.seen || (earliest !== null && earliest > known.seen);
+      if (newFiring) known.firings.push(earliest ?? t);
       known.firings = known.firings.filter((ts) => t - ts < DAY);
-      let newFiring = false;
-      for (const started of g.starts.size ? g.starts : [t]) {
-        if (t - started < DAY && !known.firings.includes(started)) { known.firings.push(started); newFiring = true; }
-      }
+      known.seen = t;
       const item = {
         id: `${t}-${Math.random().toString(36).slice(2, 8)}`, key: g.key, alertname: g.alertname, severity: g.severity, app: g.app,
         namespace: g.namespace, count: g.count, alerts: g.alerts, summary: g.summary,
@@ -507,9 +510,13 @@ export function createTriage(cfg, { now = () => Date.now(), write = (line) => pr
       if (cap) {
         const reasons = ['cap', ...(cfg.escalateSeverities.includes(item.severity) ? ['p1'] : []), ...(item.repeat ? ['repeat'] : [])];
         skip(cap, alertFields(item), reasons);
-        if (!state.cap.skipped) { state.cap.since = t; state.cap.reason = cap; }
-        state.cap.skipped += 1;
-        if (state.cap.names.length < 50 && !state.cap.names.includes(item.alertname)) state.cap.names.push(item.alertname);
+        // The line counts alert groups, not notifications: a repeat of a skipped alert is not one more.
+        if (!state.cap.keys.includes(item.key) && state.cap.keys.length < 500) {
+          if (!state.cap.skipped) { state.cap.since = t; state.cap.reason = cap; }
+          state.cap.keys.push(item.key);
+          state.cap.skipped = state.cap.keys.length;
+          if (!state.cap.names.includes(item.alertname)) state.cap.names.push(item.alertname);
+        }
         continue;
       }
       state.investigations.push(t);

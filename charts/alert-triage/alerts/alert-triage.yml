@@ -74,11 +74,11 @@ groups:
           app: alert-triage
           severity: p3
         annotations:
-          summary: "Alert triage skipped {{ $value | printf \"%.0f\" }} alerts in an hour: cap reached"
+          summary: "Alert triage skipped alerts {{ $value | printf \"%.0f\" }} times in an hour: cap reached"
           description: |
             The alert triage service in namespace {{ $labels.namespace }} did not investigate
-            {{ $value | printf "%.0f" }} p1 or p2 alert groups in the last hour because its hourly or daily cap was
-            used up. The caps bound the model spend; nothing is queued. The service posted one line in Slack and
+            p1 or p2 alerts {{ $value | printf "%.0f" }} times in the last hour because its hourly or daily cap was
+            used up (a repeat notification of the same alert counts again). The caps bound the model spend; nothing is queued. The service posted one line in Slack and
             marked every skipped alert with escalate=true in its log. Many different alerts at once usually have
             one cause: look at the first alerts of the hour. Which cap:
             sum by (reason) (increase(alert_triage_skipped_total[1h])). The caps are capPerHour and capPerDay in

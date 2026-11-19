@@ -220,11 +220,11 @@ tests:
               severity: p3
               namespace: holmes
             exp_annotations:
-              summary: "Alert triage skipped 24 alerts in an hour: cap reached"
+              summary: "Alert triage skipped alerts 24 times in an hour: cap reached"
               description: |
                 The alert triage service in namespace holmes did not investigate
-                24 p1 or p2 alert groups in the last hour because its hourly or daily cap was
-                used up. The caps bound the model spend; nothing is queued. The service posted one line in Slack and
+                p1 or p2 alerts 24 times in the last hour because its hourly or daily cap was
+                used up (a repeat notification of the same alert counts again). The caps bound the model spend; nothing is queued. The service posted one line in Slack and
                 marked every skipped alert with escalate=true in its log. Many different alerts at once usually have
                 one cause: look at the first alerts of the hour. Which cap:
                 sum by (reason) (increase(alert_triage_skipped_total[1h])). The caps are capPerHour and capPerDay in

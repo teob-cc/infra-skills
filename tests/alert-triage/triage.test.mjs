@@ -290,27 +290,73 @@ test('parseFinding: JSON, fenced JSON, JSON inside prose; nothing else', () => {
 
 test('escalation: the same group fires 3 times in 24 hours', async (t) => {
   const b = await bed(t);
-  await fire(b, { startsAt: '2026-11-19T09:58:00Z' }); // first firing, investigated
-  b.clock += HOUR;
-  await fire(b, { startsAt: '2026-11-19T09:58:00Z' }); // a repeat notification is not a new firing
-  await fire(b, { startsAt: '2026-11-19T10:50:00Z' }); // second firing
+  const at = (hhmm) => { b.clock = Date.parse(`2026-11-19T${hhmm}:00Z`); };
+  at('10:00'); await fire(b, { startsAt: '2026-11-19T09:58:00Z' }); // incident 1, investigated
+  at('10:30'); await fire(b, { startsAt: '2026-11-19T09:58:00Z' }); // a repeat notification is not a new firing
+  at('10:51'); await fire(b, { startsAt: '2026-11-19T10:50:00Z' }); // incident 2 (the first had resolved)
   assert.equal(b.posts('#infra-watchdog').length, 0);
-  b.clock += HOUR;
-  await fire(b, { startsAt: '2026-11-19T11:55:00Z' }); // third firing, inside the 4 hour window
-  await fire(b, { startsAt: '2026-11-19T11:55:00Z' }); // its repeat: no second escalation line
+  at('11:56'); await fire(b, { startsAt: '2026-11-19T11:55:00Z' }); // incident 3, inside the 4 hour window
+  at('12:10'); await fire(b, { startsAt: '2026-11-19T11:55:00Z' }); // its repeat: no second escalation line
   assert.equal(b.holmesRequests.length, 1);
   const skips = b.log('skip');
   assert.deepEqual(skips.map((s) => [s.reason, s.escalate, s.escalate_reasons]), [['dedup', false, []], ['dedup', false, []], ['dedup', true, ['repeat']], ['dedup', false, []]]);
   assert.deepEqual(b.posts('#infra-watchdog'), ['[test] escalate: KubePodCrashLooping (p2 · app shop · namespace shop): fired 3 times or more in 24 hours. Not investigated again: one investigation per group per window.']);
 
-  b.clock += 3 * HOUR; // outside the window: the fourth firing is investigated and escalated as a repeater
-  await fire(b, { startsAt: '2026-11-19T14:59:00Z' });
+  at('15:00'); await fire(b, { startsAt: '2026-11-19T14:59:00Z' }); // incident 4, outside the window: investigated, escalated as a repeater
   const last = b.log('investigation').at(-1);
   assert.deepEqual([last.escalate, last.escalate_reasons], [true, ['repeat']]);
 
   b.clock += 25 * HOUR; // a day later the count starts again
   await fire(b, { startsAt: '2026-11-20T15:58:00Z' });
   assert.equal(b.log('investigation').at(-1).escalate, false);
+});
+
+test('one incident with several instances is one firing, whatever their start times', async (t) => {
+  const b = await bed(t);
+  const pod = (n, startsAt) => ({ startsAt, labels: { pod: `shop-${n}` } });
+  // Three pods of one group crash one after the other: one payload, three start times.
+  await fire(b, pod(0, '2026-11-19T09:50:00Z'), pod(1, '2026-11-19T09:55:00Z'), pod(2, '2026-11-19T09:58:00Z'));
+  const first = b.log('investigation')[0];
+  assert.deepEqual([first.firing_instances, first.escalate, first.escalate_reasons], [3, false, []]);
+  // The incident goes on: a fourth pod joins, then the first one recovers. Still the same firing.
+  b.clock += 10 * MIN;
+  await fire(b, pod(0, '2026-11-19T09:50:00Z'), pod(1, '2026-11-19T09:55:00Z'), pod(2, '2026-11-19T09:58:00Z'), pod(3, '2026-11-19T10:08:00Z'));
+  b.clock += 10 * MIN;
+  await fire(b, pod(1, '2026-11-19T09:55:00Z'), pod(2, '2026-11-19T09:58:00Z'), pod(3, '2026-11-19T10:08:00Z'));
+  assert.ok(b.log('skip').every((s) => s.reason === 'dedup' && s.escalate === false));
+  assert.equal(b.posts('#infra-watchdog').length, 0);
+  assert.equal(JSON.parse(fs.readFileSync(b.cfg.stateFile, 'utf8')).groups['KubePodCrashLooping|shop|shop'].firings.length, 1);
+
+  // Two more separate incidents, each with two pods: now it is the third firing.
+  b.clock += 30 * MIN; // 10:50
+  await fire(b, pod(0, '2026-11-19T10:45:00Z'), pod(1, '2026-11-19T10:47:00Z'));
+  assert.equal(b.posts('#infra-watchdog').length, 0);
+  b.clock += 30 * MIN; // 11:20
+  await fire(b, pod(0, '2026-11-19T11:15:00Z'), pod(2, '2026-11-19T11:18:00Z'));
+  assert.deepEqual(b.log('skip').at(-1).escalate_reasons, ['repeat']);
+  assert.equal(b.posts('#infra-watchdog').length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(b.cfg.stateFile, 'utf8')).groups['KubePodCrashLooping|shop|shop'].firings.length, 3);
+});
+
+test('the cap line counts alert groups, not notifications', async (t) => {
+  const b = await bed(t);
+  for (let i = 0; i < 6; i += 1) await fire(b, { name: `Used${i}` });
+  // Two groups are skipped; Alertmanager notifies one of them three times and the other twice before the line is due.
+  for (const name of ['CappedA', 'CappedB', 'CappedA', 'CappedA', 'CappedB']) { b.clock += 20_000; await fire(b, { name }); }
+  b.clock += MIN;
+  await b.triage.tick();
+  assert.deepEqual(b.posts('#infra-alerts').filter((x) => x.includes('cap reached')), ['[test] 2 alerts not investigated, cap reached (6 an hour): CappedA, CappedB']);
+  assert.equal(b.log('cap')[0].skipped, 2);
+  // Each notification still has its own skip line and counts in the metric.
+  assert.equal(b.log('skip').length, 5);
+  assert.equal(b.metric('alert_triage_skipped_total{reason="cap_hour"}'), 5);
+  // The same alert in two namespaces is two groups, named once.
+  b.clock += 61 * MIN;
+  for (let i = 0; i < 6; i += 1) await fire(b, { name: `Again${i}` });
+  await fire(b, { name: 'CappedC', namespace: 'one' }); await fire(b, { name: 'CappedC', namespace: 'two' });
+  b.clock += 3 * MIN;
+  await b.triage.tick();
+  assert.equal(b.posts('#infra-alerts').filter((x) => x.includes('cap reached')).at(-1), '[test] 2 alerts not investigated, cap reached (6 an hour): CappedC');
 });
 
 test('storm: 30 alerts in 10 minutes give 6 investigations, one cap line, and no queue', async (t) => {
