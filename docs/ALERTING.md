@@ -19,6 +19,8 @@ A p1 alert inhibits p2 and p3 alerts that share its `alertname` and `app`. The
 `Watchdog` alert always fires. It goes to the dead-man heartbeat (`ALERTMANAGER_DEADMAN_URL`)
 or to a null receiver, and never to a human channel.
 
+Slack is an optional third channel for p1 and p2; see [Slack](#slack) below.
+
 To change rules on a running env, use `observability.sh <env> --dry-run` first. It
 renders the upgrade server-side and diffs the three ConfigMaps against the live ones.
 Then run `observability.sh <env> --rules-only`, which upgrades only the `prometheus`
@@ -188,3 +190,98 @@ so only the external dead-man heartbeat covers those. Set it up per env:
 AlertmanagerNotificationsFailing (p1) means Telegram rejects or cannot receive alerts.
 AlertmanagerEmailNotificationsFailing (p3) means the SMTP relay key is not authorised
 for the sender domain.
+
+## Slack
+
+Alertmanager can post p1 and p2 alerts to a Slack channel by itself, next to Telegram
+and email. Both keep every alert they get without Slack; p3 and the Watchdog never go to
+Slack. The receiver is off until the env has a Secret `alertmanager-slack`. Without that
+Secret the generated Alertmanager config is byte-for-byte the one without Slack.
+
+A message has a title with severity, env, alert name and state, like
+`[P1] [prod] KubeAPIServerDown (FIRING)`, linked to the alert list of the env's Grafana,
+and one line per alert: its state, its summary and a runbook link. A group of more than
+ten alerts shows the first ten. Resolved alerts are posted too.
+
+### Switch it on for an env
+
+1. In Slack, create an app with the single bot scope `chat:write`, install it to the
+   workspace and add it to the channel (`/invite @<app>`). Keep its bot token
+   (`xoxb-...`). An app that is not in the channel gets `not_in_channel` from Slack.
+2. Create `envs/<env>/secrets.plain/alertmanager-slack.yaml`, the same shape as
+   `alertmanager-telegram.yaml`:
+
+   ```yaml
+   apiVersion: v1
+   kind: Secret
+   metadata:
+     name: alertmanager-slack
+     namespace: observability
+   type: Opaque
+   stringData:
+     token: <the bot token>
+   ```
+
+3. Encrypt it, commit the file under `secrets.sops/`, and apply it with the kubeconfig
+   of that env named explicitly, because `sops/apply.sh` writes to the current context:
+
+   ```bash
+   tools/sops/encrypt.sh <env> alertmanager-slack.yaml
+   KUBECONFIG=<envs repo>/envs/<env>/kubeconfig.yaml tools/sops/apply.sh <env> alertmanager-slack.yaml
+   ```
+
+4. The channel defaults to `#infra-alerts`. For another one, set it in
+   `envs/<env>/env.properties`, in quotes: `ALERTMANAGER_SLACK_CHANNEL="#ops-alerts"`.
+   `ALERTMANAGER_SLACK_LINK_URL` changes where the title links to.
+5. Look at the change, then roll it out:
+
+   ```bash
+   tools/k3s/observability.sh <env> --dry-run      # writes nothing
+   tools/k3s/observability.sh <env> --rules-only   # upgrades only the prometheus release
+   ```
+
+   The dry run prints `Slack receiver on: ...` and the diff of `alertmanager.yml` shows
+   one new receiver `ops-slack` and two new route legs, nothing else. The first real run
+   adds a volume to the Alertmanager StatefulSet, so its pod restarts once.
+
+The token is read by Alertmanager from the mounted file
+(`/etc/alertmanager/slack/token`). It is in no ConfigMap, no Helm value and no output of
+the script, and the script never creates or changes this Secret.
+
+### Check it
+
+Send a test alert to Alertmanager (it resolves by itself after five minutes):
+
+```bash
+kubectl -n observability port-forward svc/prometheus-alertmanager 9093:9093 &
+curl -s -XPOST -H 'Content-Type: application/json' http://127.0.0.1:9093/api/v2/alerts \
+  -d '[{"labels":{"alertname":"SlackTest","severity":"p2","app":"infra","env":"<env>"},
+        "annotations":{"summary":"Test alert, ignore"}}]'
+```
+
+It must appear in the channel and in Telegram within a minute. If it does not reach
+Slack, AlertmanagerNotificationsFailing fires with `integration="slack"`, and the
+Alertmanager log names Slack's answer: `invalid_auth` (wrong or revoked token),
+`not_in_channel` or `channel_not_found` (the app was not added to the channel, or the
+channel name is wrong), `missing_scope` (the app lacks `chat:write`).
+
+### Switch it off
+
+Delete the Secret and run `--rules-only` again; the config goes back to the one without
+Slack. Remove `secrets.sops/alertmanager-slack.yaml` from the envs repo as well,
+otherwise the next `sops/apply.sh <env>` puts the Secret back.
+
+```bash
+kubectl -n observability delete secret alertmanager-slack
+tools/k3s/observability.sh <env> --rules-only
+```
+
+### Test for the generated config
+
+`tests/alertmanager-config/run.sh` renders the Alertmanager config for a fake env without
+a cluster, with and without the Slack and dead-man Secrets. It checks the config with
+`amtool check-config`, checks with `amtool config routes test` which receivers a p1, p2,
+p3, Watchdog and an unlabelled alert reach, and compares the config without Slack with
+`tests/alertmanager-config/expected/`. Run it after any change to the `alertmanager:`
+block of `observability.sh`; `--update` rewrites the expected files after a wanted
+change.

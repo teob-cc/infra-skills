@@ -233,6 +233,18 @@ ALERTMANAGER_SMTP_HOST="${ALERTMANAGER_SMTP_HOST:-smtp.resend.com:465}"
 # Alertmanager UI.
 ALERTMANAGER_DEADMAN_URL="${ALERTMANAGER_DEADMAN_URL:-}"
 
+# Slack as a third channel for p1 and p2 alerts, next to Telegram and email. Off by
+# default. It switches on when a Secret `alertmanager-slack` (namespace observability,
+# key `token`) exists: the bot token (xoxb-...) of a Slack app with the scope
+# chat:write that was added to the channel. Apply it via SOPS like alertmanager-telegram
+# (envs/<env>/secrets.sops/alertmanager-slack.yaml). Alertmanager reads the token from
+# the mounted file, so it is in no ConfigMap, Helm value or output of this script.
+# The channel comes from env.properties (quote it: ALERTMANAGER_SLACK_CHANNEL="#ops").
+# ALERTMANAGER_SLACK_LINK_URL is where the message title links to; it defaults to the
+# alert list of this env's Grafana. See docs/ALERTING.md, "Slack".
+ALERTMANAGER_SLACK_CHANNEL="${ALERTMANAGER_SLACK_CHANNEL:-#infra-alerts}"
+ALERTMANAGER_SLACK_LINK_URL="${ALERTMANAGER_SLACK_LINK_URL:-${GRAFANA_HOST:+https://${GRAFANA_HOST}/alerting/list}}"
+
 # Public endpoints probed end-to-end by the blackbox exporter, space-separated, set
 # per env in envs/<env>/env.properties. Empty (the default) skips the exporter and the
 # scrape job entirely, so envs that have not opted in are unaffected. The shared
@@ -1580,6 +1592,69 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
     DEADMAN_RECEIVER_BLOCK=""
   fi
 
+  # Slack receiver (see ALERTMANAGER_SLACK_CHANNEL above). Optional like the dead-man's
+  # switch: without the Secret every variable below is empty and the rendered
+  # Alertmanager config is exactly what it was before Slack existed here. The script
+  # never creates this Secret and never reads the token's value: it only asks whether
+  # the key is there.
+  SLACK_SECRET_MOUNT=""
+  SLACK_ROUTES=""
+  SLACK_RECEIVER_BLOCK=""
+  slack_channel_re='^[#@]?[A-Za-z0-9._-]+$'
+  slack_link_re='^https?://[A-Za-z0-9._~:/?#@!&=+%,;-]+$'
+  if kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-slack >/dev/null 2>&1; then
+    if ! kubectl -n "$NAMESPACE_OBSERVABILITY" get secret alertmanager-slack -o json 2>/dev/null \
+        | jq -e '(.data.token // "") | length > 0' >/dev/null; then
+      warn "Secret ${NAMESPACE_OBSERVABILITY}/alertmanager-slack has no 'token' key; Slack receiver stays off"
+    elif [[ ! "$ALERTMANAGER_SLACK_CHANNEL" =~ $slack_channel_re ]]; then
+      err "ALERTMANAGER_SLACK_CHANNEL='${ALERTMANAGER_SLACK_CHANNEL}' is not a channel name or id (like \"#infra-alerts\" or C0123ABCD)"
+      exit 1
+    elif [[ -n "$ALERTMANAGER_SLACK_LINK_URL" && ! "$ALERTMANAGER_SLACK_LINK_URL" =~ $slack_link_re ]]; then
+      err "ALERTMANAGER_SLACK_LINK_URL='${ALERTMANAGER_SLACK_LINK_URL}' is not an http(s) URL"
+      exit 1
+    else
+      info "Slack receiver on: p1 and p2 also go to ${ALERTMANAGER_SLACK_CHANNEL} (bot token read from Secret alertmanager-slack)"
+      SLACK_SECRET_MOUNT="    - name: slack-token
+      mountPath: /etc/alertmanager/slack
+      secretName: alertmanager-slack
+      readOnly: true"
+      # Before the email and Telegram legs, each with continue, so those legs see the
+      # alert exactly as before. Same timing as the Telegram legs. p3 stays out of Slack.
+      SLACK_ROUTES="        - matchers: [severity=\"p1\"]
+          receiver: ops-slack
+          group_wait: 0s
+          repeat_interval: 1h
+          continue: true
+        - matchers: [severity=\"p2\"]
+          receiver: ops-slack
+          continue: true"
+      # chat.postMessage with the bot token as a Bearer credential from the mounted
+      # file. username and icons are left empty: a bot with chat:write alone posts
+      # under its own name. One line per alert, at most ten alerts per message.
+      SLACK_RECEIVER_BLOCK="      - name: ops-slack
+        slack_configs:
+          - api_url: https://slack.com/api/chat.postMessage
+            http_config:
+              authorization:
+                type: Bearer
+                credentials_file: /etc/alertmanager/slack/token
+            channel: '${ALERTMANAGER_SLACK_CHANNEL}'
+            send_resolved: true
+            username: ''
+            icon_emoji: ''
+            icon_url: ''
+            color: '{{ if eq .Status \"firing\" }}{{ if eq .CommonLabels.severity \"p1\" }}danger{{ else }}warning{{ end }}{{ else }}good{{ end }}'
+            title: '[{{ .CommonLabels.severity | toUpper }}] [{{ .CommonLabels.env }}] {{ .CommonLabels.alertname }} ({{ .Status | toUpper }})'
+            title_link: '${ALERTMANAGER_SLACK_LINK_URL}'
+            fallback: '[{{ .CommonLabels.severity | toUpper }}] [{{ .CommonLabels.env }}] {{ .CommonLabels.alertname }} ({{ .Status | toUpper }})'
+            text: |-
+              {{ range \$i, \$a := .Alerts }}{{ if lt \$i 10 }}{{ \$a.Status }}: {{ if \$a.Annotations.summary }}{{ \$a.Annotations.summary }}{{ else }}{{ \$a.Annotations.description }}{{ end }}{{ if \$a.Annotations.runbook }} (<{{ \$a.Annotations.runbook }}|runbook>){{ end }}
+              {{ end }}{{ end }}{{ if gt (len .Alerts) 10 }}{{ len .Alerts }} alerts in this group, the first 10 are shown.{{ end }}"
+    fi
+  else
+    info "No Slack receiver configured (Secret alertmanager-slack absent)"
+  fi
+
   # Create Prometheus values with PostgreSQL exporter scrape config
   prometheus_values=$(mktemp -t prometheus-values-XXXX.yaml)
   trap 'rm -f "$prometheus_values"' EXIT
@@ -1849,6 +1924,7 @@ alertmanager:
       secretName: alertmanager-telegram
       readOnly: true
 ${DEADMAN_SECRET_MOUNT}
+${SLACK_SECRET_MOUNT}
   config:
     global:
       smtp_smarthost: ${ALERTMANAGER_SMTP_HOST}
@@ -1871,6 +1947,7 @@ ${DEADMAN_SECRET_MOUNT}
           group_wait: 0s
           group_interval: 1m
           repeat_interval: 1m
+${SLACK_ROUTES}
         - matchers: [severity="p1"]
           receiver: ops-email
           group_wait: 0s
@@ -1917,6 +1994,7 @@ ${DEADMAN_SECRET_MOUNT}
               {{ end }}
       - name: watchdog-null
 ${DEADMAN_RECEIVER_BLOCK}
+${SLACK_RECEIVER_BLOCK}
     inhibit_rules:
       - source_matchers: [severity="p1"]
         target_matchers: [severity=~"p2|p3"]
