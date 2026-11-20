@@ -24,7 +24,19 @@ set -euo pipefail
 #       - the nodes, where admission webhooks live (cert-manager, CNPG, ARC): the API
 #         server calls them from the host network;
 #       - plus per-namespace extras: Postgres clients on 5432 and the CNPG operator
-#         (postgres), S3 clients on 9000 (minio).
+#         (postgres), S3 clients on 9000 (minio). Those client allows admit every namespace
+#         that is not a tenant's (no infra-skills/tenant label), or only
+#         NETPOL_POSTGRES_CLIENT_NAMESPACES / NETPOL_MINIO_CLIENT_NAMESPACES when set. A
+#         tenant's namespaces reach only the CNPG poolers labelled infra-skills/tenant=<tenant>,
+#         and MinIO only when the tenant is listed in NETPOL_TENANT_MINIO (docs/TENANTS.md).
+#   * NETPOL_APP_NAMESPACES (opt-in): application namespaces get the same default-deny ingress
+#     and the same allows as a platform namespace (same namespace, Traefik, Pomerium, Prometheus).
+#
+# Tenant nodes (shared-root tenant workers, docs/TENANTS.md: label
+# node-restriction.kubernetes.io/tenant, taint infra-skills/tenant, or a name <tenant>-* for a
+# tenant in TENANTS) are left out of platform-allow-from-nodes and of the public addresses
+# runners may reach: whoever is root there could otherwise reach every webhook and platform
+# pod from the host network. Runners stay denied every node address, tenant nodes included.
 #
 # How kube-router treats host-network sources: it ACCEPTs any packet whose source address
 # is local to the pod's node (iptables `-m addrtype --src-type LOCAL`), before the policy
@@ -64,6 +76,11 @@ set -euo pipefail
 # Environment (all optional; env.properties may set them):
 #   NETPOL_SKIP_NAMESPACES       space/comma list, same as --skip
 #   NETPOL_RUNNER_EGRESS_DENY    extra CIDRs runners must not reach (e.g. your other servers)
+#   NETPOL_APP_NAMESPACES        application namespaces fenced like platform ones
+#   NETPOL_POSTGRES_CLIENT_NAMESPACES, NETPOL_MINIO_CLIENT_NAMESPACES
+#                                restrict the Postgres / S3 client allows to these namespaces
+#   NETPOL_TENANT_MINIO          tenants whose namespaces may reach MinIO on 9000
+#   TENANTS                      tenant names (tools/k3s/tenant-admission.sh)
 #   NAMESPACE_RUNNER, NAMESPACE_HARBOR, NAMESPACE_OBSERVABILITY, NAMESPACE_ARGOCD,
 #   NAMESPACE_SSO, NAMESPACE_CERT_MANAGER, NAMESPACE_NEXUS, NAMESPACE_MINIO,
 #   CNPG_NAMESPACE, NAMESPACE_POSTGRES   the namespace names the other scripts use
@@ -143,7 +160,19 @@ cidr_contains() {
 gateway_block() { local c=$1 m; m=$(mask "${c#*/}"); echo "$(int2ip $(( $(ip2int "${c%/*}") & m )))/31"; }
 
 # --- Discover the cluster -----------------------------------------------------
-NODES_JSON=$(kubectl get nodes -o json)
+NODES_ALL_JSON=$(kubectl get nodes -o json)
+TENANT_NODE_LABEL="node-restriction.kubernetes.io/tenant"
+TENANT_NS_LABEL="infra-skills/tenant"
+words_json() { tr ', ' '\n\n' <<<"${1:-}" | sed '/^$/d' | jq -R . | jq -sc .; }
+TENANTS_J=$(words_json "${TENANTS:-}")
+# shellcheck disable=SC2016  # a jq filter
+IS_TENANT='((.metadata.labels // {})[$tl] // "") != "" or ((.spec.taints // []) | any(.key == "infra-skills/tenant"))
+  or (.metadata.name as $n | $tenants | any(. as $t | $n | startswith($t + "-")))'
+TENANT_NODES_JSON=$(jq -c --arg tl "$TENANT_NODE_LABEL" --argjson tenants "$TENANTS_J" "{items: [.items[] | select($IS_TENANT)]}" <<<"$NODES_ALL_JSON")
+NODES_JSON=$(jq -c --arg tl "$TENANT_NODE_LABEL" --argjson tenants "$TENANTS_J" "{items: [.items[] | select(($IS_TENANT) | not)]}" <<<"$NODES_ALL_JSON")
+TENANT_NODE_IPS=()  # addresses of tenant nodes: never a source the platform trusts
+while read -r ip; do [[ -n "$ip" ]] && is_ipv4 "$ip" && TENANT_NODE_IPS+=("$ip"); done < <(
+  jq -r '.items[].status.addresses[]? | select(.type=="InternalIP" or .type=="ExternalIP") | .address' <<<"$TENANT_NODES_JSON")
 NODE_IPS=()      # every IPv4 node address
 while read -r ip; do [[ -n "$ip" ]] && is_ipv4 "$ip" && NODE_IPS+=("$ip"); done < <(
   jq -r '.items[].status.addresses[] | select(.type=="InternalIP" or .type=="ExternalIP") | .address' <<<"$NODES_JSON")
@@ -209,6 +238,7 @@ add_except() {
 add_except "$CLUSTER_CIDR"
 add_except "$SERVICE_CIDR"
 for ip in "${NODE_IPS[@]}"; do add_except "$ip/32"; done
+for ip in ${TENANT_NODE_IPS[@]+"${TENANT_NODE_IPS[@]}"}; do add_except "$ip/32"; done
 for c in ${NETPOL_RUNNER_EGRESS_DENY//,/ }; do
   [[ "$c" == */* ]] || c="$c/32"
   is_ipv4 "${c%/*}" || { provision::error "NETPOL_RUNNER_EGRESS_DENY: not an IPv4 CIDR: $c"; exit 1; }
@@ -218,10 +248,15 @@ done
 log "env ${ENV_NAME}: nodes ${NODE_IPS[*]}; public ${PUBLIC_IPS[*]:-none}"
 log "cluster CIDR ${CLUSTER_CIDR}, service CIDR ${SERVICE_CIDR}, node podCIDRs ${POD_CIDRS[*]}"
 log "Traefik target ports ${TRAEFIK_TARGETS[*]}"
+TENANT_NODE_NAMES=$(jq -r '[.items[].metadata.name] | join(" ")' <<<"$TENANT_NODES_JSON")
+[[ -n "$TENANT_NODE_NAMES" ]] && log "tenant nodes, not trusted as node sources: ${TENANT_NODE_NAMES} (${TENANT_NODE_IPS[*]-})"
 
 # --- Namespace selection ------------------------------------------------------
 in_list() { local x=$1; shift; local l=" ${*//,/ } "; [[ "$l" == *" $x "* ]]; }
 ALL_NS=("$NS_RUNNER" "$NS_HARBOR" "$NS_OBS" "$NS_ARGOCD" "$NS_SSO" "$NS_CERT" "$NS_NEXUS" "$NS_MINIO" "$NS_CNPG" "$NS_POSTGRES")
+for ns in $(tr ', ' '\n\n' <<<"${NETPOL_APP_NAMESPACES:-}" | sed '/^$/d'); do
+  in_list "$ns" "${ALL_NS[*]}" || ALL_NS+=("$ns")
+done
 EXISTING_NS=$(kubectl get ns -o jsonpath='{.items[*].metadata.name}')
 TARGET_NS=()
 for ns in "${ALL_NS[@]}"; do
@@ -269,6 +304,16 @@ needs_node_sources() { in_list "$1" "$NS_RUNNER $NS_CERT $NS_CNPG"; }
 TRAEFIK_PEER=$(from_ns_pods "$NS_INGRESS" app.kubernetes.io/name=traefik)
 POMERIUM_PEER=$(from_ns_pods "$NS_SSO" app.kubernetes.io/name=pomerium)
 PROMETHEUS_PEER=$(from_ns_pods "$NS_OBS" app.kubernetes.io/name=prometheus)
+# Postgres / S3 clients: every namespace that is not a tenant's, or only the listed ones.
+client_peer() { # client_peer <namespace list> -> a NetworkPolicyPeer
+  jq -nc --arg l "$TENANT_NS_LABEL" --argjson names "$(words_json "${1:-}")" '
+    {namespaceSelector: {matchExpressions: ([{key: $l, operator: "DoesNotExist"}]
+      + (if ($names | length) > 0 then [{key: "kubernetes.io/metadata.name", operator: "In", values: $names}] else [] end))}}'
+}
+PG_CLIENTS=$(client_peer "${NETPOL_POSTGRES_CLIENT_NAMESPACES:-}")
+S3_CLIENTS=$(jq -c --arg l "$TENANT_NS_LABEL" --argjson t "$(words_json "${NETPOL_TENANT_MINIO:-}")" \
+  '[.] + (if ($t | length) > 0 then [{namespaceSelector: {matchExpressions: [{key: $l, operator: "In", values: $t}]}}] else [] end)' \
+  <<<"$(client_peer "${NETPOL_MINIO_CLIENT_NAMESPACES:-}")")
 
 render_ns() {
   local ns=$1 sel
@@ -293,15 +338,23 @@ render_ns() {
     "$(jq -nc --argjson s "$sel" --argjson p "$POMERIUM_PEER" '{podSelector: $s, policyTypes: ["Ingress"], ingress: [{from: [$p]}]}')"
   case "$ns" in
     "$NS_POSTGRES")
-      policy "$ns" platform-allow-postgres-clients "apps in any namespace -> CNPG instances/poolers on 5432; CNPG operator -> instances" \
-        "$(jq -nc --argjson op "$(from_ns_pods "$NS_CNPG" app.kubernetes.io/name=cloudnative-pg)" '{
+      policy "$ns" platform-allow-postgres-clients "apps in every non-tenant namespace -> CNPG instances/poolers on 5432; CNPG operator -> instances" \
+        "$(jq -nc --argjson op "$(from_ns_pods "$NS_CNPG" app.kubernetes.io/name=cloudnative-pg)" --argjson clients "$PG_CLIENTS" '{
           podSelector: {matchExpressions: [{key: "cnpg.io/podRole", operator: "In", values: ["instance", "pooler"]}]},
           policyTypes: ["Ingress"],
-          ingress: [{from: [{namespaceSelector: {}}], ports: [{port: 5432, protocol: "TCP"}]}, {from: [$op]}]}')"
+          ingress: [{from: [$clients], ports: [{port: 5432, protocol: "TCP"}]}, {from: [$op]}]}')"
+      local t
+      for t in $(jq -r '.[]' <<<"$TENANTS_J"); do
+        policy "$ns" "platform-allow-postgres-tenant-${t}" "tenant ${t} -> only its own CNPG poolers (labelled ${TENANT_NS_LABEL}=${t}) on 5432" \
+          "$(jq -nc --arg t "$t" --arg l "$TENANT_NS_LABEL" '{
+            podSelector: {matchLabels: {"cnpg.io/podRole": "pooler", ($l): $t}},
+            policyTypes: ["Ingress"],
+            ingress: [{from: [{namespaceSelector: {matchLabels: {($l): $t}}}], ports: [{port: 5432, protocol: "TCP"}]}]}')"
+      done
       ;;
     "$NS_MINIO")
-      policy "$ns" platform-allow-s3-clients "apps in any namespace -> the S3 API on 9000" \
-        "$(jq -nc '{podSelector: {matchLabels: {app: "minio"}}, policyTypes: ["Ingress"], ingress: [{from: [{namespaceSelector: {}}], ports: [{port: 9000, protocol: "TCP"}]}]}')"
+      policy "$ns" platform-allow-s3-clients "apps in every non-tenant namespace (and NETPOL_TENANT_MINIO tenants) -> the S3 API on 9000" \
+        "$(jq -nc --argjson clients "$S3_CLIENTS" '{podSelector: {matchLabels: {app: "minio"}}, policyTypes: ["Ingress"], ingress: [{from: $clients, ports: [{port: 9000, protocol: "TCP"}]}]}')"
       ;;
   esac
 }
