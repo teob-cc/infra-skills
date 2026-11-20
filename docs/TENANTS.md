@@ -49,7 +49,9 @@ It also gives the order to set a tenant up in, and the gaps that remain.
   `--warn` binds the policies with `[Warn, Audit]`, for a first look at a live cluster.
   `--plan` also lists the existing pods and nodes that the policies would refuse.
 - **`tools/k3s/join-worker.sh <env> <tenant>-<n> --tenant <tenant>`** joins the tenant worker:
-  - it uses the agent token, and refuses without one;
+  - it joins with a bootstrap token made for this join and deleted when the run ends
+    (`--token agent` uses a separate agent token instead, on a server installed with one; the
+    server token is refused for a tenant);
   - it writes a registries.yaml that holds only the tenant's pull robot
     (`secrets.plain/registry-tenant-<tenant>.yaml`, with `stringData.registry`, `.username`
     and `.password`);
