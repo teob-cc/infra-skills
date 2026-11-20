@@ -28,6 +28,9 @@ SSH_KEY=""
 NODE_LABELS=""
 NODE_TAINTS=""
 REMOVE=false
+TENANT_FLAG=""
+TOKEN_MODE=""
+KEEP_QUARANTINE=false
 UNINSTALL=false
 DEBUG=false
 
@@ -49,6 +52,19 @@ Flags:
                         when needed: alerts treat it as parked, not failed, while it is
                         not Ready (docs/ALERTING.md, "On-demand nodes")
   --taint KEY=VAL:EFF   Add taint to node (repeatable, e.g. --taint gpu=rtx4080:NoSchedule)
+  --tenant NAME         Join a shared-root tenant worker (docs/TENANTS.md; or TENANT= in the worker's
+                        env.properties): short-lived agent-only join token, tenant-only registries.yaml, node name
+                        NAME-*, taints infra-skills/quarantine + infra-skills/tenant=NAME:NoExecute,
+                        label node-restriction.kubernetes.io/tenant=NAME set as cluster admin.
+                        Needs tools/k3s/tenant-admission.sh first
+  --token MODE          Join token: bootstrap (a k3s bootstrap token made for this join, agent-only,
+                        deleted when the run ends; default for --tenant), agent (server/agent-token,
+                        when the server was installed with one), server (the server token, which
+                        also admits servers) or auto (default: agent if present, else server).
+                        An agent already joined is moved off the server token. JOIN_TOKEN_TTL
+                        (default 30m) bounds a bootstrap token that could not be deleted
+  --keep-quarantine     Leave the infra-skills/quarantine taint on a newly registered node (by
+                        default it is lifted once the node registered with the expected address)
   --remove              Park: drain, delete node, stop+disable k3s-agent
                         (keeps k3s and the containerd image cache for fast revival)
   --uninstall           Like --remove, but also runs k3s-agent-uninstall.sh
@@ -71,6 +87,9 @@ while [[ $# -gt 0 ]]; do
     --ssh-key)   SSH_KEY="$2"; shift 2 ;;
     --label)     LABELS+=("$2"); shift 2 ;;
     --taint)     TAINTS+=("$2"); shift 2 ;;
+    --tenant)    TENANT_FLAG="$2"; shift 2 ;;
+    --token)     TOKEN_MODE="$2"; shift 2 ;;
+    --keep-quarantine) KEEP_QUARANTINE=true; shift ;;
     --remove)    REMOVE=true; shift ;;
     --uninstall) REMOVE=true; UNINSTALL=true; shift ;;
     --debug)     DEBUG=true; shift ;;
@@ -130,7 +149,39 @@ NODE_NAME="${WORKER_ARG}"
 # Normalize: replace underscores with hyphens for K8s
 NODE_NAME="${NODE_NAME//_/-}"
 
+# --- Tenant worker (shared root, docs/TENANTS.md) ---
+TENANT="${TENANT_FLAG:-${TENANT:-}}"
+TENANT_NODE_LABEL="node-restriction.kubernetes.io/tenant"
+TENANT_TAINT="infra-skills/tenant"
+QUARANTINE_TAINT="infra-skills/quarantine"
+if [[ -n "$TENANT" ]]; then
+  if [[ ! "$TENANT" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    err "Tenant name must be a DNS label: ${TENANT}"; exit 1
+  fi
+  if [[ "$NODE_NAME" != "${TENANT}-"* ]]; then
+    err "A node of tenant ${TENANT} must be named ${TENANT}-* (got ${NODE_NAME}): the admission policies recognise tenant nodes by name"
+    exit 1
+  fi
+  case "${TOKEN_MODE:-bootstrap}" in
+    bootstrap|agent) TOKEN_MODE="${TOKEN_MODE:-bootstrap}" ;;
+    *) err "A tenant worker joins with an agent-only token (--token bootstrap, the default, or agent), never with the server token"; exit 1 ;;
+  esac
+fi
+TOKEN_MODE="${TOKEN_MODE:-auto}"
+case "$TOKEN_MODE" in bootstrap|agent|server|auto) ;; *) err "--token must be bootstrap, agent, server or auto"; exit 1 ;; esac
+# Labels under node-restriction.kubernetes.io/ can be set only by an admin (NodeRestriction):
+# the kubelet would fail to register with them, so they are never persisted in config.yaml.
+# A tenant node persists no labels at all: tenant-admission.sh lets its kubelet register
+# only with the labels the kubelet maintains itself.
+declare -a PERSIST_LABELS=()
+for label in ${LABELS[@]+"${LABELS[@]}"}; do
+  [[ "$label" == "${TENANT_NODE_LABEL}="* && -n "$TENANT" ]] && { err "--label ${TENANT_NODE_LABEL} is set by --tenant"; exit 1; }
+  [[ -n "$TENANT" || "$label" == node-restriction.kubernetes.io/* ]] && continue
+  PERSIST_LABELS+=("$label")
+done
+
 info "K3s worker join for ${ENV_NAME}/${WORKER_ARG}"
+[[ -n "$TENANT" ]] && info "  Tenant: ${TENANT} (shared-root tenant worker)"
 info "  Node:   ${NODE_NAME}"
 info "  Worker: ${VLAN_IP_ADDR} (Tailscale)"
 info "  Master: ${MASTER_VLAN_IP_ADDR} (Tailscale)"
@@ -230,53 +281,192 @@ if ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "timeout 5 bash -c 'cat < /dev/null > /d
 fi
 ok "Master K3s API reachable from worker"
 
-# --- Get K3s node token from master ---
-info "Fetching K3s node token from master..."
+# --- Get the join token from the master ---
+# server/node-token is the server token: it also admits a new SERVER, which gets the
+# datastore and every Secret. An agent keeps its token in
+# /etc/systemd/system/k3s-agent.service.env, readable by whoever is root on it. Modes:
+#   bootstrap  a bootstrap token made for this join (`k3s token create --ttl`), deleted again
+#              once the node registered. It joins agents only (a server join is refused) and
+#              the copy left on the node is dead afterwards; the agent keeps working through
+#              restarts on its node password. No change on the server. Default for --tenant.
+#   agent      server/agent-token, when the server was installed with a separate agent-token.
+#              Not added here to a running server: on k3s v1.36 (sqlite) adding agent-token to
+#              an existing server makes every k3s start after the first fail with
+#              "cred/passwd newer than datastore" (INFRA-214, reproduced 2026-11-20).
+#   server     the server token (the historical default).
+#   auto       agent when the server has a separate agent token, else server (default).
+info "Fetching K3s join token from master (--token ${TOKEN_MODE})..."
 
 # Try SSH to master via Tailscale IP
 MASTER_SSH_HOST="$MASTER_VLAN_IP_ADDR"
 MASTER_NODE_TOKEN=""
+AGENT_TOKEN_STATE=""
+BOOTSTRAP_TOKEN_ID=""
 
 MASTER_USERS=(admin root)
 [[ -n "${MASTER_SSH_USER:-}" ]] && MASTER_USERS=("$MASTER_SSH_USER" "${MASTER_USERS[@]}")
 for master_user in "${MASTER_USERS[@]}"; do
-  MASTER_NODE_TOKEN=$(ssh "${SSH_OPTS[@]}" "${master_user}@${MASTER_SSH_HOST}" \
-    "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null || true)
-  if [[ -n "$MASTER_NODE_TOKEN" ]]; then
-    info "  Fetched token via SSH as ${master_user}@${MASTER_SSH_HOST}"
+  AGENT_TOKEN_STATE=$(ssh "${SSH_OPTS[@]}" "${master_user}@${MASTER_SSH_HOST}" \
+    "d=/var/lib/rancher/k3s/server; sudo test -f \$d/node-token || exit 1; if sudo test -f \$d/agent-token && ! sudo test -L \$d/agent-token && ! sudo cmp -s \$d/token \$d/agent-token; then echo separate; else echo shared; fi" \
+    2>/dev/null || true)
+  if [[ -n "$AGENT_TOKEN_STATE" ]]; then
     MASTER_SSH_USER="$master_user"
     break
   fi
 done
-
-if [[ -z "$MASTER_NODE_TOKEN" ]]; then
-  err "Could not fetch K3s node token from master."
+if [[ -z "$AGENT_TOKEN_STATE" ]]; then
+  err "Could not read the K3s tokens on the master."
   err "Retrieve it manually: ssh <user>@${MASTER_SSH_HOST} sudo cat /var/lib/rancher/k3s/server/node-token"
   err "Or set MASTER_SSH_USER=<user> (a login with sudo on the master) and re-run."
   exit 1
 fi
-ok "Got K3s node token"
+if [[ "$TOKEN_MODE" == auto ]]; then
+  if [[ "$AGENT_TOKEN_STATE" == separate ]]; then
+    TOKEN_MODE=agent
+  else
+    TOKEN_MODE=server
+    warn "Joining with the server token, which also admits servers; --token bootstrap joins with a short-lived agent-only token instead."
+  fi
+fi
+case "$TOKEN_MODE" in
+  agent)
+    if [[ "$AGENT_TOKEN_STATE" != separate ]]; then
+      err "The server has no separate agent token (server/agent-token is the server token). Use --token bootstrap."
+      exit 1
+    fi
+    MASTER_NODE_TOKEN=$(ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" "sudo cat /var/lib/rancher/k3s/server/agent-token" 2>/dev/null || true)
+    [[ "$MASTER_NODE_TOKEN" == *"::server:"* ]] && { err "server/agent-token holds a server token; refusing"; exit 1; }
+    ;;
+  server)
+    MASTER_NODE_TOKEN=$(ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" "sudo cat /var/lib/rancher/k3s/server/node-token" 2>/dev/null || true)
+    ;;
+  bootstrap)
+    MASTER_NODE_TOKEN=$(ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" \
+      "sudo k3s token create --ttl ${JOIN_TOKEN_TTL:-30m} --description 'join-worker ${NODE_NAME}' 2>/dev/null | tail -1" 2>/dev/null || true)
+    if [[ ! "$MASTER_NODE_TOKEN" =~ ::[a-z0-9]{6}\.[a-z0-9]{16}$ ]]; then
+      err "Could not create a bootstrap token on the master (k3s token create)"; exit 1
+    fi
+    BOOTSTRAP_TOKEN_ID="${MASTER_NODE_TOKEN##*::}"; BOOTSTRAP_TOKEN_ID="${BOOTSTRAP_TOKEN_ID%%.*}"
+    ;;
+esac
+if [[ -z "$MASTER_NODE_TOKEN" ]]; then
+  err "Could not read the ${TOKEN_MODE} token on the master as ${MASTER_SSH_USER}@${MASTER_SSH_HOST}"
+  exit 1
+fi
+ok "Got K3s ${TOKEN_MODE} token (via ${MASTER_SSH_USER}@${MASTER_SSH_HOST})${BOOTSTRAP_TOKEN_ID:+, id ${BOOTSTRAP_TOKEN_ID}, valid ${JOIN_TOKEN_TTL:-30m}}"
+# Delete the bootstrap token when the script ends, joined or not: its job is done once the
+# node registered, and an unused one should not outlive the run.
+delete_bootstrap_token() {
+  [[ -n "$BOOTSTRAP_TOKEN_ID" ]] || return 0
+  ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" "sudo k3s token delete ${BOOTSTRAP_TOKEN_ID} >/dev/null 2>&1" \
+    && info "Bootstrap token ${BOOTSTRAP_TOKEN_ID} deleted" \
+    || warn "Could not delete bootstrap token ${BOOTSTRAP_TOKEN_ID}; it expires after ${JOIN_TOKEN_TTL:-30m}"
+  BOOTSTRAP_TOKEN_ID=""
+}
+trap delete_bootstrap_token EXIT
+
+# A node that once held the server token keeps it in the agent env file until rewritten
+# below; if the tenant already had root then, the server token must be rotated.
+if [[ -n "$TENANT" ]] && ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
+     "sudo grep -q '::server:' /etc/systemd/system/k3s-agent.service.env 2>/dev/null"; then
+  warn "This node holds the SERVER token in /etc/systemd/system/k3s-agent.service.env; it is replaced now."
+  warn "  If the tenant was already root on it, rotate the server token (k3s token rotate) — see docs/TENANTS.md."
+fi
+
+# --- Admission policies (tools/k3s/tenant-admission.sh) ---
+# With infra-skills-node-registration in place a kubelet can register a new node only with
+# the quarantine taint; a tenant node additionally needs the tenant policies, or nothing
+# stops its kubelet from untainting or relabelling itself.
+REGISTRATION_POLICY=false
+kubectl get validatingadmissionpolicy infra-skills-node-registration >/dev/null 2>&1 && REGISTRATION_POLICY=true
+if [[ -n "$TENANT" ]]; then
+  for p in infra-skills-node-registration infra-skills-tenant-node-self infra-skills-node-shared-agent-identity infra-skills-tenant-pod-placement; do
+    if ! kubectl get validatingadmissionpolicybinding "$p" >/dev/null 2>&1; then
+      err "Admission policy ${p} is not installed: run tools/k3s/tenant-admission.sh ${ENV_ARG} (with TENANTS including ${TENANT}) first"
+      exit 1
+    fi
+    if ! kubectl get validatingadmissionpolicybinding "$p" -o json | jq -e '.spec.validationActions | index("Deny")' >/dev/null; then
+      warn "Admission policy ${p} only warns (validationActions without Deny): it does not protect this tenant node yet"
+    fi
+  done
+  if ! kubectl get validatingadmissionpolicy infra-skills-node-registration -o json \
+       | jq -e --arg t "$TENANT" '.spec.variables[] | select(.name == "tenant") | .expression | contains("\"" + $t + "\"")' >/dev/null; then
+    err "tenant-admission.sh does not know tenant ${TENANT}: add it to TENANTS in envs/${ENV_ARG}/env.properties and re-run it"
+    exit 1
+  fi
+fi
+QUARANTINE=false
+if ! kubectl get node "$NODE_NAME" >/dev/null 2>&1 && { [[ -n "$TENANT" ]] || $REGISTRATION_POLICY; }; then
+  QUARANTINE=true
+fi
+# A tenant node always carries its quarantine taint in config.yaml: whenever it registers
+# anew it waits for an admin (this script) to check it and lift the taint.
+[[ -n "$TENANT" ]] && TAINTS=("${TENANT_TAINT}=${TENANT}:NoExecute" ${TAINTS[@]+"${TAINTS[@]}"})
+# The quarantine taint is persisted (applied at every fresh registration) but never applied
+# with kubectl below: this script lifts it once the node checks out.
+declare -a PERSIST_TAINTS=(${TAINTS[@]+"${TAINTS[@]}"})
+if [[ -n "$TENANT" ]] || $REGISTRATION_POLICY; then
+  PERSIST_TAINTS=("${QUARANTINE_TAINT}=true:NoExecute" ${PERSIST_TAINTS[@]+"${PERSIST_TAINTS[@]}"})
+fi
+if $QUARANTINE && [[ -z "$TENANT" ]]; then
+  info "infra-skills-node-registration is installed: ${NODE_NAME} registers quarantined (${QUARANTINE_TAINT}=true:NoExecute)"
+fi
 
 # --- Registry credentials (containerd) ---
 # harbor.sh writes the pull-only robot for Harbor's private projects into the server's
 # /etc/rancher/k3s/registries.yaml; an agent needs the same file or it cannot pull from
 # library/dockerhub-proxy. Copy it (never printed); an agent that is already running is
 # restarted below only when the file changed.
+#
+# A tenant node gets its own file instead: the server's mirrors, every credential removed,
+# and only the tenant's pull robot (envs/<env>/secrets.plain/registry-tenant-<tenant>.yaml,
+# or its secrets.sops copy: stringData.registry, .username, .password). The platform's
+# node-pull robot would let the tenant pull every private platform image.
 REGISTRIES_CHANGED=false
 REGISTRIES_YAML=$(ssh "${SSH_OPTS[@]}" "${MASTER_SSH_USER}@${MASTER_SSH_HOST}" \
   "sudo cat /etc/rancher/k3s/registries.yaml 2>/dev/null" 2>/dev/null || true)
+if [[ -n "$TENANT" ]]; then
+  command -v yq >/dev/null 2>&1 || { err "yq is required for a tenant join"; exit 1; }
+  TENANT_REG_PLAIN="${ENV_ROOT}/${ENV_ARG}/secrets.plain/registry-tenant-${TENANT}.yaml"
+  TENANT_REG_SOPS="${ENV_ROOT}/${ENV_ARG}/secrets.sops/registry-tenant-${TENANT}.yaml"
+  TENANT_REG=""
+  if [[ -f "$TENANT_REG_PLAIN" ]]; then
+    TENANT_REG=$(cat "$TENANT_REG_PLAIN")
+  elif [[ -f "$TENANT_REG_SOPS" ]]; then
+    TENANT_REG=$(sops -d "$TENANT_REG_SOPS") || { err "Cannot decrypt ${TENANT_REG_SOPS}"; exit 1; }
+  fi
+  REG_SRC="${REGISTRIES_YAML:-}"; [[ -n "$REG_SRC" ]] || REG_SRC="{}"
+  REG_BASE=$(printf "%s\n" "$REG_SRC" | yq eval 'del(.configs[].auth)' -)
+  if [[ -n "$TENANT_REG" ]]; then
+    REG_HOST=$(printf '%s\n' "$TENANT_REG" | yq eval '.stringData.registry // ""' -)
+    REG_USER=$(printf '%s\n' "$TENANT_REG" | yq eval '.stringData.username // ""' -)
+    REG_PASS=$(printf '%s\n' "$TENANT_REG" | yq eval '.stringData.password // ""' -)
+    if [[ -z "$REG_HOST" || -z "$REG_USER" || -z "$REG_PASS" ]]; then
+      err "registry-tenant-${TENANT}.yaml needs stringData.registry, .username and .password"; exit 1
+    fi
+    REGISTRIES_YAML=$(printf '%s\n' "$REG_BASE" | H="$REG_HOST" U="$REG_USER" P="$REG_PASS" \
+      yq eval '.configs[strenv(H)].auth = {"username": strenv(U), "password": strenv(P)}' -)
+    unset REG_PASS TENANT_REG
+    info "Tenant registries.yaml: the server's mirrors, ${REG_USER} for ${REG_HOST}, no platform credential"
+  else
+    REGISTRIES_YAML="$REG_BASE"
+    warn "No registry-tenant-${TENANT}.yaml in secrets.plain/ or secrets.sops/: the tenant node gets no registry credential (public images only)"
+  fi
+  [[ "$REGISTRIES_YAML" == "{}" ]] && REGISTRIES_YAML="# Managed by join-worker.sh --tenant ${TENANT}: no registry credential"
+fi
 if [[ -n "$REGISTRIES_YAML" ]]; then
   if [[ "$(printf '%s\n' "$REGISTRIES_YAML" | shasum -a 256 | cut -d' ' -f1)" != \
         "$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo cat /etc/rancher/k3s/registries.yaml 2>/dev/null | sha256sum" 2>/dev/null | cut -d' ' -f1)" ]]; then
     printf '%s\n' "$REGISTRIES_YAML" | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
       "sudo sh -c 'umask 077; mkdir -p /etc/rancher/k3s && cat > /etc/rancher/k3s/registries.yaml'"
     REGISTRIES_CHANGED=true
-    ok "Copied /etc/rancher/k3s/registries.yaml from the server"
+    if [[ -n "$TENANT" ]]; then ok "Wrote the tenant registries.yaml"; else ok "Copied /etc/rancher/k3s/registries.yaml from the server"; fi
   else
-    info "/etc/rancher/k3s/registries.yaml already matches the server's"
+    info "/etc/rancher/k3s/registries.yaml already up to date"
   fi
 fi
 unset REGISTRIES_YAML
+
 
 # --- Persist agent config (flannel-iface, labels, taints) ---
 # kubectl-applied labels/taints live on the node object and die with it (e.g. parked
@@ -290,13 +480,13 @@ unset REGISTRIES_YAML
 # is silently undeliverable). The master must also run flannel-iface=tailscale0.
 K3S_CONFIG="# Managed by join-worker.sh"$'\n'
 K3S_CONFIG+="flannel-iface: tailscale0"$'\n'
-if [[ ${#LABELS[@]} -gt 0 ]]; then
+if [[ ${#PERSIST_LABELS[@]} -gt 0 ]]; then
   K3S_CONFIG+="node-label:"$'\n'
-  for label in "${LABELS[@]}"; do K3S_CONFIG+="  - \"${label}\""$'\n'; done
+  for label in "${PERSIST_LABELS[@]}"; do K3S_CONFIG+="  - \"${label}\""$'\n'; done
 fi
-if [[ ${#TAINTS[@]} -gt 0 ]]; then
+if [[ ${#PERSIST_TAINTS[@]} -gt 0 ]]; then
   K3S_CONFIG+="node-taint:"$'\n'
-  for taint in "${TAINTS[@]}"; do K3S_CONFIG+="  - \"${taint}\""$'\n'; done
+  for taint in "${PERSIST_TAINTS[@]}"; do K3S_CONFIG+="  - \"${taint}\""$'\n'; done
 fi
 info "Persisting agent config (flannel-iface/labels/taints) to /etc/rancher/k3s/config.yaml..."
 printf '%s' "$K3S_CONFIG" | ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
@@ -326,8 +516,21 @@ if kubectl get node "$NODE_NAME" >/dev/null 2>&1; then
   NODE_STATUS=$(kubectl get node "$NODE_NAME" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')
   if [[ "$NODE_STATUS" == "True" ]]; then
     ok "Node ${NODE_NAME} is already joined and Ready"
-    if [[ "$REGISTRIES_CHANGED" == "true" ]]; then
-      info "Restarting k3s-agent so containerd reads the new registries.yaml..."
+    # Switch a joined agent to the chosen token (e.g. off the server token). A bootstrap token
+    # replaces only a server token: an agent joined with an expired one keeps working.
+    TOKEN_SWITCHED=false
+    ENV_F=/etc/systemd/system/k3s-agent.service.env
+    TOKEN_CURRENT="sudo grep -qxF \"K3S_TOKEN='${MASTER_NODE_TOKEN}'\" $ENV_F"
+    [[ "$TOKEN_MODE" == bootstrap ]] && TOKEN_CURRENT="! sudo grep -q '::server:' $ENV_F"
+    if ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$TOKEN_CURRENT" 2>/dev/null; then
+      info "Switching the agent to the ${TOKEN_MODE} token..."
+      ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo sed -i \
+        -e \"s|^K3S_TOKEN=.*|K3S_TOKEN='${MASTER_NODE_TOKEN}'|\" \
+        /etc/systemd/system/k3s-agent.service.env && sudo systemctl daemon-reload"
+      TOKEN_SWITCHED=true
+    fi
+    if [[ "$REGISTRIES_CHANGED" == "true" || "$TOKEN_SWITCHED" == "true" ]]; then
+      info "Restarting k3s-agent (new registries.yaml or token)..."
       ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo systemctl restart --no-block k3s-agent"
     fi
     # Still apply labels/taints below
@@ -536,6 +739,39 @@ if [[ ${#TAINTS[@]} -gt 0 ]]; then
     info "  Taint: ${taint}"
   done
   ok "Taints applied"
+fi
+
+# --- Tenant label (admin only: NodeRestriction keeps the kubelet off this prefix) ---
+if [[ -n "$TENANT" ]]; then
+  kubectl label node "$NODE_NAME" "${TENANT_NODE_LABEL}=${TENANT}" --overwrite >/dev/null
+  ok "Label ${TENANT_NODE_LABEL}=${TENANT} set"
+fi
+
+# --- Quarantine ---
+# A node registered with the quarantine taint receives no pod until an admin lifts it. This
+# script lifts it only when the node is the one it just set up: its InternalIP is the
+# worker's address and, for a tenant node, it carries the tenant taint and label.
+NODE_JSON=$(kubectl get node "$NODE_NAME" -o json)
+if jq -e --arg q "$QUARANTINE_TAINT" '(.spec.taints // []) | any(.key == $q)' <<<"$NODE_JSON" >/dev/null; then
+  NODE_IP_OK=$(jq -r --arg ip "$VLAN_IP_ADDR" '[.status.addresses[]? | select(.type == "InternalIP") | .address] | index($ip) != null' <<<"$NODE_JSON")
+  TENANT_OK=true
+  if [[ -n "$TENANT" ]]; then
+    TENANT_OK=$(jq -r --arg t "$TENANT" --arg tt "$TENANT_TAINT" --arg tl "$TENANT_NODE_LABEL" \
+      '((.spec.taints // []) | any(.key == $tt and .value == $t and .effect == "NoExecute")) and ((.metadata.labels // {})[$tl] == $t)' <<<"$NODE_JSON")
+  fi
+  if $KEEP_QUARANTINE; then
+    warn "Node ${NODE_NAME} stays quarantined (--keep-quarantine). Lift it with: kubectl taint node ${NODE_NAME} ${QUARANTINE_TAINT}-"
+  elif [[ "$NODE_IP_OK" != true ]]; then
+    err "Node ${NODE_NAME} stays quarantined: its InternalIP is not ${VLAN_IP_ADDR}. Check it is the machine you joined:"
+    err "  kubectl get node ${NODE_NAME} -o wide"
+    exit 1
+  elif [[ "$TENANT_OK" != true ]]; then
+    err "Node ${NODE_NAME} stays quarantined: it lacks ${TENANT_TAINT}=${TENANT}:NoExecute or ${TENANT_NODE_LABEL}=${TENANT}"
+    exit 1
+  else
+    kubectl taint node "$NODE_NAME" "${QUARANTINE_TAINT}-" >/dev/null
+    ok "Quarantine lifted (${NODE_NAME} registered with ${VLAN_IP_ADDR})"
+  fi
 fi
 
 # --- Final status ---
