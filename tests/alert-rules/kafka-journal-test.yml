@@ -60,14 +60,14 @@ tests:
           - labels: '{alertname="KafkaJournalReplicatorStalled"}'
             value: 1
 
-  # 4. A group with no committed offset yet: the exporter reports lag and offset -1.
+  # 4. A replicator group with no committed offset yet: the exporter reports lag and offset -1.
   #    That is not backlog, so nothing fires.
   - name: group without committed offsets is not a stall
     interval: 1m
     input_series:
-      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="new-group",topic="t",partition="0"}
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.new",topic="t",partition="0"}
         values: -1x45
-      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="new-group",topic="t",partition="0"}
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.new",topic="t",partition="0"}
         values: -1x45
     promql_expr_test:
       - expr: count by (alertname) (ALERTS{app="kafka-journal"})
@@ -119,4 +119,47 @@ tests:
           - labels: '{alertname="KafkaJournalReplicatorLagHigh"}'
             value: 1
           - labels: '{alertname="RedpandaDown"}'
+            value: 1
+
+  # 7. Idle replicator (no lag, no commits) next to other groups with lag and no commits:
+  #    a dead-letter reader and an app consumer far behind. Only replicator groups count,
+  #    so nothing fires — neither a stall nor lag high.
+  - name: other groups with lag do not raise replicator alerts
+    interval: 1m
+    input_series:
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 0x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 1000x45
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-dead-letter.app",topic="dl",partition="0"}
+        values: 500x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-dead-letter.app",topic="dl",partition="0"}
+        values: 20x45
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="reporting-tool",topic="t",partition="0"}
+        values: 50000x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="reporting-tool",topic="t",partition="0"}
+        values: 5x45
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{app="kafka-journal"})
+        eval_time: 40m
+        exp_samples: []
+
+  # 8. One replicator stalled while another replicator keeps committing: the busy group
+  #    must not mask the stalled one, and the alert names the stalled group.
+  - name: stalled replicator is not masked by a committing one
+    interval: 1m
+    input_series:
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.a",topic="a",partition="0"}
+        values: 50x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.a",topic="a",partition="0"}
+        values: 1000x45
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.b",topic="b",partition="0"}
+        values: 50x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.b",topic="b",partition="0"}
+        values: 1000+100x45
+    promql_expr_test:
+      - expr: count by (alertname, consumergroup) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 40m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorStalled",consumergroup="teob-replicator.a"}'
             value: 1

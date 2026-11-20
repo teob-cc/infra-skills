@@ -28,8 +28,8 @@ set -uo pipefail
 #  10. postgres  (optional)  CloudNativePG + pgweb (+ Barman Cloud plugin with PG_WAL_ARCHIVE)
 #  11. mysql     (optional)  Percona MySQL operator + Adminer
 #  12. kafka     (optional)  Strimzi operator + Apache Kafka broker (kafka-journal stack);
-#                            replaces the retired step redpanda (an env that still lists
-#                            redpanda fails with a message naming kafka)
+#                            replaces the retired step redpanda (a run that would reach
+#                            it stops with a message naming kafka)
 #  13. scylla    (optional)  Scylla operator + node (kafka-journal stack)
 #  14. nexus     (optional)  artifact repository
 #  15. amneziawg (optional) AmneziaWG gateway: read-only Nexus over a tunnel, key page behind
@@ -165,29 +165,6 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# --- Retired steps ------------------------------------------------------------
-# A step that was replaced fails loudly instead of being skipped as unknown, so an env
-# that still lists it is not left without its component. Format: "old:new:note".
-RETIRED_STEPS=("redpanda:kafka:Redpanda was replaced by Apache Kafka on the Strimzi operator (tools/k3s/kafka.sh). Moving a running broker means resetting the journal offsets apps keep: docs/KAFKA-JOURNAL-OPS.md#migrate-from-redpanda. tools/k3s/redpanda.sh still runs by hand until it is removed.")
-check_retired_steps() {
-  local entry old new note s
-  for entry in "${RETIRED_STEPS[@]}"; do
-    old="${entry%%:*}"; new="${entry#*:}"; note="${new#*:}"; new="${new%%:*}"
-    for s in "$ONLY_STEP" "$FROM_STEP"; do
-      if [[ "$s" == "$old" ]]; then
-        provision::error "Step '${old}' is retired; its replacement is '${new}'. ${note}"
-        exit 1
-      fi
-    done
-    if env_wants "$old"; then
-      provision::error "env.properties of '${ENV_NAME}' lists the retired step '${old}' in UP_OPTIONAL_STEPS."
-      provision::error "Replace it with '${new}'. ${note}"
-      exit 1
-    fi
-  done
-}
-check_retired_steps
-
 # --- Step helpers -----------------------------------------------------------
 # Return the index of a step name, or -1 if unknown.
 step_index() {
@@ -220,8 +197,42 @@ mark_done() {
   is_done "$1" || printf '%s\n' "$1" >>"$STATE_FILE"
 }
 
+# --- Retired steps ------------------------------------------------------------
+# A step that was replaced is not skipped as unknown: a run that would have reached it
+# stops, so an env that still lists it is not left without its component. A run that
+# does not reach its slot (--list, --only <other step>, --from a later step) only warns.
+# Format: "old:new:note"; the old step ran in the slot its replacement has now.
+RETIRED_STEPS=("redpanda:kafka:Redpanda was replaced by Apache Kafka on the Strimzi operator (tools/k3s/kafka.sh); an env that still runs Redpanda follows docs/KAFKA-JOURNAL-OPS.md#migrate-from-redpanda. tools/k3s/redpanda.sh still runs by hand until it is removed.")
+# check_retired_steps <run|list>
+check_retired_steps() {
+  local mode="$1" entry old new note reaches from_idx
+  for entry in "${RETIRED_STEPS[@]}"; do
+    old="${entry%%:*}"; new="${entry#*:}"; note="${new#*:}"; new="${new%%:*}"
+    if [[ "$mode" == run && ( "$ONLY_STEP" == "$old" || "$FROM_STEP" == "$old" ) ]]; then
+      provision::error "Step '${old}' is retired; its replacement is '${new}'. ${note}"
+      exit 1
+    fi
+    env_wants "$old" || continue
+    reaches=1
+    if [[ "$mode" == list || -n "$ONLY_STEP" ]]; then
+      reaches=0
+    elif [[ -n "$FROM_STEP" ]]; then
+      # An unknown --from step is reported by validate_step_name below.
+      from_idx="$(step_index "$FROM_STEP")"
+      if [[ "$from_idx" == "-1" ]] || (( from_idx > $(step_index "$new") )); then reaches=0; fi
+    fi
+    if [[ "$reaches" -eq 1 ]]; then
+      provision::error "env.properties of '${ENV_NAME}' lists the retired step '${old}' in UP_OPTIONAL_STEPS."
+      provision::error "Replace it with '${new}'. ${note}"
+      exit 1
+    fi
+    provision::warn "env.properties of '${ENV_NAME}' lists the retired step '${old}' in UP_OPTIONAL_STEPS; replace it with '${new}' (a full run stops on it)."
+  done
+}
+
 # --- --list (no cluster needed) ---------------------------------------------
 if [[ "$DO_LIST" -eq 1 ]]; then
+  check_retired_steps list
   echo "Stack steps for env '${ENV_NAME}':"
   echo "State file: ${STATE_FILE}"
   echo
@@ -239,6 +250,7 @@ fi
 # completed step is skipped.
 ACTIVE=()
 RESPECT_STATE=1
+check_retired_steps run
 
 if [[ -n "$ONLY_STEP" ]]; then
   validate_step_name "$ONLY_STEP"

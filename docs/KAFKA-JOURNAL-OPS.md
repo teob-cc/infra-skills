@@ -30,16 +30,26 @@ tools/k3s/scylla.sh <env> --show-credentials [app-id]
 Namespaces: `kafka` (operator `strimzi-cluster-operator`, broker `kafka-dual-role-0`,
 `kafka-entity-operator` with the Topic and User Operators, `kafka-kafka-exporter`,
 `kafbat-ui`), `scylla` / `scylla-operator` (member `scylla-dc1-rack1-0`), backup CronJob
-`scylla-backup` in `scylla`. The UI is Kafbat at `console.<env>`, behind Pomerium.
+`scylla-backup` in `scylla`. The UI is Kafbat at `console.<env>`, behind Pomerium; it is
+read-only by default (`KAFBAT_UI_READONLY=true`), because it connects as the superuser and the
+route admits any authenticated org member. Set `KAFBAT_UI_READONLY=false` only together with a
+route narrowed to admins.
 
 ## Users, topics and the admin client {#users-topics}
 
 - **App users** are `KafkaUser` resources in namespace `kafka` (label
   `strimzi.io/cluster: kafka`). `kafka.sh <env> --provision-credentials <app-id>` writes
   `secrets.plain/<app>-kafka.secret.yaml` (the SCRAM password Secret in `kafka` and the
-  app's `<app>-kafka` Secret) and `kafka-users/<app>.yaml` (the KafkaUser, ACLs on the
-  prefix `<app>` or `KAFKA_ACL_PREFIX`). Encrypt the first, commit both. Every
-  `kafka.sh` run re-applies `kafka-users/`, so a rebuilt cluster gets its users back.
+  app's `<app>-kafka` Secret) and `kafka-users/<app>.yaml` (the KafkaUser). Encrypt the
+  first, commit both. Every `kafka.sh` run re-applies `kafka-users/`, so a rebuilt cluster
+  gets its users back. A rerun keeps the app's password (the live Secret, else the
+  `secrets.plain` copy); `--rotate-password` makes a new one, after which the app restarts
+  with the reapplied Secret.
+- **Default ACLs** cover topics, consumer groups and transactional ids that start with
+  `<app-id>.` (with the dot), plus cluster `IdempotentWrite`. App ids cannot contain a dot,
+  so app `teob` (`teob.`) never reaches `teob-rust.*` of app `teob-rust`; a prefix without a
+  separator, or with `-`, would. Apps whose names do not start with `<app-id>.` set
+  `KAFKA_ACL_PREFIX` (`*` grants every resource of those types), or keep hand-written ACLs.
   Apps that manage their own users through Argo CD put the same KafkaUser in their chart.
 - **ACL pattern types** are `literal` and `prefix` (Redpanda's `User` said `prefixed`).
   The cluster resource takes no name: `resource: {type: cluster}`.
@@ -56,10 +66,14 @@ Namespaces: `kafka` (operator `strimzi-cluster-operator`, broker `kafka-dual-rol
   JAAS=$(kubectl -n kafka get secret admin -o jsonpath='{.data.sasl\.jaas\.config}' | base64 -d)
   printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=SCRAM-SHA-512\nsasl.jaas.config=%s\n' "$JAAS" |
     kubectl -n kafka exec -i kafka-dual-role-0 -c kafka -- \
-      /opt/kafka/bin/kafka-consumer-groups.sh \
+      env KAFKA_HEAP_OPTS=-Xmx256m /opt/kafka/bin/kafka-consumer-groups.sh \
         --bootstrap-server kafka-kafka-bootstrap.kafka.svc.cluster.local:9093 \
         --command-config /dev/stdin --describe --group <group>
   ```
+
+  The `env KAFKA_HEAP_OPTS=-Xmx256m` matters: the container's `KAFKA_HEAP_OPTS` is the
+  broker's own heap (`-Xms` = `-Xmx`, 1g by default), and a CLI JVM started with it inside
+  the broker's memory limit can get the broker OOM-killed.
 
 | Redpanda (`rpk`) | Kafka (`/opt/kafka/bin`) |
 |---|---|
@@ -68,7 +82,7 @@ Namespaces: `kafka` (operator `strimzi-cluster-operator`, broker `kafka-dual-rol
 | `rpk topic alter-config <t> --set k=v` | `kafka-configs.sh --alter --entity-type topics --entity-name <t> --add-config k=v` (or the KafkaTopic's `config`) |
 | `rpk group list` / `describe <g>` | `kafka-consumer-groups.sh --list` / `--describe --group <g>` |
 | `rpk group delete <g>` | `kafka-consumer-groups.sh --delete --group <g>` |
-| `rpk group seek <g> --to start` | `kafka-consumer-groups.sh --reset-offsets --group <g> --all-topics --to-earliest --execute` |
+| `rpk group seek <g> --to start` | `kafka-consumer-groups.sh --reset-offsets --group <g> --all-topics --to-earliest --execute`; the group must have no active members, so stop its consumers first (scale to 0 through git) |
 | `rpk security user create` | a `KafkaUser` (`--provision-credentials`) |
 
 ## Restart procedures {#restart}
@@ -90,7 +104,12 @@ Single-node stack — restarts mean brief unavailability, apps retry.
 ## Replicator stall / lag {#replicator-stall}
 
 Alerts: `KafkaJournalReplicatorStalled` (p1), `KafkaJournalReplicatorLagHigh` (p2),
-`KafkaExporterDown` (p2: the lag alerts are blind while it lasts).
+`KafkaExporterDown` (p2: the lag alerts are blind while it lasts). Both replicator alerts
+look at replicator consumer groups only, one group at a time, and name the group: the
+groups matching `KAFKA_REPLICATOR_GROUP_REGEX` (env.properties or environment of
+`observability.sh`; default `.*replicator.*`, which matches kafka-journal's
+`<prefix>replicator.<keyspace>.<topic>`). An app's own consumers or a dead-letter reader
+with lag neither fire nor hide a stalled replicator.
 
 1. Confirm from the broker's view: `tools/k3s/kafka.sh <env> --watch groups`
    — look at the replicator group's lag per partition.
@@ -137,19 +156,30 @@ status and the operator log.
 **Kafka CR deleted, data intact** (by hand, by `--force-cleanup`, by a mistaken Argo sync):
 Strimzi keeps the KRaft cluster ID only in the CR's `status.clusterId`, so a new CR gets a
 new ID and the broker crash-loops with `Invalid cluster.id in .../meta.properties`. Rerun
-`tools/k3s/kafka.sh <env>`: it records the ID of a Ready cluster in ConfigMap
-`kafka-cluster-id` and, when it has to create the CR again, creates it paused, restores
-the ID into the status and unpauses (Strimzi's recovery procedure). The expected ID is also
-the one the error message reads from `meta.properties`.
+`tools/k3s/kafka.sh <env>`: when the CR is missing or has no ID yet, it creates it paused,
+restores the ID into the status and unpauses (Strimzi's recovery procedure).
+
+- **Where the ID comes from:** ConfigMap `kafka-cluster-id` in `kafka`. kafka.sh records
+  the ID as soon as the CR status carries one, and replaces a recorded ID only once the
+  cluster is Ready: a CR recreated outside kafka.sh gets a new ID and crash-loops, and must
+  not overwrite the ID its data needs.
+- **Override, `KAFKA_CLUSTER_ID=<id>`:** for when the namespace is gone (and the ConfigMap
+  with it) but `/data/kafka` is kept. The ID is the `cluster.id=` line of
+  `/data/kafka/kafka-log0/meta.properties` on the node, and also what the crash-loop error
+  says it read. If the CR still exists with another ID, kafka.sh stops: delete the Kafka CR
+  first (the PV and PVC stay), then rerun with the override.
 
 Data loss on `/data/kafka` is more serious — the last ≤7 days of the journal live only
 there until replicated:
 
 1. Reprovision: `tools/k3s/kafka.sh <env>` (idempotent). If the PV content is corrupt,
    delete the Kafka CR and its PVC, wipe `/data/kafka` on the node, clear the PV's
-   `claimRef.uid` (or delete the PV; kafka.sh recreates it) and rerun. Users come back
-   from `kafka-users/` and the password Secrets (`tools/sops/apply.sh <env>`); the
-   superuser `admin` gets a new password, and the Kafbat UI picks it up on restart.
+   `claimRef.uid` (or delete the PV; kafka.sh recreates it) and rerun. The KafkaUsers and
+   their Secrets live in the Kubernetes API, not on the volume, so they survive a data wipe
+   and the User Operator writes them into the new broker, `admin` included, with its old
+   password. After a namespace loss they come back from `kafka-users/` and the password
+   Secrets (`tools/sops/apply.sh <env>`); `admin` then gets a new password, which the
+   Kafbat UI picks up on restart.
 2. Topics are recreated from their KafkaTopics, or by the apps. Events already
    replicated to Scylla are safe; events appended-but-not-yet-replicated are lost —
    check replicator lag *before* the incident (Prometheus history) to size the loss window.
@@ -165,15 +195,23 @@ there until replicated:
 
 ## Migrating from Redpanda {#migrate-from-redpanda}
 
-Earlier versions of this stack ran Redpanda (`tools/k3s/redpanda.sh`); `tools/up.sh` now
-refuses an env that still lists `redpanda` in `UP_OPTIONAL_STEPS`. A new broker restarts
-every offset at 0, and topic copies (MirrorMaker) do not keep offsets, so a running
-journal cannot be carried over by copying topics. Outline, per environment:
+Earlier versions of this stack ran Redpanda (`tools/k3s/redpanda.sh`); a `tools/up.sh` run
+that would reach the old `redpanda` step stops while an env still lists it in
+`UP_OPTIONAL_STEPS`. A new broker restarts every offset at 0, and topic copies
+(MirrorMaker) do not keep offsets, so a running journal cannot be carried over by copying
+topics.
 
-1. Run `tools/k3s/kafka.sh <env> --skip-console` next to Redpanda (or set
-   `KAFKA_CONSOLE_HOST` to another host: `console.<env>` still routes to Redpanda
-   Console until the switch). Then `tools/k3s/observability.sh <env>`; the lag and disk
-   alerts read both brokers while both run, and `RedpandaDown` stays until Redpanda goes.
+**If the Redpanda workloads can be dropped** (experimental apps, test data), skip the
+side-by-side run: stop the apps, remove Redpanda (step 6 below), reset their journal state,
+then run `tools/k3s/kafka.sh <env>` and point the apps at Kafka.
+
+**Side by side**, to keep the apps' downtime short, per environment:
+
+1. Run `tools/k3s/kafka.sh <env>` next to Redpanda. While Redpanda Console's Ingress or
+   Pomerium route owns `console.<env>`, kafka.sh warns and skips the Kafbat UI and its
+   route (`--force-console` takes the host anyway; `KAFKA_CONSOLE_HOST` picks another).
+   Then `tools/k3s/observability.sh <env>`; the lag and disk alerts read both brokers
+   while both run, and `RedpandaDown` stays until Redpanda goes.
 2. Prepare one git change: Redpanda `User` → `KafkaUser` (namespace `kafka`,
    `patternType: prefix`, cluster resource without a name), `Topic` → `KafkaTopic`
    (keep the Argo `Prune=false,Delete=false` annotation), brokers →
@@ -184,11 +222,15 @@ journal cannot be carried over by copying topics. Outline, per environment:
 4. Reset the journal state that references Redpanda offsets, per the app owners'
    procedure ([pointer reset](#kafka-loss)).
 5. Merge, unfreeze, verify: KafkaUsers Ready, topics with the expected config,
-   replicator groups at lag 0, alerts quiet, the UI behind SSO (rerun kafka.sh without
-   `--skip-console`).
+   replicator groups at lag 0, alerts quiet.
 6. After a soak, remove Redpanda: the `Redpanda` CR, the `redpanda-operator` release,
-   Redpanda Console, the `cluster.redpanda.com` CRDs, namespace `redpanda`, PV
-   `redpanda-data-pv` and `/data/redpanda` on the node.
+   Redpanda Console, the `redpanda-console-pomerium` Ingress in namespace `sso`, the
+   `cluster.redpanda.com` CRDs, namespace `redpanda`, PV `redpanda-data-pv` and
+   `/data/redpanda` on the node. The `https://console.<env>` route to Redpanda Console is
+   still in `envs/<env>/pomerium-routes.yaml`: rerun `tools/k3s/kafka.sh <env>
+   --force-console`, which deploys the Kafbat UI and replaces that route (or delete the
+   route from the file first and rerun without the flag). Commit the routes file and check
+   the UI behind SSO.
 
 ### Redpanda during the cutover {#redpanda-loss}
 

@@ -1545,6 +1545,9 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   NAMESPACE_POSTGRES="${NAMESPACE_POSTGRES:-postgres}"
   # kafka-journal stack namespaces (kafka.sh / scylla.sh; redpanda.sh until it is removed)
   NAMESPACE_KAFKA="${NAMESPACE_KAFKA:-kafka}"
+  # Consumer groups the kafka-journal replicator alerts watch (Prometheus regex, anchored).
+  # kafka-journal names them <prefix>replicator.<keyspace>.<topic>, e.g. teob-replicator.*.
+  KAFKA_REPLICATOR_GROUP_REGEX="${KAFKA_REPLICATOR_GROUP_REGEX:-.*replicator.*}"
   NAMESPACE_REDPANDA="${NAMESPACE_REDPANDA:-redpanda}"
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
   # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
@@ -3657,14 +3660,17 @@ serverFiles:
                 replicator write path are degraded; the journal itself keeps
                 accepting appends (Kafka) until topic retention runs out.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#scylla-loss"
+          # Per replicator consumer group (KAFKA_REPLICATOR_GROUP_REGEX): an app's own
+          # consumers, dead-letter readers or a stopped tool group neither raise nor mask
+          # these. Both sides of the "and" are per group.
           - alert: KafkaJournalReplicatorLagHigh
             expr: |
-              max(kafka_consumergroup_lag) > 10000
-              or max(redpanda_kafka_consumer_group_lag_max) > 10000
+              max by (consumergroup) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
+              or max by (redpanda_group) (redpanda_kafka_consumer_group_lag_max{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
             for: 15m
             labels: { severity: p2, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator lag > 10k events for >15m"
+              summary: "kafka-journal replicator {{ \$labels.consumergroup }}{{ \$labels.redpanda_group }} lag > 10k events for >15m"
               description: |
                 The replicator consumer group is more than 10k events behind
                 the journal head on at least one partition. Read models are
@@ -3673,18 +3679,18 @@ serverFiles:
           - alert: KafkaJournalReplicatorStalled
             expr: |
               (
-                sum(clamp_min(kafka_consumergroup_lag, 0)) > 0
-                and sum(delta(kafka_consumergroup_current_offset[15m])) == 0
+                sum by (consumergroup) (clamp_min(kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}, 0)) > 0
+                and sum by (consumergroup) (delta(kafka_consumergroup_current_offset{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
               )
               or
               (
-                sum(redpanda_kafka_consumer_group_lag_sum) > 0
-                and sum(delta(redpanda_kafka_consumer_group_committed_offset[15m])) == 0
+                sum by (redpanda_group) (redpanda_kafka_consumer_group_lag_sum{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 0
+                and sum by (redpanda_group) (delta(redpanda_kafka_consumer_group_committed_offset{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
               )
             for: 15m
             labels: { severity: p1, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator stalled: lag present, no commits for 15m"
+              summary: "kafka-journal replicator {{ \$labels.consumergroup }}{{ \$labels.redpanda_group }} stalled: lag present, no commits for 15m"
               description: |
                 There is uncommitted journal backlog but the replicator has not
                 committed any offsets in 15 minutes. If this persists past the

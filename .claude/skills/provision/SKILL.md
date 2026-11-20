@@ -294,11 +294,14 @@ tools/k3s/scylla.sh <env>        # Scylla operator + single node (Cassandra API,
 Both use static local PVs under `/data` pinned to the main node, and support `--watch` and
 `--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive.
 `kafka.sh --provision-credentials` writes the password Secrets to `secrets.plain/` (encrypt them)
-and the KafkaUser to `kafka-users/<app>.yaml` (commit it; every kafka.sh run re-applies it). The
-Kafbat UI is at `console.<HOSTNAME>`. After first install, rerun `tools/k3s/observability.sh <env>`
-to load their scrape jobs and alerts. An environment that still runs Redpanda (`redpanda` in
-`UP_OPTIONAL_STEPS`, which `up.sh` now refuses) follows docs/KAFKA-JOURNAL-OPS.md "Migrating from
-Redpanda": the journal offsets have to be reset, so it is a planned cutover, not a rerun.
+and the KafkaUser to `kafka-users/<app>.yaml` (commit it; every kafka.sh run re-applies it); the
+default ACLs cover names starting with `<app-id>.` (`KAFKA_ACL_PREFIX` changes that), and a rerun
+keeps the password unless `--rotate-password`. The Kafbat UI is at `console.<HOSTNAME>`, read-only
+by default (`KAFBAT_UI_READONLY`); kafka.sh skips it while another Ingress or route owns the
+host. After first install, rerun `tools/k3s/observability.sh <env>` to load their scrape jobs and
+alerts. An environment that still runs Redpanda (`redpanda` in `UP_OPTIONAL_STEPS`, on which a
+full `up.sh` run now stops) follows docs/KAFKA-JOURNAL-OPS.md "Migrating from Redpanda": the
+journal offsets have to be reset, so it is a planned cutover, not a rerun.
 
 **AmneziaWG gateway for Nexus** — lets people outside the cluster use Nexus over a tunnel instead of
 an IP allowlist. Run it after Nexus (it creates a read-only Nexus account):

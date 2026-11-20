@@ -22,12 +22,15 @@ set -euo pipefail
 # Options:
 #   --skip-operator          Skip operator installation (use existing)
 #   --skip-console           Skip the Kafbat UI and its route
+#   --force-console          Take console.<env> even when another Ingress or Pomerium route
+#                            owns it (by default kafka.sh warns and skips the console)
 #   --force-cleanup          Remove the Kafka CRs + operator before reinstalling (PV/PVC and
 #                            the cluster ID kept, so the broker comes back with its data)
 #   --show-credentials [app-id]  Display Kafka credentials and exit
 #   --show-resources         Display current Kafka resource usage and exit
 #   --watch [kind]           Inspect a running broker (kind: help|health|topics|groups|logs)
 #   --provision-credentials <app-id>  Provision a SCRAM-SHA-512 KafkaUser for an application
+#                            (keeps an existing password; add --rotate-password for a new one)
 #
 # Sizing (test defaults; prod overrides via env vars):
 #   KAFKA_STORAGE_SIZE=100Gi KAFKA_MEMORY=3Gi KAFKA_HEAP=2g tools/k3s/kafka.sh prod
@@ -40,7 +43,7 @@ ENVS_ROOT=$(provision::envs_root)
 
 # --- Parse arguments ---
 if [[ -z "${1:-}" ]]; then
-  echo "Usage: $0 <env-name> [--skip-operator] [--skip-console] [--force-cleanup] [--show-credentials [app-id]] [--show-resources] [--watch [kind]] [--provision-credentials <app-id>]" >&2
+  echo "Usage: $0 <env-name> [--skip-operator] [--skip-console] [--force-console] [--force-cleanup] [--show-credentials [app-id]] [--show-resources] [--watch [kind]] [--provision-credentials <app-id> [--rotate-password]]" >&2
   echo "Available environments:" >&2
   find "$(provision::envs_root)" -maxdepth 2 -type f -name env.properties -print | sed "s#$(provision::envs_root)/##; s#/env.properties##" | sort || true
   exit 1
@@ -55,6 +58,8 @@ fi
 
 SKIP_OPERATOR=false
 SKIP_CONSOLE=false
+FORCE_CONSOLE=false
+ROTATE_PASSWORD=false
 FORCE_CLEANUP=false
 SHOW_CREDENTIALS=false
 SHOW_CREDENTIALS_APP_ID=""
@@ -68,6 +73,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-operator) SKIP_OPERATOR=true; shift ;;
     --skip-console) SKIP_CONSOLE=true; shift ;;
+    --force-console) FORCE_CONSOLE=true; shift ;;
+    --rotate-password) ROTATE_PASSWORD=true; shift ;;
     --force-cleanup) FORCE_CLEANUP=true; shift ;;
     --show-credentials)
       SHOW_CREDENTIALS=true
@@ -99,6 +106,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Validation ---
+if [[ "$FORCE_CLEANUP" == "true" && "$SKIP_OPERATOR" == "true" ]]; then
+  echo "ERROR: --force-cleanup reinstalls the operator; it cannot be combined with --skip-operator" >&2
+  exit 1
+fi
+if [[ "$ROTATE_PASSWORD" == "true" && "$PROVISION_CREDENTIALS" != "true" ]]; then
+  echo "ERROR: --rotate-password only goes with --provision-credentials <app-id>" >&2
+  exit 1
+fi
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
 need kubectl
 need helm
@@ -146,14 +161,17 @@ err() { echo "[kafka:error] $*" >&2; }
 # Pomerium-routed Ingress. Pinned to v1.5.0: v1.5.1 was published the day this was
 # written (2026-11-20) and is not yet two weeks old.
 : "${KAFBAT_UI_IMAGE:=ghcr.io/kafbat/kafka-ui:v1.5.0}"
-: "${KAFBAT_UI_READONLY:=false}"
+# Read-only by default: the UI connects as the superuser, and the Pomerium route lets any
+# authenticated org member in, so a writable UI would let anyone delete journal topics.
+# KAFBAT_UI_READONLY=false makes it writable (then narrow the route to admins).
+: "${KAFBAT_UI_READONLY:=true}"
 NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${INGRESS_CLASS:=traefik}"
 : "${CLUSTER_ISSUER:=letsencrypt-prod}"
 : "${ENFORCE_POMERIUM:=true}"
 if [[ -n "${HOSTNAME:-}" ]]; then
-  # console.<env> is the host Redpanda Console used; while both brokers run (cutover),
-  # pass --skip-console or another KAFKA_CONSOLE_HOST so the Redpanda route stays.
+  # console.<env> is the host Redpanda Console used. While another Ingress or Pomerium route
+  # owns it, kafka.sh skips the console (deploy_console); --force-console takes it over.
   KAFKA_CONSOLE_HOST="${KAFKA_CONSOLE_HOST:-console.${HOSTNAME}}"
 fi
 
@@ -182,6 +200,8 @@ superuser_creds() {
 
 # Run a Kafka CLI tool in the broker pod as the superuser. The client properties go in
 # on stdin (--command-config /dev/stdin), so the password never lands in a file or argv.
+# The container's KAFKA_HEAP_OPTS is the broker's heap (-Xms=-Xmx); a CLI JVM started with
+# it inside the broker's memory limit could get the broker OOM-killed, hence 256m.
 kafka_admin() {
   local tool="$1"; shift
   superuser_creds || { err "Superuser secret ${SUPERUSER_SECRET} not found in ${NAMESPACE_KAFKA}"; exit 1; }
@@ -190,24 +210,36 @@ kafka_admin() {
     "sasl.mechanism=SCRAM-SHA-512" \
     "sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username=\"${KAFKA_SUPERUSER}\" password=\"${SUPERUSER_PASS}\";" |
     kubectl -n "$NAMESPACE_KAFKA" exec -i "$BROKER_POD" -c kafka -- \
-      "${KAFKA_BIN}/${tool}" --bootstrap-server "$BOOTSTRAP_SERVERS" --command-config /dev/stdin "$@"
+      env KAFKA_HEAP_OPTS=-Xmx256m "${KAFKA_BIN}/${tool}" --bootstrap-server "$BOOTSTRAP_SERVERS" --command-config /dev/stdin "$@"
 }
 
 # Strimzi keeps the KRaft cluster ID only in the Kafka CR's status. A Kafka CR that is
 # deleted and created again gets a new ID, and the broker then refuses its own data
-# ("Invalid cluster.id in .../meta.properties"). kafka.sh records the ID of a Ready cluster
-# in this ConfigMap and restores it when it has to create the CR again (Strimzi's
-# recovery procedure: create paused, set status.clusterId, unpause).
+# ("Invalid cluster.id in .../meta.properties"). kafka.sh records the ID in this ConfigMap
+# and restores it when it has to create the CR again (Strimzi's recovery procedure: create
+# paused, set status.clusterId, unpause). KAFKA_CLUSTER_ID overrides the record, for when
+# the namespace (and so the ConfigMap) is gone but /data/kafka is kept: the ID is the
+# cluster.id line of /data/kafka/kafka-log0/meta.properties on the node.
 CLUSTER_ID_CM="${KAFKA_CLUSTER_NAME}-cluster-id"
+: "${KAFKA_CLUSTER_ID:=}"
 
 remember_cluster_id() {
-  local ready id
+  local ready id recorded
   ready=$(kubectl -n "$NAMESPACE_KAFKA" get kafka.kafka.strimzi.io "$KAFKA_CLUSTER_NAME" \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
   id=$(kubectl -n "$NAMESPACE_KAFKA" get kafka.kafka.strimzi.io "$KAFKA_CLUSTER_NAME" \
     -o jsonpath='{.status.clusterId}' 2>/dev/null || true)
-  # Only a Ready cluster proves that the ID matches the data on the volume.
-  [[ "$ready" == "True" && -n "$id" ]] || return 0
+  [[ -n "$id" ]] || return 0
+  recorded=$(recorded_cluster_id)
+  [[ "$id" == "$recorded" ]] && return 0
+  # The first ID is recorded as soon as the status carries one. A different ID replaces
+  # the record only once the cluster is Ready, which proves it matches the data: a CR
+  # recreated outside kafka.sh gets a new ID and crash-loops, and must not overwrite the
+  # ID its data needs.
+  if [[ -n "$recorded" && "$ready" != "True" ]]; then
+    warn "Kafka CR has cluster ID ${id}, ConfigMap ${CLUSTER_ID_CM} records ${recorded}; keeping the record until the cluster is Ready"
+    return 0
+  fi
   kubectl -n "$NAMESPACE_KAFKA" create configmap "$CLUSTER_ID_CM" --from-literal=clusterId="$id" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 }
@@ -382,8 +414,11 @@ fi
 provision_credentials() {
   local app_id="$1"
   local app_namespace="${APP_NAMESPACE:-default}"
-  # Topics, groups and transactional ids the app may use start with this prefix.
-  local acl_prefix="${KAFKA_ACL_PREFIX:-${app_id}}"
+  # Topics, groups and transactional ids the app may use start with this prefix. The
+  # default ends in a dot, which an app id cannot contain, so app "teob" gets "teob." and
+  # never reaches the "teob-rust." resources of app "teob-rust". KAFKA_ACL_PREFIX sets
+  # another prefix (for names that do not start with "<app-id>."), or "*" for everything.
+  local acl_prefix="${KAFKA_ACL_PREFIX:-${app_id}.}"
 
   if [[ ! "$app_id" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
     err "Invalid app-id: ${app_id}"
@@ -398,13 +433,30 @@ provision_credentials() {
   log "=== Provisioning Kafka credentials for application: ${app_id} ==="
   require_broker
 
-  local app_password
-  app_password=$(openssl rand -base64 24 | tr -d '\n')
-
   local secrets_dir="$ENVS_ROOT/${ENV_NAME}/secrets.plain"
   local secret_file="${secrets_dir}/${app_id}-kafka.secret.yaml"
   local user_file="${USERS_DIR}/${app_id}.yaml"
   mkdir -p "$secrets_dir" "$USERS_DIR"
+
+  # A rerun keeps the app's password (the live Secret first, else the working copy in
+  # secrets.plain), so it does not break a running app. --rotate-password makes a new one.
+  local app_password="" pw_source=""
+  if [[ "$ROTATE_PASSWORD" != "true" ]]; then
+    app_password=$(secret_field "$NAMESPACE_KAFKA" "${app_id}-kafka-password" password)
+    pw_source="Secret ${NAMESPACE_KAFKA}/${app_id}-kafka-password"
+    if [[ -z "$app_password" && -f "$secret_file" ]]; then
+      app_password=$(NAME="${app_id}-kafka-password" yq -r \
+        'select(.kind == "Secret" and .metadata.name == strenv(NAME)) | .stringData.password // ""' \
+        "$secret_file" 2>/dev/null | head -1)
+      pw_source="${secret_file}"
+    fi
+  fi
+  if [[ -n "$app_password" ]]; then
+    info "Keeping the existing password (from ${pw_source}); --rotate-password makes a new one"
+  else
+    app_password=$(openssl rand -base64 24 | tr -d '\n')
+    info "Generated a new password$([[ "$ROTATE_PASSWORD" == "true" ]] && echo ' (--rotate-password): restart the app after the Secret is applied')"
+  fi
 
   info "Creating secret file: ${secret_file}"
   cat > "$secret_file" <<YAML
@@ -677,16 +729,26 @@ create_kafka_cluster() {
     --from-file=kafka-metrics-config.yml="$METRICS_RULES_FILE" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-  # A Kafka CR created again over existing data must take over the recorded cluster ID:
-  # when the CR is missing, or has no cluster ID yet (also a restore that stopped halfway).
-  local restore_id="" pause_block="" current_id=""
+  # A Kafka CR created again over existing data must take over the cluster ID of that data
+  # (KAFKA_CLUSTER_ID, else the recorded one): when the CR is missing, or has no cluster ID
+  # yet (also a restore that stopped halfway).
+  local restore_id="" pause_block="" current_id="" id_source
   current_id=$(kubectl -n "$NAMESPACE_KAFKA" get kafka.kafka.strimzi.io "$KAFKA_CLUSTER_NAME" \
     -o jsonpath='{.status.clusterId}' 2>/dev/null || true)
+  if [[ -n "$KAFKA_CLUSTER_ID" && -n "$current_id" && "$current_id" != "$KAFKA_CLUSTER_ID" ]]; then
+    err "KAFKA_CLUSTER_ID=${KAFKA_CLUSTER_ID}, but Kafka CR ${KAFKA_CLUSTER_NAME} already has cluster ID ${current_id}."
+    err "A running CR's ID is not changed in place: delete the Kafka CR (the PV/PVC stay), then rerun with KAFKA_CLUSTER_ID."
+    exit 1
+  fi
   if [[ -z "$current_id" ]]; then
-    restore_id=$(recorded_cluster_id)
+    if [[ -n "$KAFKA_CLUSTER_ID" ]]; then
+      restore_id="$KAFKA_CLUSTER_ID"; id_source="KAFKA_CLUSTER_ID"
+    else
+      restore_id=$(recorded_cluster_id); id_source="ConfigMap ${CLUSTER_ID_CM}"
+    fi
   fi
   if [[ -n "$restore_id" ]]; then
-    info "Kafka CR has no cluster ID, ConfigMap ${CLUSTER_ID_CM} records ${restore_id}: applying it paused to restore the ID"
+    info "Kafka CR has no cluster ID, ${id_source} gives ${restore_id}: applying it paused to restore the ID"
     pause_block=$'  annotations:\n    strimzi.io/pause-reconciliation: "true"'
   fi
 
@@ -853,6 +915,8 @@ YAML
     kubectl -n "$NAMESPACE_KAFKA" get kafka.kafka.strimzi.io "$KAFKA_CLUSTER_NAME" -o yaml 2>/dev/null | sed -n '/^status:/,$p' || true
     kubectl -n "$NAMESPACE_KAFKA" get pods,pvc 2>/dev/null || true
     kubectl -n "$NAMESPACE_KAFKA" get events --sort-by='.lastTimestamp' 2>/dev/null | tail -15 || true
+    # Record the ID the status already carries (first install), so a later recreate can restore it.
+    remember_cluster_id
     warn "Continuing; the broker may still be initializing."
     return 0
   fi
@@ -955,6 +1019,25 @@ apply_app_users
 # ============================================================================
 # Phase 6: Kafbat UI (pgweb pattern)
 # ============================================================================
+# Prints what else serves KAFKA_CONSOLE_HOST (an Ingress other than ours, or a catch-all
+# Pomerium route to another upstream); prints nothing when the host is free or ours.
+console_host_owner() {
+  local found="" routes_file to
+  found=$(kubectl get ingress -A -o json 2>/dev/null | jq -r --arg h "$KAFKA_CONSOLE_HOST" '
+    .items[] | select(any(.spec.rules[]?; .host == $h))
+    | select(.metadata.name != "kafka-console-pomerium")
+    | "Ingress \(.metadata.namespace)/\(.metadata.name)"' | paste -sd, - || true)
+  if routes_file=$(provision::pomerium_routes_file 2>/dev/null) && [[ -f "$routes_file" ]]; then
+    to=$(FROM="https://${KAFKA_CONSOLE_HOST}" yq -r '.config.routes[]?
+      | select(.from == strenv(FROM)) | select((has("prefix") or has("path") or has("regex")) | not)
+      | .to' "$routes_file" 2>/dev/null | grep -v '//kafbat-ui\.' | head -1 || true)
+    if [[ -n "$to" ]]; then
+      found="${found:+${found}, }Pomerium route to ${to}"
+    fi
+  fi
+  printf '%s' "$found"
+}
+
 deploy_console() {
   log "=== Phase 6: Kafbat UI ==="
 
@@ -966,6 +1049,21 @@ deploy_console() {
   if [[ -z "${KAFKA_CONSOLE_HOST:-}" ]]; then
     warn "KAFKA_CONSOLE_HOST not set (no HOSTNAME in env.properties) - skipping console"
     return 0
+  fi
+
+  # console.<env> is also the host Redpanda Console used. Next to a running Redpanda, the
+  # route upsert would take the host from it, so leave it alone unless told otherwise.
+  local owner
+  owner=$(console_host_owner)
+  if [[ -n "$owner" ]]; then
+    if [[ "$FORCE_CONSOLE" == "true" ]]; then
+      warn "${KAFKA_CONSOLE_HOST} is in use (${owner}); taking it over (--force-console)"
+    else
+      warn "${KAFKA_CONSOLE_HOST} is in use (${owner}) - skipping the Kafbat UI and its route."
+      warn "Remove that first, set KAFKA_CONSOLE_HOST to another host, or pass --force-console."
+      SKIP_CONSOLE=true
+      return 0
+    fi
   fi
 
   # The UI talks Kafka as the superuser: the Secret the User Operator wrote carries a
