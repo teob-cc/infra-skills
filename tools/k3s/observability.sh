@@ -1543,7 +1543,8 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   
   # Determine PostgreSQL namespace (default to 'postgres')
   NAMESPACE_POSTGRES="${NAMESPACE_POSTGRES:-postgres}"
-  # kafka-journal stack namespaces (redpanda.sh / scylla.sh)
+  # kafka-journal stack namespaces (kafka.sh / scylla.sh; redpanda.sh until it is removed)
+  NAMESPACE_KAFKA="${NAMESPACE_KAFKA:-kafka}"
   NAMESPACE_REDPANDA="${NAMESPACE_REDPANDA:-redpanda}"
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
   # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
@@ -1748,9 +1749,53 @@ ${BLACKBOX_SCRAPE_JOB_POST}
         target_label: service
       - source_labels: [__meta_kubernetes_pod_name]
         target_label: pod
-  # Redpanda broker metrics (kafka-journal stack). Discovers the plain
+  # Apache Kafka broker metrics (kafka-journal stack). Discovers the plain
+  # kafka-metrics Service created by tools/k3s/kafka.sh: the Strimzi JMX exporter
+  # on :9404 /metrics (rules in tools/k3s/kafka/kafka-metrics-config.yml).
+  - job_name: 'kafka'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - ${NAMESPACE_KAFKA}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: kafka-metrics
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_service_name]
+        target_label: service
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+  # Strimzi kafka-exporter (consumer-group lag per partition: kafka_consumergroup_lag,
+  # kafka_consumergroup_current_offset). Service kafka-exporter-metrics from kafka.sh.
+  - job_name: 'kafka-exporter'
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+            - ${NAMESPACE_KAFKA}
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        action: keep
+        regex: kafka-exporter-metrics
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        action: keep
+        regex: metrics
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_service_name]
+        target_label: service
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+  # Redpanda broker metrics, kept while an environment moves from Redpanda to Kafka
+  # (removed together with tools/k3s/redpanda.sh). Discovers the plain
   # redpanda-metrics Service created by tools/k3s/redpanda.sh; the admin API
-  # serves Prometheus metrics on /public_metrics (not /metrics).
+  # serves Prometheus metrics on /public_metrics (not /metrics). Inert without it.
   - job_name: 'redpanda'
     metrics_path: /public_metrics
     kubernetes_sd_configs:
@@ -2447,7 +2492,7 @@ serverFiles:
           # a blind spot: every rule over its metrics goes quiet instead of firing.
           - alert: ScrapeTargetDown
             expr: |
-              up{job!~"alertmanager|mysql-exporter|redpanda|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
+              up{job!~"alertmanager|mysql-exporter|kafka|kafka-exporter|redpanda|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
               unless on (node) node:on_demand_parked
             for: 15m
             labels: { severity: p3, app: infra }
@@ -3017,7 +3062,7 @@ serverFiles:
               summary: "PVC {{ \$labels.namespace }}/{{ \$labels.persistentvolumeclaim }} has {{ \$value | humanizePercentage }} free"
               description: |
                 The volume is over 90% full. Expand the PVC (if the storage class allows it),
-                or prune the data (Postgres: check bloat and WAL; Redpanda: retention).
+                or prune the data (Postgres: check bloat and WAL; Kafka: topic retention).
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#workloads"
           - alert: KubePersistentVolumeFull
             expr: |
@@ -3551,17 +3596,44 @@ serverFiles:
                 with "Too many connections" at 100%, which takes the PHP sites down. Usually a
                 scraper flood or a wedged pool holding connections.
 
-      # kafka-journal stack watchdog (Redpanda + ScyllaDB + replicator; see
-      # docs/KAFKA-JOURNAL-OPS.md). Rules are inert until the redpanda/scylla scrape jobs
-      # have live targets and the replicator consumer group exists — like the
+      # kafka-journal stack watchdog (Apache Kafka on Strimzi + ScyllaDB + replicator; see
+      # docs/KAFKA-JOURNAL-OPS.md). Rules are inert until the kafka/kafka-exporter/scylla
+      # scrape jobs have live targets and the replicator consumer group exists — like the
       # uce-* rules they activate the moment the metrics appear.
-      # Lag gauges require the enable_consumer_group_metrics cluster property
-      # to include consumer_lag (set by tools/k3s/redpanda.sh in the CR).
+      # Lag comes from the Strimzi kafka-exporter (kafka_consumergroup_lag, per partition;
+      # -1 where a group has no committed offset yet, hence clamp_min).
+      # While an environment moves from Redpanda, the lag and disk rules also read the
+      # Redpanda series (the second branch of each "or") and RedpandaDown stays; both go
+      # with redpanda.sh.
       # ScyllaSnapshotOverdue keys off a node-exporter textfile stamp written
       # by the scylla-backup CronJob (nas-backup-stamp pattern).
       - name: kafka-journal
         interval: 1m
         rules:
+          - alert: KafkaBrokerDown
+            expr: up{job="kafka"} == 0
+            for: 5m
+            labels: { severity: p1, app: kafka-journal }
+            annotations:
+              summary: "Kafka broker target down for >5m"
+              description: |
+                Prometheus cannot scrape the Kafka broker's JMX exporter (:9404
+                /metrics, pod {{ \$labels.pod }}). Journal appends are failing or about
+                to — check the broker pod and the Kafka CR status
+                (tools/k3s/kafka.sh <env> --watch health).
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#kafka-loss"
+          - alert: KafkaExporterDown
+            expr: up{job="kafka-exporter"} == 0
+            for: 15m
+            labels: { severity: p2, app: kafka-journal }
+            annotations:
+              summary: "Kafka consumer-lag exporter down for >15m"
+              description: |
+                Prometheus cannot scrape the Strimzi kafka-exporter (:9404). The broker
+                may be fine, but KafkaJournalReplicatorLagHigh and
+                KafkaJournalReplicatorStalled cannot fire while it is down. Check the
+                kafka-kafka-exporter pod in namespace ${NAMESPACE_KAFKA}.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
           - alert: RedpandaDown
             expr: up{job="redpanda"} == 0
             for: 5m
@@ -3571,7 +3643,8 @@ serverFiles:
               description: |
                 Prometheus cannot scrape the Redpanda admin API (:9644
                 /public_metrics). Journal appends are failing or about to —
-                check the broker pod and the redpanda CR status.
+                check the broker pod and the redpanda CR status. Only while an
+                environment still runs Redpanda next to Kafka.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#redpanda-loss"
           - alert: ScyllaDown
             expr: up{job="scylla"} == 0
@@ -3582,11 +3655,12 @@ serverFiles:
               description: |
                 Prometheus cannot scrape Scylla (:9180). Reads and the
                 replicator write path are degraded; the journal itself keeps
-                accepting appends (Redpanda) until topic retention runs out.
+                accepting appends (Kafka) until topic retention runs out.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#scylla-loss"
           - alert: KafkaJournalReplicatorLagHigh
             expr: |
-              max(redpanda_kafka_consumer_group_lag_max) > 10000
+              max(kafka_consumergroup_lag) > 10000
+              or max(redpanda_kafka_consumer_group_lag_max) > 10000
             for: 15m
             labels: { severity: p2, app: kafka-journal }
             annotations:
@@ -3598,8 +3672,15 @@ serverFiles:
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
           - alert: KafkaJournalReplicatorStalled
             expr: |
-              sum(redpanda_kafka_consumer_group_lag_sum) > 0
-              and sum(delta(redpanda_kafka_consumer_group_committed_offset[15m])) == 0
+              (
+                sum(clamp_min(kafka_consumergroup_lag, 0)) > 0
+                and sum(delta(kafka_consumergroup_current_offset[15m])) == 0
+              )
+              or
+              (
+                sum(redpanda_kafka_consumer_group_lag_sum) > 0
+                and sum(delta(redpanda_kafka_consumer_group_committed_offset[15m])) == 0
+              )
             for: 15m
             labels: { severity: p1, app: kafka-journal }
             annotations:
@@ -3611,16 +3692,22 @@ serverFiles:
                 the replicator and check Scylla availability.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
           - alert: KafkaJournalDataDiskLow
+            # A static local PV reports the whole /data filesystem, so this is the free
+            # space under the broker's data directory.
             expr: |
-              (redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes) < 0.15
+              (
+                max by (persistentvolumeclaim) (kubelet_volume_stats_available_bytes{job="kubernetes-nodes", namespace="${NAMESPACE_KAFKA}", persistentvolumeclaim=~"data-.*"})
+                  / max by (persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes", namespace="${NAMESPACE_KAFKA}", persistentvolumeclaim=~"data-.*"})
+              ) < 0.15
+              or (redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes) < 0.15
             for: 30m
             labels: { severity: p2, app: kafka-journal }
             annotations:
-              summary: "Redpanda data disk below 15% free"
+              summary: "Kafka data disk below 15% free"
               description: |
-                Free space on the Redpanda data mount is under 15%. The static
+                Free space on the broker's data mount is under 15%. The static
                 local PV shares /data with Scylla and backups — prune or grow
-                before the broker hits its write floor.
+                before the broker runs out of space and stops appending.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#disk-full"
           - alert: ScyllaSnapshotOverdue
             expr: |

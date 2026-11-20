@@ -6,7 +6,7 @@ read, designed to be driven by your AI agent.
 One command sequence takes a fresh Hetzner server (bare-metal or Cloud VM) to a working K3s
 platform: GitHub single sign-on in front of everything (Dex + Pomerium), CI/CD on your own
 runners, GitOps delivery (ArgoCD), container and artifact registries (Harbor, Nexus), production
-databases (PostgreSQL, MySQL, optionally Redpanda + ScyllaDB), and observability (Prometheus +
+databases (PostgreSQL, MySQL, optionally Apache Kafka + ScyllaDB), and observability (Prometheus +
 Loki + Grafana) — with TLS, DNS, and age-encrypted secrets handled along the way. Everything runs
 under **your** accounts: your GitHub org, your Hetzner account, your domain, your keys. Nothing
 phones home.
@@ -128,7 +128,7 @@ The seams and how to add a provider: [docs/VERTICALS.md](docs/VERTICALS.md).
 - [Verticals & provider seams](docs/VERTICALS.md)
 - [GitOps Service Delivery](docs/GITOPS.md)
 - [Evaluator key intake](docs/EVALUATOR-KEYS.md)
-- [Kafka-journal operations (Redpanda + ScyllaDB)](docs/KAFKA-JOURNAL-OPS.md)
+- [Kafka-journal operations (Apache Kafka + ScyllaDB)](docs/KAFKA-JOURNAL-OPS.md)
 - [Grafana across clusters (metrics export, remote datasources, framing)](docs/GRAFANA-ACROSS-CLUSTERS.md)
 
 ## License

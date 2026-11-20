@@ -1,50 +1,98 @@
 # kafka-journal stack — operations runbook
 
-Operational procedures for the Redpanda + ScyllaDB persistence stack backing
+Operational procedures for the Apache Kafka + ScyllaDB persistence stack backing
 kafka-journal apps (one per app-id, e.g. `myapp`). Referenced by the `kafka-journal`
 Prometheus alert group (baked into `tools/k3s/observability.sh`,
 mirrored in `envs/<env>/apps/observability/kafka-journal-alert-rules.yaml`).
 
-**Architecture recap:** events are appended to Redpanda topics
+**Architecture recap:** events are appended to Kafka topics
 (`journal.<category>`, 7-day retention) and replicated by the kafka-journal
 replicator into Scylla keyspace `<app>_journal`. Kafka is the source of truth
 for the last 7 days; Scylla is the long-term store. Durability = daily Scylla
 snapshot + Kafka replay of the gap since that snapshot. **The daily snapshot
 cadence must therefore stay well under the 7-day topic retention.**
 
+Kafka runs on the Strimzi operator (`tools/k3s/kafka.sh`): Apache Kafka 4.3.2 in KRaft
+mode, one node that is both controller and broker, SASL/SCRAM-SHA-512 on the internal
+listener `:9093`, simple authorization. Apps connect to
+`kafka-kafka-bootstrap.kafka.svc.cluster.local:9093` with `SASL_PLAINTEXT`.
+
 Key handles:
 
 ```bash
 export KUBECONFIG=$INFRA_ENVS_ROOT/<env>/kubeconfig.yaml   # or infra-envs/envs/<env>/
-tools/k3s/redpanda.sh <env> --watch health|topics|groups|logs
-tools/k3s/scylla.sh   <env> --watch status|compactions|logs
-tools/k3s/redpanda.sh <env> --show-credentials [app-id]
-tools/k3s/scylla.sh   <env> --show-credentials [app-id]
+tools/k3s/kafka.sh  <env> --watch health|topics|groups|logs
+tools/k3s/scylla.sh <env> --watch status|compactions|logs
+tools/k3s/kafka.sh  <env> --show-credentials [app-id]
+tools/k3s/scylla.sh <env> --show-credentials [app-id]
 ```
 
-Namespaces: `redpanda` (operator + broker `redpanda-0`), `scylla` /
-`scylla-operator` (member `scylla-dc1-rack1-0`), backup CronJob `scylla-backup`
-in `scylla`.
+Namespaces: `kafka` (operator `strimzi-cluster-operator`, broker `kafka-dual-role-0`,
+`kafka-entity-operator` with the Topic and User Operators, `kafka-kafka-exporter`,
+`kafbat-ui`), `scylla` / `scylla-operator` (member `scylla-dc1-rack1-0`), backup CronJob
+`scylla-backup` in `scylla`. The UI is Kafbat at `console.<env>`, behind Pomerium.
+
+## Users, topics and the admin client {#users-topics}
+
+- **App users** are `KafkaUser` resources in namespace `kafka` (label
+  `strimzi.io/cluster: kafka`). `kafka.sh <env> --provision-credentials <app-id>` writes
+  `secrets.plain/<app>-kafka.secret.yaml` (the SCRAM password Secret in `kafka` and the
+  app's `<app>-kafka` Secret) and `kafka-users/<app>.yaml` (the KafkaUser, ACLs on the
+  prefix `<app>` or `KAFKA_ACL_PREFIX`). Encrypt the first, commit both. Every
+  `kafka.sh` run re-applies `kafka-users/`, so a rebuilt cluster gets its users back.
+  Apps that manage their own users through Argo CD put the same KafkaUser in their chart.
+- **ACL pattern types** are `literal` and `prefix` (Redpanda's `User` said `prefixed`).
+  The cluster resource takes no name: `resource: {type: cluster}`.
+- **Topics** are created by the apps (`auto.create.topics.enable=false`) or declared as
+  `KafkaTopic` resources. The Topic Operator owns a topic with a KafkaTopic: **deleting
+  the KafkaTopic deletes the topic and its journal.** Argo-managed KafkaTopics keep
+  `argocd.argoproj.io/sync-options: Prune=false,Delete=false`.
+- **Admin client:** the superuser is the KafkaUser `admin`; its Secret `admin` in `kafka`
+  holds `password` and a ready `sasl.jaas.config`. The Kafka CLI tools live in the broker
+  pod under `/opt/kafka/bin`. `kafka.sh --watch` feeds them the client properties on
+  stdin; for a one-off command do the same:
+
+  ```bash
+  JAAS=$(kubectl -n kafka get secret admin -o jsonpath='{.data.sasl\.jaas\.config}' | base64 -d)
+  printf 'security.protocol=SASL_PLAINTEXT\nsasl.mechanism=SCRAM-SHA-512\nsasl.jaas.config=%s\n' "$JAAS" |
+    kubectl -n kafka exec -i kafka-dual-role-0 -c kafka -- \
+      /opt/kafka/bin/kafka-consumer-groups.sh \
+        --bootstrap-server kafka-kafka-bootstrap.kafka.svc.cluster.local:9093 \
+        --command-config /dev/stdin --describe --group <group>
+  ```
+
+| Redpanda (`rpk`) | Kafka (`/opt/kafka/bin`) |
+|---|---|
+| `rpk cluster health` | `kafka-metadata-quorum.sh describe --status`, `kubectl -n kafka get kafka kafka` |
+| `rpk topic list --detailed` | `kafka-topics.sh --describe` |
+| `rpk topic alter-config <t> --set k=v` | `kafka-configs.sh --alter --entity-type topics --entity-name <t> --add-config k=v` (or the KafkaTopic's `config`) |
+| `rpk group list` / `describe <g>` | `kafka-consumer-groups.sh --list` / `--describe --group <g>` |
+| `rpk group delete <g>` | `kafka-consumer-groups.sh --delete --group <g>` |
+| `rpk group seek <g> --to start` | `kafka-consumer-groups.sh --reset-offsets --group <g> --all-topics --to-earliest --execute` |
+| `rpk security user create` | a `KafkaUser` (`--provision-credentials`) |
 
 ## Restart procedures {#restart}
 
 Single-node stack — restarts mean brief unavailability, apps retry.
 
-- **Redpanda broker:** `kubectl -n redpanda delete pod redpanda-0`. The
-  StatefulSet reschedules onto the pinned node (static local PV). Verify with
-  `--watch health`.
+- **Kafka broker:** `kubectl -n kafka delete pod kafka-dual-role-0`. The StrimziPodSet
+  recreates it on the pinned node (static local PV). Or let Strimzi roll it:
+  `kubectl -n kafka annotate strimzipodset kafka-dual-role strimzi.io/manual-rolling-update=true`.
+  Verify with `--watch health`.
 - **Scylla member:** `kubectl -n scylla delete pod scylla-dc1-rack1-0`. Wait
   for `UN` in `--watch status`. Expect a few minutes of commitlog replay.
-- **Operators** are stateless: `kubectl -n redpanda rollout restart deploy/redpanda-operator`,
+- **Operators** are stateless: `kubectl -n kafka rollout restart deploy/strimzi-cluster-operator`,
+  `kubectl -n kafka rollout restart deploy/kafka-entity-operator`,
   `kubectl -n scylla-operator rollout restart deploy/scylla-operator`.
 - Full-node reboot: both come back on their own; local-path/local PVs survive
-  (`/data/redpanda`, `/data/scylla` on the node).
+  (`/data/kafka`, `/data/scylla` on the node).
 
 ## Replicator stall / lag {#replicator-stall}
 
-Alerts: `KafkaJournalReplicatorStalled` (p1), `KafkaJournalReplicatorLagHigh` (p2).
+Alerts: `KafkaJournalReplicatorStalled` (p1), `KafkaJournalReplicatorLagHigh` (p2),
+`KafkaExporterDown` (p2: the lag alerts are blind while it lasts).
 
-1. Confirm from the broker's view: `tools/k3s/redpanda.sh <env> --watch groups`
+1. Confirm from the broker's view: `tools/k3s/kafka.sh <env> --watch groups`
    — look at the replicator group's lag per partition.
 2. Check the replicator pod (deployed as `<app>-replicator`): logs,
    restarts, OOM. A restart usually resumes from committed offsets — this is
@@ -79,46 +127,92 @@ sstables) — restore from snapshot + Kafka replay:
    over restored data is safe.
 6. Verify: app reads return, lag drains to zero, next nightly snapshot succeeds.
 
-## Redpanda loss / pointer reset {#redpanda-loss}
+## Kafka loss / pointer reset {#kafka-loss}
 
-Alert: `RedpandaDown` (p1 — journal appends are failing).
+Alert: `KafkaBrokerDown` (p1 — journal appends are failing).
 
-Transient loss: restart (see above). Data loss on `/data/redpanda` is more
-serious — the last ≤7 days of the journal live only there until replicated:
+Transient loss: restart (see above), and check `kubectl -n kafka get kafka kafka -o yaml`
+status and the operator log.
 
-1. Reprovision: `tools/k3s/redpanda.sh <env>` (idempotent). If the PV content
-   is corrupt, wipe `/data/redpanda` on the node first. Recreate app users:
-   `--provision-credentials <app-id>` (reapply/re-encrypt secrets).
-2. Topics are auto-recreated (topic bootstrap Job / app auto-create). Events
-   already replicated to Scylla are safe; events appended-but-not-yet-replicated
-   are lost — check replicator lag *before* the incident (Prometheus history)
-   to size the loss window.
+**Kafka CR deleted, data intact** (by hand, by `--force-cleanup`, by a mistaken Argo sync):
+Strimzi keeps the KRaft cluster ID only in the CR's `status.clusterId`, so a new CR gets a
+new ID and the broker crash-loops with `Invalid cluster.id in .../meta.properties`. Rerun
+`tools/k3s/kafka.sh <env>`: it records the ID of a Ready cluster in ConfigMap
+`kafka-cluster-id` and, when it has to create the CR again, creates it paused, restores
+the ID into the status and unpauses (Strimzi's recovery procedure). The expected ID is also
+the one the error message reads from `meta.properties`.
+
+Data loss on `/data/kafka` is more serious — the last ≤7 days of the journal live only
+there until replicated:
+
+1. Reprovision: `tools/k3s/kafka.sh <env>` (idempotent). If the PV content is corrupt,
+   delete the Kafka CR and its PVC, wipe `/data/kafka` on the node, clear the PV's
+   `claimRef.uid` (or delete the PV; kafka.sh recreates it) and rerun. Users come back
+   from `kafka-users/` and the password Secrets (`tools/sops/apply.sh <env>`); the
+   superuser `admin` gets a new password, and the Kafbat UI picks it up on restart.
+2. Topics are recreated from their KafkaTopics, or by the apps. Events already
+   replicated to Scylla are safe; events appended-but-not-yet-replicated are lost —
+   check replicator lag *before* the incident (Prometheus history) to size the loss window.
 3. **Pointer reset:** kafka-journal stores per-entity journal pointers
-   (metajournal) in Scylla that reference Kafka offsets. After a broker wipe,
-   offsets restart at 0 and stale pointers point past the log head. Reset the
-   replicator group so it starts from the (new) beginning:
-   `rpk group delete <replicator-group>` (via
-   `kubectl -n redpanda exec redpanda-0 -c redpanda -- rpk ...` with superuser
-   creds from `--show-credentials`), then follow the kafka-journal pointer-reset
-   procedure app-side (your application's docs) before re-enabling writers.
-4. Post-incident: confirm `rpk cluster health`, lag = 0, and run a manual
+   (metajournal) in Scylla that reference Kafka offsets, and some apps keep consumer
+   offsets of their own there as well. After a broker wipe, offsets restart at 0 and
+   stale pointers point past the log head. Delete the replicator group so it starts
+   from the (new) beginning: `kafka-consumer-groups.sh --delete --group <replicator-group>`
+   (admin client, see [above](#users-topics)), then follow the kafka-journal
+   pointer-reset procedure app-side (your application's docs) before re-enabling writers.
+4. Post-incident: confirm `--watch health`, lag = 0, and run a manual
    snapshot to re-baseline durability.
+
+## Migrating from Redpanda {#migrate-from-redpanda}
+
+Earlier versions of this stack ran Redpanda (`tools/k3s/redpanda.sh`); `tools/up.sh` now
+refuses an env that still lists `redpanda` in `UP_OPTIONAL_STEPS`. A new broker restarts
+every offset at 0, and topic copies (MirrorMaker) do not keep offsets, so a running
+journal cannot be carried over by copying topics. Outline, per environment:
+
+1. Run `tools/k3s/kafka.sh <env> --skip-console` next to Redpanda (or set
+   `KAFKA_CONSOLE_HOST` to another host: `console.<env>` still routes to Redpanda
+   Console until the switch). Then `tools/k3s/observability.sh <env>`; the lag and disk
+   alerts read both brokers while both run, and `RedpandaDown` stays until Redpanda goes.
+2. Prepare one git change: Redpanda `User` → `KafkaUser` (namespace `kafka`,
+   `patternType: prefix`, cluster resource without a name), `Topic` → `KafkaTopic`
+   (keep the Argo `Prune=false,Delete=false` annotation), brokers →
+   `kafka-kafka-bootstrap.kafka.svc.cluster.local:9093`, password Secrets into `kafka`,
+   `UP_OPTIONAL_STEPS` `redpanda` → `kafka`.
+3. Freeze the writers through git (Argo CD reverts a `kubectl scale`), take
+   `tools/k3s/scylla.sh <env> --snapshot-now`.
+4. Reset the journal state that references Redpanda offsets, per the app owners'
+   procedure ([pointer reset](#kafka-loss)).
+5. Merge, unfreeze, verify: KafkaUsers Ready, topics with the expected config,
+   replicator groups at lag 0, alerts quiet, the UI behind SSO (rerun kafka.sh without
+   `--skip-console`).
+6. After a soak, remove Redpanda: the `Redpanda` CR, the `redpanda-operator` release,
+   Redpanda Console, the `cluster.redpanda.com` CRDs, namespace `redpanda`, PV
+   `redpanda-data-pv` and `/data/redpanda` on the node.
+
+### Redpanda during the cutover {#redpanda-loss}
+
+Alert: `RedpandaDown` (p1), only while an env still runs Redpanda. Restart with
+`kubectl -n redpanda delete pod redpanda-0`; `tools/k3s/redpanda.sh <env> --watch health`
+shows the broker's view. If the broker cannot be brought back, finish the migration
+instead of rebuilding it.
 
 ## Disk full {#disk-full}
 
 Alerts: `KafkaJournalDataDiskLow` (p2), plus the generic `NodeFilesystemSpaceLow`
 on `/data` (all local PVs share the `vg0-data` volume — sizes are declarative,
-NOT enforced).
+NOT enforced; a static local PV reports the whole filesystem).
 
 - Biggest consumers under `/data`: `k3s-storage` (local-path PVCs), `rancher`,
-  `users` (backup staging), `redpanda`, `scylla`.
-- Quick wins: prune backup staging retention (`users/*-backups`), 
+  `users` (backup staging), `kafka`, `scylla`.
+- Quick wins: prune backup staging retention (`users/*-backups`),
   `nodetool clearsnapshot` leftovers in `/data/scylla`, old Harbor/Nexus blobs.
-- Redpanda refuses writes near disk-full (storage min free bytes); Scylla
-  compaction needs headroom ~ the size of the largest sstable set.
-- Structural fix: shrink topic retention, grow the LVM volume, or move a
-  consumer elsewhere. PV "sizes" can be raised by editing the PV + PVC objects
-  (local volumes don't enforce them).
+- Kafka has no write floor: when the log directory fills up, the broker takes it
+  offline and stops. Act at the alert, not at 100%. Scylla compaction needs headroom
+  ~ the size of the largest sstable set.
+- Structural fix: shrink topic retention (`retention.ms` / `retention.bytes` on the
+  topic), grow the LVM volume, or move a consumer elsewhere. PV "sizes" can be raised by
+  editing the PV + PVC objects (local volumes don't enforce them).
 
 ## Snapshot cadence {#snapshot-cadence}
 
@@ -140,16 +234,29 @@ Alert: `ScyllaSnapshotOverdue` (p1 at >26h — this is the durability line).
 
 ## Upgrades {#upgrades}
 
-- Pins live in the scripts: `REDPANDA_OPERATOR_VERSION` / `REDPANDA_IMAGE_TAG`
-  (`redpanda.sh`), `SCYLLA_OPERATOR_VERSION` / `SCYLLA_IMAGE_TAG` /
-  `SCYLLA_AGENT_VERSION` (`scylla.sh`).
-- Order: operator first, then the CR image tag. Single node = downtime window;
-  do it in a quiet window with a fresh snapshot taken first.
-- Broker upgrades: one minor at a time (Redpanda supports rolling from the
-  previous feature release). Scylla: patch releases freely within 2025.1;
+- Pins live in the scripts: `STRIMZI_VERSION`, `KAFKA_VERSION`, `KAFKA_METADATA_VERSION`,
+  `KAFBAT_UI_IMAGE` (`kafka.sh`), `SCYLLA_OPERATOR_VERSION` / `SCYLLA_IMAGE_TAG` /
+  `SCYLLA_AGENT_VERSION` (`scylla.sh`). The JMX exporter rules in
+  `tools/k3s/kafka/kafka-metrics-config.yml` come from the Strimzi release's
+  `packaging/examples/metrics/kafka-metrics.yaml`; refresh them with the operator.
+- A Strimzi release supports a fixed set of Kafka versions (its `kafka-versions.yaml`;
+  1.3.1: 4.2.0–4.3.2). A newer Kafka waits for the Strimzi release that adds it; dev
+  compose and CI pin the same Kafka version as the cluster and move with it.
+- Kafka order, one step per run of `kafka.sh`:
+  1. **Operator:** bump `STRIMZI_VERSION`. kafka.sh applies the chart's CRDs
+     server-side before `helm upgrade` (Helm itself never upgrades CRDs). The operator
+     rolls the broker onto its own image of the same Kafka version.
+  2. **Kafka:** bump `KAFKA_VERSION` (keep `KAFKA_METADATA_VERSION`). The broker rolls;
+     single node = a short outage. Check apps and lag.
+  3. **Metadata:** once the new version runs well, bump `KAFKA_METADATA_VERSION` (e.g.
+     `4.3-IV0`). Some metadata versions cannot be downgraded: this is the point of no
+     return.
+- Scylla: operator first, then the CR image tag; patch releases freely within 2025.1;
   major/minor jumps need the Scylla upgrade guide (sstable format).
+- Single node = downtime window; do it in a quiet window with a fresh snapshot taken first.
 - The weekly upstream-canary CI lane (kafka-journal fork) is the early-warning
-  for client/broker incompatibilities before any broker bump.
+  for client/broker incompatibilities before any broker bump. Kafka 4 dropped the old
+  client protocol versions (KIP-896): clients need kafka-clients 2.1 or newer.
 
 ## Drills {#drills}
 
@@ -158,9 +265,11 @@ Quarterly, on your reference env:
 1. **Snapshot-restore drill:** take `--snapshot-now`, drop + restore
    `<app>_journal` per [Scylla loss](#scylla-loss) on a scratch keyspace, verify
    row counts.
-2. **Alert drill:** scale the redpanda statefulset to 0
-   (`kubectl -n redpanda patch redpanda redpanda --type merge -p '{"spec":{"clusterSpec":{"statefulset":{"replicas":0}}}}'`
-   or simply delete the pod repeatedly) → `RedpandaDown` fires within ~6m;
-   scale back, confirm resolve. Later: scale replicator to 0 with traffic →
+2. **Alert drill:** make the scrape fail without touching the broker: point the metrics
+   Service at a closed port,
+   `kubectl -n kafka patch svc kafka-metrics --type json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":9999}]'`
+   → `KafkaBrokerDown` fires within ~6m; set it back to 9404 (or rerun kafka.sh), confirm
+   resolve. (A NetworkPolicy cannot do this: policies add up, and Strimzi's own policy
+   opens 9404.) Later: scale the replicator to 0 with traffic →
    `KafkaJournalReplicatorStalled`.
 3. **Failure-mode review:** check lag history and disk trends for the quarter.

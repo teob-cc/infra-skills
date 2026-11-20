@@ -41,7 +41,7 @@ Ask for (accept an env name from the arguments if given):
 4. **ACME email** — for Let's Encrypt certificates.
 5. **GitHub org** — gates SSO and hosts the CI runners.
 6. **Components beyond the core** — core is identity + Harbor + runners + ArgoCD +
-   observability; optional: PostgreSQL, MySQL, Redpanda/Scylla, Nexus.
+   observability; optional: PostgreSQL, MySQL, Kafka/Scylla, Nexus.
 
 ## Step 3 — Generate the environment files
 
@@ -89,7 +89,7 @@ ACME_EMAIL=<acme-email>
 # BACKUP_TARGET_HOST=<vpn-ip>  BACKUP_TARGET_PORT=22  BACKUP_TARGET_USER=<ssh-user>
 # BACKUP_REMOTE_BASE=/volume1/remote_backups  BACKUP_REMOTE_RDIFF=/opt/bin/rdiff-backup
 # BACKUP_K3S_EXCLUDES="*_observability_prometheus-server"   # further PVC-dir globs to skip
-# Optional components tools/up.sh runs for this env (from: postgres mysql redpanda scylla nexus wireguard backup):
+# Optional components tools/up.sh runs for this env (from: postgres mysql kafka scylla nexus wireguard backup):
 UP_OPTIONAL_STEPS="postgres"
 ```
 

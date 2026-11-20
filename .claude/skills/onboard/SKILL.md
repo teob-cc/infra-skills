@@ -100,7 +100,7 @@ back to the user and get an explicit yes. Then, in this order (from the infra-sk
    observability → **runner-image** (Harbor creds to the envs repo, custom image build on the
    vanilla runners, switch) → **base-image** (`library/teob-base`, the runtime base every JVM
    service starts FROM) → the env's `UP_OPTIONAL_STEPS`, re-applies observability if
-   redpanda/scylla ran, and ends with `tools/doctor.sh <env>`. It checkpoints and retries a
+   kafka/scylla ran, and ends with `tools/doctor.sh <env>`. It checkpoints and retries a
    transient failure once; on a real failure fix the cause and re-run — it resumes.
    Prerequisite for the two image steps: the envs repo must contain
    `.github/workflows/build-runner-image.yml` and `build-teob-base-image.yml` (copied from

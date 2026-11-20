@@ -1,0 +1,122 @@
+# promtool unit tests for the kafka-journal alert group in tools/k3s/observability.sh
+# (docs/KAFKA-JOURNAL-OPS.md). Render the rules first, as for on-demand-nodes-test.yml:
+#   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
+#   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
+#   cd tests/alert-rules
+#   docker run --rm -v "$PWD":/w -w /w --entrypoint promtool \
+#     quay.io/prometheus/prometheus:v3.14.0 test rules kafka-journal-test.yml
+# The series are what the Strimzi kafka-exporter and JMX exporter publish (jobs kafka and
+# kafka-exporter from tools/k3s/kafka.sh). Scenario 6 keeps the Redpanda branch working
+# while an environment still runs Redpanda next to Kafka.
+rule_files:
+  - rules.yml
+evaluation_interval: 1m
+
+tests:
+  # 1. Broker target down: KafkaBrokerDown after 5m; nothing else of the group fires.
+  - name: kafka broker down
+    interval: 1m
+    input_series:
+      - series: up{job="kafka",namespace="kafka",pod="kafka-dual-role-0"}
+        values: 0x20
+      - series: up{job="kafka-exporter",namespace="kafka",pod="kafka-kafka-exporter-abc"}
+        values: 1x20
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 10m
+        exp_samples:
+          - labels: '{alertname="KafkaBrokerDown"}'
+            value: 1
+
+  # 2. One partition 20k behind for 30m: lag high, but commits move, so not stalled.
+  - name: replicator lag high, still committing
+    interval: 1m
+    input_series:
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 20000x40
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="1"}
+        values: 0x40
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 1000+100x40
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 35m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorLagHigh"}'
+            value: 1
+
+  # 3. Backlog and no commit for 30m: stalled (p1). Lag 50 stays under the lag-high bar.
+  - name: replicator stalled
+    interval: 1m
+    input_series:
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 50x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="teob-replicator.j",topic="t",partition="0"}
+        values: 1000x45
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 40m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorStalled"}'
+            value: 1
+
+  # 4. A group with no committed offset yet: the exporter reports lag and offset -1.
+  #    That is not backlog, so nothing fires.
+  - name: group without committed offsets is not a stall
+    interval: 1m
+    input_series:
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="new-group",topic="t",partition="0"}
+        values: -1x45
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="new-group",topic="t",partition="0"}
+        values: -1x45
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{app="kafka-journal"})
+        eval_time: 40m
+        exp_samples: []
+
+  # 5. Broker data PVC under 15% free for 30m. k3s publishes kubelet volume stats twice
+  #    (kubernetes-nodes and kubernetes-api-servers); the rule pins one job, so this must
+  #    not fail with duplicate series. A Scylla PVC that is just as full stays out of it.
+  - name: kafka data disk low
+    interval: 1m
+    input_series:
+      - series: kubelet_volume_stats_available_bytes{job="kubernetes-nodes",namespace="kafka",persistentvolumeclaim="data-0-kafka-dual-role-0",node="test"}
+        values: 10x45
+      - series: kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes",namespace="kafka",persistentvolumeclaim="data-0-kafka-dual-role-0",node="test"}
+        values: 100x45
+      - series: kubelet_volume_stats_available_bytes{job="kubernetes-api-servers",namespace="kafka",persistentvolumeclaim="data-0-kafka-dual-role-0"}
+        values: 10x45
+      - series: kubelet_volume_stats_capacity_bytes{job="kubernetes-api-servers",namespace="kafka",persistentvolumeclaim="data-0-kafka-dual-role-0"}
+        values: 100x45
+      - series: kubelet_volume_stats_available_bytes{job="kubernetes-nodes",namespace="scylla",persistentvolumeclaim="data-scylla-dc1-rack1-0",node="test"}
+        values: 10x45
+      - series: kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes",namespace="scylla",persistentvolumeclaim="data-scylla-dc1-rack1-0",node="test"}
+        values: 100x45
+    promql_expr_test:
+      - expr: count by (alertname, persistentvolumeclaim) (ALERTS{alertstate="firing",alertname="KafkaJournalDataDiskLow"})
+        eval_time: 40m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalDataDiskLow",persistentvolumeclaim="data-0-kafka-dual-role-0"}'
+            value: 1
+
+  # 6. Cutover: Redpanda still serves the journal. Its lag series keep the lag rule
+  #    working, and RedpandaDown still fires for its own target.
+  - name: redpanda branch during the cutover
+    interval: 1m
+    input_series:
+      - series: redpanda_kafka_consumer_group_lag_max{job="redpanda",redpanda_group="teob-replicator.j"}
+        values: 20000x40
+      - series: redpanda_kafka_consumer_group_lag_sum{job="redpanda",redpanda_group="teob-replicator.j"}
+        values: 20000x40
+      - series: redpanda_kafka_consumer_group_committed_offset{job="redpanda",redpanda_group="teob-replicator.j"}
+        values: 1000+100x40
+      - series: up{job="redpanda",namespace="redpanda",pod="redpanda-0"}
+        values: 0x40
+    promql_expr_test:
+      - expr: sort(count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"}))
+        eval_time: 35m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorLagHigh"}'
+            value: 1
+          - labels: '{alertname="RedpandaDown"}'
+            value: 1
