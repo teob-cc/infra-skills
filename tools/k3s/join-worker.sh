@@ -10,6 +10,8 @@ set -euo pipefail
 #
 # Reads env.properties from envs/<env>/<worker-name>/env.properties
 # Expects: VLAN_IP (Tailscale IP), MASTER_VLAN_IP, MASTER_HOSTNAME, EXTERNAL_IP
+# Optional: TENANT, NODE_LABELS, NODE_TAINTS, REGISTRY_HOSTS, MASTER_SSH_USER,
+#   SSH_VIA=tailscale (SSH straight to VLAN_IP, e.g. when the public :22 is firewalled)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -195,7 +197,10 @@ SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout
 # Prefer EXTERNAL_IP for SSH (Tailscale SSH may intercept connections to Tailscale IPs
 # and require browser-based auth, which breaks BatchMode)
 SSH_HOST="$EXTERNAL_IP"
-if [[ -n "$SSH_USER" ]]; then
+# SSH_VIA=tailscale (worker env.properties): go straight to the Tailscale IP, e.g. a cloud
+# node whose public :22 is closed by its firewall (saves the timeout of the probe below).
+[[ "${SSH_VIA:-}" == tailscale ]] && SSH_HOST="$VLAN_IP_ADDR"
+if [[ -n "$SSH_USER" && "$SSH_HOST" != "$VLAN_IP_ADDR" ]]; then
   # The LAN address is only reachable from the same network; when operating
   # remotely, fall back to the Tailscale IP.
   if ! ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 "${SSH_USER}@${SSH_HOST}" "true" 2>/dev/null; then
@@ -698,7 +703,29 @@ if [[ "${NEED_TUNNEL_NAT}" == "true" ]]; then
     addt \$src udp 8472 ""
   done
 fi
-# Persist across reboots.
+# Persist across reboots. On Ubuntu, installing iptables-persistent removes ufw (the host
+# firewall of e.g. a cloud tenant node): where ufw is installed and iptables-persistent is
+# not, a oneshot unit restores only these rules (appended, before k3s-agent) instead.
+mkdir -p /etc/iptables
+if dpkg -s ufw >/dev/null 2>&1 && ! dpkg -s iptables-persistent >/dev/null 2>&1; then
+  cat > /etc/iptables/infra-skills-worker-nat.v4 <<'RULESEOF'
+${PERSIST_BODY}
+RULESEOF
+  cat > /etc/systemd/system/infra-skills-worker-nat.service <<'UNITEOF'
+[Unit]
+Description=infra-skills join-worker NAT rules (Harbor :443 bypass, k3s tunnel)
+After=network-pre.target
+Before=k3s-agent.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iptables-restore --noflush /etc/iptables/infra-skills-worker-nat.v4
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+  systemctl daemon-reload
+  systemctl enable infra-skills-worker-nat.service >/dev/null 2>&1
+else
 if ! dpkg -s iptables-persistent >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   echo 'iptables-persistent iptables-persistent/autosave_v4 boolean false' | debconf-set-selections
@@ -710,6 +737,7 @@ cat > /etc/iptables/rules.v4 <<'RULESEOF'
 ${PERSIST_BODY}
 RULESEOF
 rm -f /etc/iptables/rules.v6
+fi
 echo "[OK] Worker NAT rules configured"
 NAT
 )

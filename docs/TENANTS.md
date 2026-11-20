@@ -130,8 +130,15 @@ manual, because they hold its data.
 - **Logs and metrics.** Promtail and node-exporter do not run on a tenant node. Promtail would
   hand the tenant its Loki credentials. The tenant sees its own logs and metrics through a
   tenant console that queries server-side.
-- **The tailnet.** Tag the tenant node in your Tailscale ACL so that it can reach only the k3s
-  API (6443) and flannel (8472/udp) of the server. That ACL lives outside infra-skills.
+- **The tailnet.** Tag the tenant node `tag:tenant-<tenant>` (its Tailscale auth key carries
+  the tag). In your Tailscale ACL, allow the tag to reach only the server's k3s API (6443/tcp)
+  and flannel (8472/udp). The server may reach the tag on 8472/udp and 10250/tcp (kubelet: logs
+  and exec), and the operator on 22/tcp. The ACL lives outside infra-skills;
+  `provision-hetzner-cloud.sh` documents the snippet. A node whose public :22 is closed sets
+  `SSH_VIA=tailscale` in its env.properties.
+- **Host firewall.** Where ufw is installed, `join-worker.sh` persists its NAT rules with a
+  oneshot unit (`infra-skills-worker-nat.service`) instead of installing iptables-persistent.
+  On Ubuntu that package removes ufw.
 - **The server token on platform workers.** Without `--token bootstrap`, a platform worker
   still joins with the server token, as before. Root on any such worker can join a server.
   Move platform workers with `join-worker.sh <env> <worker> --token bootstrap`, which takes
