@@ -21,6 +21,14 @@ set -euo pipefail
 #   --show-resources         Display current PostgreSQL resource usage and exit
 #   --watch [kind]           Watch/inspect a running cluster (kind: help|cluster|pods|events|logs|operator-logs|sql|exporter|services|pvc)
 #   --provision-credentials <app-id>  Provision database credentials for an application
+#       --tenant <name>      ... for a tenant (docs/TENANTS.md): secret in the tenant namespace, stricter
+#                            limits, no read-only role access, Pooler labelled for the tenant
+#       --pooler             ... and a CNPG Pooler pooler-<app-id> (PgBouncer); the secret points at it
+#       --connection-limit N ... role CONNECTION LIMIT (default PG_APP_CONNECTION_LIMIT, else 50; tenant 20)
+#       --statement-timeout D  role statement_timeout (default PG_APP_STATEMENT_TIMEOUT; tenant 60s)
+#   --revoke-public-connect [--apply]  List (or, with --apply, revoke) CONNECT and TEMPORARY that
+#                            PUBLIC still holds on application databases; owners, the read-only role
+#                            and the pooler role get explicit grants first
 #   --dump-table <table>     Dump a specific table (use --database to specify database, --output to specify file)
 #   --database <dbname>      Database name for dump-table (default: app)
 #   --output <file>          Output file for dump-table (default: stdout)
@@ -78,6 +86,12 @@ WATCH=false
 WATCH_KIND="help"
 PROVISION_CREDENTIALS=false
 APP_ID=""
+PG_TENANT=""
+PG_POOLER=false
+PG_CONN_LIMIT=""
+PG_STATEMENT_TIMEOUT=""
+REVOKE_PUBLIC_CONNECT=false
+REVOKE_PUBLIC_APPLY=false
 SHOW_CREDENTIALS_APP_ID=""
 DUMP_TABLE=false
 DUMP_TABLE_NAME=""
@@ -118,6 +132,12 @@ while [[ $# -gt 0 ]]; do
       APP_ID="$2"
       shift 2
       ;;
+    --tenant) PG_TENANT="${2:?--tenant needs a tenant name}"; shift 2 ;;
+    --pooler) PG_POOLER=true; shift ;;
+    --connection-limit) PG_CONN_LIMIT="${2:?--connection-limit needs a number}"; shift 2 ;;
+    --statement-timeout) PG_STATEMENT_TIMEOUT="${2:?--statement-timeout needs a duration, e.g. 60s}"; shift 2 ;;
+    --revoke-public-connect) REVOKE_PUBLIC_CONNECT=true; shift ;;
+    --apply) REVOKE_PUBLIC_APPLY=true; shift ;;
     --dump-table)
       DUMP_TABLE=true
       if [[ -z "${2:-}" ]]; then
@@ -639,7 +659,8 @@ fi
 provision_credentials() {
   local app_id="$1"
   local namespace="$NAMESPACE_POSTGRES"
-  local app_namespace="${APP_NAMESPACE:-default}"
+  local tenant="$PG_TENANT"
+  local app_namespace="${APP_NAMESPACE:-${tenant:-default}}"
   
   # Validate app_id (alphanumeric and hyphens only, for safety)
   if [[ ! "$app_id" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
@@ -647,8 +668,27 @@ provision_credentials() {
     err "App ID must be lowercase alphanumeric with hyphens (e.g., 'my-app', 'evse')"
     exit 1
   fi
+  if [[ -n "$tenant" && ! "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    err "Invalid tenant: ${tenant}"; exit 1
+  fi
+  # Role limits. A tenant shares the cluster with the platform's apps: its role gets a small
+  # connection budget and time limits, so a runaway query or pool cannot starve them.
+  local conn_limit statement_timeout idle_tx_timeout
+  if [[ -n "$tenant" ]]; then
+    conn_limit="${PG_CONN_LIMIT:-${PG_TENANT_CONNECTION_LIMIT:-20}}"
+    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_TENANT_STATEMENT_TIMEOUT:-60s}}"
+    idle_tx_timeout="${PG_TENANT_IDLE_IN_TRANSACTION_TIMEOUT:-5min}"
+  else
+    conn_limit="${PG_CONN_LIMIT:-${PG_APP_CONNECTION_LIMIT:-50}}"
+    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_APP_STATEMENT_TIMEOUT:-}}"
+    idle_tx_timeout="${PG_APP_IDLE_IN_TRANSACTION_TIMEOUT:-}"
+  fi
+  [[ "$conn_limit" =~ ^(-1|[0-9]+)$ ]] || { err "connection limit must be a number (or -1): ${conn_limit}"; exit 1; }
+  for v in "$statement_timeout" "$idle_tx_timeout"; do
+    [[ -z "$v" || "$v" =~ ^[0-9]+(ms|s|min|h)?$ ]] || { err "not a Postgres duration: ${v}"; exit 1; }
+  done
   
-  log "=== Provisioning PostgreSQL credentials for application: ${app_id} ==="
+  log "=== Provisioning PostgreSQL credentials for application: ${app_id}${tenant:+ (tenant ${tenant})} ==="
   
   # Check if cluster exists and is ready
   if ! kubectl -n "$namespace" get cluster postgres-cluster >/dev/null 2>&1; then
@@ -669,24 +709,10 @@ provision_credentials() {
     fi
   fi
   
-  # Get superuser credentials
-  if ! kubectl -n "$namespace" get secret postgres-cluster-superuser >/dev/null 2>&1; then
-    err "PostgreSQL superuser secret not found"
-    err "Run provisioning first: tools/k3s/postgres.sh ${ENV_NAME}"
-    exit 1
-  fi
-  
   local pg_host="postgres-cluster-rw.${namespace}.svc.cluster.local"
   local pg_port="5432"
-  local superuser
-  local superpass
-  superuser=$(kubectl -n "$namespace" get secret postgres-cluster-superuser -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || echo "postgres")
-  superpass=$(kubectl -n "$namespace" get secret postgres-cluster-superuser -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
-  
-  if [[ -z "$superpass" ]]; then
-    err "Failed to retrieve superuser password"
-    exit 1
-  fi
+  local pooler_name="pooler-${app_id}"
+  local superuser="postgres"
   
   # Generate app credentials
   local app_username="${app_id}"
@@ -694,52 +720,98 @@ provision_credentials() {
   app_password=$(openssl rand -base64 24 | tr -d '\n')
   local app_database="${app_id}"
   
-  info "Creating database user and database: ${app_username}/${app_database}"
-  
-  # Find a PostgreSQL pod to execute commands
+  # Find the primary to execute commands (psql as the local superuser over the socket)
   local pg_pod
-  pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  [[ -n "$pg_pod" ]] || pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
   
   if [[ -z "$pg_pod" ]]; then
     err "No PostgreSQL pod found in cluster"
     exit 1
   fi
+
+  # --- Pooler (before the grants: CNPG creates its auth role cnpg_pooler_pgbouncer) ---
+  if [[ "$PG_POOLER" == "true" ]]; then
+    info "Applying CNPG Pooler ${pooler_name} (PgBouncer, ${PG_POOLER_MODE:-session} mode)..."
+    jq -nc --arg n "$pooler_name" --arg ns "$namespace" --arg t "$tenant" --arg app "$app_id" \
+       --arg mode "${PG_POOLER_MODE:-session}" --arg pool "$([[ "$conn_limit" == -1 ]] && echo 20 || echo "$conn_limit")" '
+      ({"app.kubernetes.io/part-of": $app} + (if $t != "" then {"infra-skills/tenant": $t} else {} end)) as $l
+      | {apiVersion: "postgresql.cnpg.io/v1", kind: "Pooler", metadata: {name: $n, namespace: $ns, labels: $l},
+         spec: {cluster: {name: "postgres-cluster"}, instances: 1, type: "rw",
+                pgbouncer: {poolMode: $mode, parameters: {max_client_conn: "200", default_pool_size: $pool}},
+                template: {metadata: {labels: $l}, spec: {containers: []}}}}' \
+      | kubectl apply -f - || { err "Failed to apply Pooler ${pooler_name}"; exit 1; }
+    pg_host="${pooler_name}.${namespace}.svc.cluster.local"
+    local i
+    for i in $(seq 1 30); do
+      kubectl -n "$namespace" exec "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = 'cnpg_pooler_pgbouncer'" 2>/dev/null | grep -q 1 && break
+      sleep 2
+    done
+  fi
   
-  # Create database and user
-  info "Creating database '${app_database}' and user '${app_username}'..."
+  info "Creating database '${app_database}' and role '${app_username}' (connection limit ${conn_limit}${statement_timeout:+, statement_timeout ${statement_timeout}}${idle_tx_timeout:+, idle_in_transaction_session_timeout ${idle_tx_timeout}})..."
   
-  # Create user (or update password if exists)
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_user WHERE usename = '${app_username}') THEN CREATE USER ${app_username} WITH PASSWORD '${app_password}'; ELSE ALTER USER ${app_username} WITH PASSWORD '${app_password}'; END IF; END \$\$;" || {
-    err "Failed to create/update database user"
-    exit 1
-  }
-  
-  # Create database if not exists
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${app_database}'" | grep -q 1 || \
-    kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d postgres -c "CREATE DATABASE ${app_database} OWNER ${app_username};" || {
-    err "Failed to create database"
-    exit 1
-  }
-  
-  # Grant privileges including ability to create extensions
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d postgres -c "GRANT ALL PRIVILEGES ON DATABASE ${app_database} TO ${app_username};" || {
-    warn "Failed to grant privileges (database may already have correct permissions)"
-  }
-  
-  # Grant CREATE privilege on the database schema to allow extension creation
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d "${app_database}" -c "GRANT CREATE ON SCHEMA public TO ${app_username};" || {
-    warn "Failed to grant CREATE privilege on schema public"
-  }
+  # The SQL goes over stdin, never on a command line, and the password statement runs with
+  # log_statement off, so the password lands in neither ps nor the server log. Identifiers are
+  # quoted (:"name"), so app ids with hyphens work.
+  #   * REVOKE CONNECT, TEMPORARY ... FROM PUBLIC: by default every role may connect to every
+  #     database; with it revoked only the owner and explicit grants can. Other databases
+  #     keep PUBLIC's CONNECT until --revoke-public-connect --apply (listed below for a tenant).
+  #   * a new role gets no attribute beyond LOGIN; an existing one keeps its attributes (a
+  #     warning names the dangerous ones).
+  local ro_role=""
+  [[ -z "$tenant" ]] && ro_role="${PG_READONLY_ROLE:-}"
+  kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q <<SQL || { err "Failed to create/update the database role and database"; exit 1; }
+\\set role '${app_username}'
+\\set db '${app_database}'
+\\set pw '${app_password}'
+\\set ro '${ro_role}'
+SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') \\gexec
+BEGIN;
+SET LOCAL log_statement = 'none';
+ALTER ROLE :"role" WITH LOGIN PASSWORD :'pw' CONNECTION LIMIT ${conn_limit};
+COMMIT;
+SELECT format('ALTER ROLE %I SET statement_timeout = %L', :'role', '${statement_timeout}') WHERE '${statement_timeout}' <> '' \\gexec
+SELECT format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', :'role', '${idle_tx_timeout}') WHERE '${idle_tx_timeout}' <> '' \\gexec
+SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'role') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db') \\gexec
+REVOKE CONNECT, TEMPORARY ON DATABASE :"db" FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"role";
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db', :'ro') WHERE :'ro' <> '' AND EXISTS (SELECT FROM pg_roles WHERE rolname = :'ro') \\gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO cnpg_pooler_pgbouncer', :'db') WHERE EXISTS (SELECT FROM pg_roles WHERE rolname = 'cnpg_pooler_pgbouncer') \\gexec
+SELECT 'WARN role ' || rolname || ' has ' || concat_ws(', ', CASE WHEN rolsuper THEN 'SUPERUSER' END, CASE WHEN rolcreaterole THEN 'CREATEROLE' END,
+       CASE WHEN rolcreatedb THEN 'CREATEDB' END, CASE WHEN rolreplication THEN 'REPLICATION' END, CASE WHEN rolbypassrls THEN 'BYPASSRLS' END)
+  FROM pg_roles WHERE rolname = :'role' AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls);
+\\c :"db"
+GRANT CREATE ON SCHEMA public TO :"role";
+SQL
   
   # Pre-install common extensions as superuser so app user can use them
   info "Pre-installing common PostgreSQL extensions..."
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d "${app_database}" -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || \
-    warn "pgvector extension not available (image may not include it)"
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d "${app_database}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;" 2>/dev/null || true
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d "${app_database}" -c "CREATE EXTENSION IF NOT EXISTS btree_gin;" 2>/dev/null || true
-  kubectl -n "$namespace" exec "$pg_pod" -- psql -U "$superuser" -d "${app_database}" -c "CREATE EXTENSION IF NOT EXISTS btree_gist;" 2>/dev/null || true
+  local ext
+  for ext in vector pg_trgm btree_gin btree_gist; do
+    kubectl -n "$namespace" exec "$pg_pod" -c postgres -- psql -U "$superuser" -d "${app_database}" -qc "CREATE EXTENSION IF NOT EXISTS ${ext};" >/dev/null 2>&1 || \
+      { [[ "$ext" == vector ]] && warn "pgvector extension not available (image may not include it)"; }
+  done
 
   info "✓ Database and user created"
+
+  # A tenant role can still reach every database where PUBLIC keeps CONNECT: name them.
+  if [[ -n "$tenant" ]]; then
+    local open_dbs
+    open_dbs=$(kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -tA <<SQL
+SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database
+ WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('${app_database}', 'postgres') AND has_database_privilege('${app_username}', datname, 'CONNECT');
+SQL
+)
+    if [[ -n "$open_dbs" ]]; then
+      warn "Tenant role ${app_username} may still CONNECT to: ${open_dbs}"
+      warn "  (PUBLIC holds CONNECT there). Close them: tools/k3s/postgres.sh ${ENV_NAME} --revoke-public-connect [--apply]"
+    else
+      info "✓ Tenant role ${app_username} can connect only to ${app_database} (and postgres)"
+    fi
+    info "  The postgres database stays open to every role (the exporter and CNPG use it); it holds no app data."
+  fi
   
   # Create secret file
   local secrets_dir="$ENVS_ROOT/${ENV_NAME}/secrets.plain"
@@ -750,7 +822,7 @@ provision_credentials() {
   
   # Create secret YAML file
   info "Creating secret file: ${secret_file}"
-  cat > "$secret_file" <<YAML
+  (umask 077; cat > "$secret_file" <<YAML
 apiVersion: v1
 kind: Secret
 metadata:
@@ -758,7 +830,7 @@ metadata:
   namespace: ${app_namespace}
 type: Opaque
 stringData:
-  # PostgreSQL host
+  # PostgreSQL host$([[ "$PG_POOLER" == "true" ]] && echo " (CNPG Pooler ${pooler_name})")
   POSTGRES_HOST: ${pg_host}
 
   # PostgreSQL port
@@ -773,11 +845,18 @@ stringData:
   # PostgreSQL password
   POSTGRES_PASSWORD: ${app_password}
 YAML
+  )
 
   info "✓ Secret file created"
   
-  # Ensure namespace exists
-  kubectl get ns "$app_namespace" >/dev/null 2>&1 || kubectl create ns "$app_namespace"
+  # Ensure namespace exists (a tenant namespace comes from tools/k3s/tenant.sh)
+  if ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+    if [[ -n "$tenant" ]]; then
+      err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first"
+      exit 1
+    fi
+    kubectl create ns "$app_namespace"
+  fi
   
   # Apply to kubectl
   info "Applying secret to Kubernetes..."
@@ -803,6 +882,7 @@ YAML
   info "  Port:             ${pg_port}"
   info "  Database:         ${app_database}"
   info "  Username:         ${app_username}"
+  info "  Connection limit: ${conn_limit}"
   info ""
   info "Secret fields:"
   info "  POSTGRES_HOST"
@@ -814,6 +894,54 @@ YAML
   
   exit 0
 }
+
+# ============================================================================
+# Revoke PUBLIC's CONNECT on application databases
+# ============================================================================
+# Every role may connect to every database by default (PUBLIC holds CONNECT and TEMPORARY).
+# This lists the databases where PUBLIC still does and, with --apply, first grants CONNECT
+# explicitly to each database's owner, PG_READONLY_ROLE and cnpg_pooler_pgbouncer, then
+# revokes PUBLIC's. The postgres database and templates are left alone (the exporter and
+# CNPG use postgres).
+revoke_public_connect() {
+  local namespace="$NAMESPACE_POSTGRES" pg_pod
+  pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  [[ -n "$pg_pod" ]] || { err "No primary PostgreSQL pod found"; exit 1; }
+  local dbs
+  dbs=$(kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U postgres -d postgres -tA <<'SQL'
+SELECT datname FROM pg_database
+ WHERE datallowconn AND NOT datistemplate AND datname <> 'postgres' AND has_database_privilege('public', datname, 'CONNECT')
+ ORDER BY 1;
+SQL
+)
+  if [[ -z "$dbs" ]]; then
+    info "✓ PUBLIC holds CONNECT on no application database"
+    exit 0
+  fi
+  info "PUBLIC holds CONNECT on: $(tr '\n' ' ' <<<"$dbs")"
+  if [[ "$REVOKE_PUBLIC_APPLY" != "true" ]]; then
+    info "Nothing changed. Revoke with: tools/k3s/postgres.sh ${ENV_NAME} --revoke-public-connect --apply"
+    info "  (grants CONNECT to each owner${PG_READONLY_ROLE:+, ${PG_READONLY_ROLE}} and cnpg_pooler_pgbouncer first; any other role that"
+    info "   relied on PUBLIC then needs its own GRANT CONNECT)"
+    exit 0
+  fi
+  kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q <<SQL || { err "revoke failed"; exit 1; }
+\\set ro '${PG_READONLY_ROLE:-}'
+SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', d.datname, pg_get_userbyid(d.datdba)) FROM pg_database d
+ WHERE d.datallowconn AND NOT d.datistemplate AND d.datname <> 'postgres' AND has_database_privilege('public', d.datname, 'CONNECT') \\gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', d.datname, r.rolname) FROM pg_database d, pg_roles r
+ WHERE r.rolname IN (:'ro', 'cnpg_pooler_pgbouncer') AND d.datallowconn AND NOT d.datistemplate AND d.datname <> 'postgres'
+   AND has_database_privilege('public', d.datname, 'CONNECT') \\gexec
+SELECT format('REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC', d.datname) FROM pg_database d
+ WHERE d.datallowconn AND NOT d.datistemplate AND d.datname <> 'postgres' AND has_database_privilege('public', d.datname, 'CONNECT') \\gexec
+SQL
+  info "✓ PUBLIC's CONNECT revoked on: $(tr '\n' ' ' <<<"$dbs")"
+  exit 0
+}
+
+if [[ "$REVOKE_PUBLIC_CONNECT" == "true" ]]; then
+  revoke_public_connect
+fi
 
 if [[ "$PROVISION_CREDENTIALS" == "true" ]]; then
   provision_credentials "$APP_ID"
