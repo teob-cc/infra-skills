@@ -1,34 +1,61 @@
 #!/usr/bin/env bash
 # Hetzner Cloud provisioning helper
 #
-# This script provisions K3s servers on Hetzner Cloud VMs via API.
-# It handles the full lifecycle: server creation, cloud-init, DNS, Tailscale,
-# postinstall, and worker node support.
+# Creates, provisions and destroys Hetzner Cloud VMs through the Hetzner Cloud API. Three kinds of node:
+#
+#   server          (default) a K3s server on a cloud VM, with a Hetzner Cloud private network.
+#   private worker  MASTER_PRIVATE_IP set: a K3s agent that joins a cloud server over that network.
+#   tenant worker   --worker <tenant>-<n>: a VM in the TENANT's own Hetzner project (its own API
+#                   token) that joins an existing cluster (bare metal or cloud) over Tailscale as an
+#                   isolated tenant worker, through tools/k3s/join-worker.sh --tenant. No private
+#                   network, no public inbound port but Tailscale's, no DNS records.
+#                   See docs/HETZNER-CLOUD-TENANT.md.
 #
 # Usage:
-#   tools/provision-hetzner-cloud.sh <env-name> [flags]
+#   tools/provision-hetzner-cloud.sh <env-name> [--worker <tenant>-<n>] [flags]
 #
 # Flags:
+#   --worker NAME           Tenant worker mode: config in envs/<env>/<NAME>/env.properties
 #   --ssh-key PATH          SSH key path (default: ~/.ssh/id_ed25519)
 #   --create-server         Create server only (skip provisioning)
 #   --provision-only        Provision existing server (skip creation)
+#   --no-join               Tenant worker: provision the node but do not run join-worker.sh
 #   --skip-diagnose         Skip pre-flight checks
-#   --skip-dns              Skip Cloudflare DNS setup
-#   --skip-tailscale        Skip Tailscale setup
+#   --skip-dns              Skip Cloudflare DNS setup (never done for a tenant worker)
+#   --skip-tailscale        Skip Tailscale setup (not possible for a tenant worker)
 #   --destroy               Tear down server (with confirmation)
+#   --confirm NAME          Answer the --destroy confirmation non-interactively (must equal the server name)
+#   --dry-run               Print every API call (method, URL, body with secrets redacted) and every
+#                           remote step instead of running it. GET calls still run when a token is
+#                           available, so the plan reflects what exists; nothing is created or deleted.
 #   --debug                 Verbose logging
 #
-# Environment file expected at: envs/<env>/env.properties with variables:
+# Server / private worker: envs/<env>/env.properties with
 #   HOSTNAME=example.domain.tld
 #   ACME_EMAIL=admin@example.com
-#   HCLOUD_SERVER_TYPE=cpx31         # Hetzner Cloud server type
-#   HCLOUD_LOCATION=fsn1             # Datacenter (fsn1, nbg1, hel1)
+#   HCLOUD_SERVER_TYPE=cpx32         # Hetzner Cloud server type
+#   HCLOUD_LOCATION=hel1             # Location (fsn1, nbg1, hel1)
 #   HCLOUD_IMAGE=ubuntu-24.04        # OS image
 #   HCLOUD_NETWORK_ZONE=eu-central   # For private network
 #   PRIVATE_IP=10.0.0.2/16           # Private network IP
-#   # Optional: worker mode
+#   # Optional: private worker mode
 #   # MASTER_PRIVATE_IP=10.0.0.1
 #   # MASTER_HOSTNAME=master.example.domain.tld
+#
+# Tenant worker: envs/<env>/<tenant>-<n>/env.properties (the same file tools/k3s/join-worker.sh reads)
+#   TENANT=symbioen                  # DNS label; the node is named <tenant>-*
+#   MASTER_VLAN_IP=100.x.y.z         # the cluster server's Tailscale IP
+#   MASTER_HOSTNAME=prod.example.com # the cluster server's hostname
+#   HCLOUD_SERVER_TYPE=cx33          # default cx33
+#   HCLOUD_LOCATION=hel1             # default hel1; put it where the cluster server is
+#   HCLOUD_IMAGE=ubuntu-24.04
+#   # Written by this script: EXTERNAL_IP (public IPv4), VLAN_IP (Tailscale IPv4)
+#   # Optional: HCLOUD_TOKEN_FILE, TAILSCALE_TAG (default tag:tenant-<tenant>), HCLOUD_FIREWALL_SSH_CIDRS,
+#   #           REGISTRY_HOSTS (join-worker.sh)
+#   The tenant project's API token: envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt (or the
+#   sops copy in secrets.sops/, or HCLOUD_TOKEN_FILE relative to envs/). The shared token
+#   (envs/shared/secrets.plain/hetzner-cloud-token.txt) and an HCLOUD_TOKEN in the environment are
+#   never used for a tenant worker.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -39,34 +66,41 @@ ENV_ROOT=$(provision::envs_root)
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 
-# Validate local keys before continuing
-if ! provision::validate_local_keys; then
-  provision::warn "Missing required local keys. Aborting provisioning."
-  exit 1
-fi
-
 function usage() {
   cat <<USAGE
-${BLUE}Hetzner Cloud provisioning${NC}
-Usage: $0 <env-name> [--ssh-key PATH] [--create-server] [--provision-only] [--skip-diagnose] [--skip-dns] [--skip-tailscale] [--destroy] [--debug]
+Hetzner Cloud provisioning
+Usage: $0 <env-name> [--worker NAME] [--ssh-key PATH] [--create-server] [--provision-only] [--no-join]
+          [--skip-diagnose] [--skip-dns] [--skip-tailscale] [--destroy] [--confirm NAME] [--dry-run] [--debug]
 
 Examples:
   $0 cloud-test --ssh-key ~/.ssh/id_ed25519
   $0 cloud-test --create-server           # Create server only
   $0 cloud-test --provision-only           # Provision existing server
   $0 cloud-test --destroy                  # Tear down server
+  $0 prod --worker symbioen-1 --dry-run    # Tenant worker: print the plan
+  $0 prod --worker symbioen-1              # Tenant worker: create, provision, join
+  $0 prod --worker symbioen-1 --destroy    # Tenant worker: drain/remove from the cluster, then delete
 
-Environment file expected at: envs/<env>/env.properties with variables:
+Server / private worker: envs/<env>/env.properties with
   HOSTNAME=example.domain.tld
   ACME_EMAIL=admin@example.com
   HCLOUD_SERVER_TYPE=cax11         # Hetzner Cloud server type (default: cax11)
-  HCLOUD_LOCATION=hel1             # Datacenter (default: hel1)
+  HCLOUD_LOCATION=hel1             # Location (default: hel1)
   HCLOUD_IMAGE=ubuntu-24.04        # OS image (default: ubuntu-24.04)
   HCLOUD_NETWORK_ZONE=eu-central   # For private network (default: eu-central)
   PRIVATE_IP=10.0.0.2/16           # Private network IP
-  # Optional: worker mode
+  # Optional: private worker mode
   # MASTER_PRIVATE_IP=10.0.0.1
   # MASTER_HOSTNAME=master.example.domain.tld
+
+Tenant worker (--worker NAME): envs/<env>/NAME/env.properties with
+  TENANT=<tenant>                  # NAME must be <tenant>-*
+  MASTER_VLAN_IP=100.x.y.z         # cluster server's Tailscale IP
+  MASTER_HOSTNAME=<server hostname>
+  HCLOUD_SERVER_TYPE=cx33          # default: cx33
+  HCLOUD_LOCATION=hel1             # default: hel1
+  Token: envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt (or HCLOUD_TOKEN_FILE)
+  See docs/HETZNER-CLOUD-TENANT.md.
 USAGE
 }
 
@@ -76,6 +110,10 @@ function warn(){ echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 function err(){ echo -e "${RED}[ERROR]${NC} $*" >&2; }
 function debug(){ $DEBUG && echo -e "${YELLOW}[DEBUG]${NC} $*" >&2 || true; }
 function dbg(){ if $DEBUG; then echo -e "${YELLOW}[DEBUG]${NC} $*" >&2; fi }
+# Dry-run output goes to the script's stdout (fd 3, also from inside $(...)), so a plan can be
+# captured with > plan.txt while the log stays on stderr.
+exec 3>&1
+function plan(){ echo -e "[DRY-RUN] $*" >&3; }
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   usage
@@ -91,8 +129,8 @@ if [[ ${1:-} == "" ]]; then
 fi
 
 ENV_NAME=$1; shift || true
-ENV_DIR="${ENV_ROOT}/${ENV_NAME}"
-ENV_FILE="${ENV_DIR}/env.properties"
+CLUSTER_DIR="${ENV_ROOT}/${ENV_NAME}"
+ENV_DIR="${CLUSTER_DIR}"
 
 SSH_KEY="${SSH_KEY:-}"
 CREATE_SERVER=true
@@ -101,7 +139,11 @@ SKIP_DIAGNOSE=false
 SKIP_DNS=false
 SKIP_TAILSCALE=false
 DESTROY=false
+DESTROY_CONFIRM=""
+DRY_RUN=false
 DEBUG=false
+WORKER_NAME=""
+NO_JOIN=false
 
 # Default behavior: run everything unless specifically limited
 DEFAULT_RUN_ALL=true
@@ -110,10 +152,14 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --ssh-key)
       SSH_KEY="$2"; shift 2;;
+    --worker)
+      WORKER_NAME="$2"; shift 2;;
     --create-server)
       CREATE_SERVER=true; PROVISION_SERVER=false; DEFAULT_RUN_ALL=false; shift;;
     --provision-only)
       CREATE_SERVER=false; PROVISION_SERVER=true; DEFAULT_RUN_ALL=false; shift;;
+    --no-join)
+      NO_JOIN=true; shift;;
     --skip-diagnose)
       SKIP_DIAGNOSE=true; shift;;
     --skip-dns)
@@ -122,6 +168,10 @@ while [[ $# -gt 0 ]]; do
       SKIP_TAILSCALE=true; shift;;
     --destroy)
       DESTROY=true; shift;;
+    --confirm)
+      DESTROY_CONFIRM="$2"; shift 2;;
+    --dry-run)
+      DRY_RUN=true; shift;;
     --debug)
       DEBUG=true; shift;;
     -h|--help)
@@ -131,48 +181,114 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Validate local keys before continuing (the SSH key goes onto the node; the age key decrypts sops copies)
+if ! provision::validate_local_keys; then
+  if $DRY_RUN; then
+    provision::warn "Missing local keys (continuing: --dry-run)."
+  else
+    provision::warn "Missing required local keys. Aborting provisioning."
+    exit 1
+  fi
+fi
+
+# --- Node kind ---
+# NODE_ROLE: server | private-worker | tenant-worker
+TENANT_MODE=false
+if [[ -n "$WORKER_NAME" ]]; then
+  TENANT_MODE=true
+  ENV_DIR="${CLUSTER_DIR}/${WORKER_NAME}"
+fi
+ENV_FILE="${ENV_DIR}/env.properties"
+
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo -e "${RED}Environment file not found: ${ENV_FILE}${NC}"
   exit 1
 fi
 
+# bash sets HOSTNAME to the local machine's name; a tenant worker's env.properties need not set it.
+$TENANT_MODE && unset HOSTNAME
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
-# Defaults for cloud-specific properties
-HCLOUD_SERVER_TYPE="${HCLOUD_SERVER_TYPE:-cax11}"
-HCLOUD_LOCATION="${HCLOUD_LOCATION:-hel1}"
-HCLOUD_IMAGE="${HCLOUD_IMAGE:-ubuntu-24.04}"
-HCLOUD_NETWORK_ZONE="${HCLOUD_NETWORK_ZONE:-eu-central}"
-
-# Validate required properties
-REQUIRED=(HOSTNAME PRIVATE_IP)
-for v in "${REQUIRED[@]}"; do
-  if [[ -z "${!v:-}" ]]; then
-    echo -e "${RED}Missing required variable ${v} in ${ENV_FILE}${NC}"; exit 1
+if $TENANT_MODE; then
+  NODE_ROLE=tenant-worker
+  NODE_NAME="${WORKER_NAME//_/-}"
+  if [[ -z "${TENANT:-}" ]]; then
+    err "--worker is the tenant worker mode: set TENANT=<tenant> in ${ENV_FILE}"; exit 1
   fi
-done
-
-# Ensure PRIVATE_IP has CIDR notation
-if [[ "${PRIVATE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  PRIVATE_IP="${PRIVATE_IP}/16"
-fi
-PRIVATE_IP_ADDR="${PRIVATE_IP%/*}"
-
-# Determine if this node should join an existing master as a worker
-WORKER_MODE=false
-if [[ -n "${MASTER_PRIVATE_IP:-}" ]]; then
+  if [[ ! "$TENANT" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    err "TENANT must be a DNS label: ${TENANT}"; exit 1
+  fi
+  if [[ ! "$NODE_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ || "$NODE_NAME" != "${TENANT}-"* ]]; then
+    err "A worker of tenant ${TENANT} must be named ${TENANT}-<n> (got ${NODE_NAME}): the admission policies recognise tenant nodes by name"
+    exit 1
+  fi
+  for v in MASTER_VLAN_IP MASTER_HOSTNAME; do
+    if [[ -z "${!v:-}" ]]; then
+      err "Missing required variable ${v} in ${ENV_FILE}"; exit 1
+    fi
+  done
+  # Tailscale is the only way in: the node's public interface admits nothing else.
+  if $SKIP_TAILSCALE; then
+    err "--skip-tailscale is not possible for a tenant worker: it joins the cluster over Tailscale"; exit 1
+  fi
+  SKIP_DNS=true
+  HOSTNAME="${NODE_NAME}"
+  HCLOUD_SERVER_TYPE="${HCLOUD_SERVER_TYPE:-cx33}"
+  HCLOUD_LOCATION="${HCLOUD_LOCATION:-hel1}"
+  HCLOUD_IMAGE="${HCLOUD_IMAGE:-ubuntu-24.04}"
+  HCLOUD_SERVER_NAME="${NODE_NAME}"
+  HCLOUD_FIREWALL_NAME="${HCLOUD_FIREWALL_NAME:-${NODE_NAME}}"
+  HCLOUD_FIREWALL_SSH_CIDRS="${HCLOUD_FIREWALL_SSH_CIDRS:-}"
+  TAILSCALE_TAG="${TAILSCALE_TAG:-tag:tenant-${TENANT}}"
+  if [[ ! "$TAILSCALE_TAG" =~ ^tag:[A-Za-z0-9-]+$ ]]; then
+    err "TAILSCALE_TAG must look like tag:<name> (got ${TAILSCALE_TAG})"; exit 1
+  fi
+  PRIVATE_IP_ADDR=""
   WORKER_MODE=true
-  if [[ -z "${MASTER_HOSTNAME:-}" ]]; then
-    echo -e "${RED}MASTER_PRIVATE_IP is set but MASTER_HOSTNAME is missing in ${ENV_FILE}${NC}"; exit 1
+else
+  # Defaults for cloud-specific properties
+  HCLOUD_SERVER_TYPE="${HCLOUD_SERVER_TYPE:-cax11}"
+  HCLOUD_LOCATION="${HCLOUD_LOCATION:-hel1}"
+  HCLOUD_IMAGE="${HCLOUD_IMAGE:-ubuntu-24.04}"
+  HCLOUD_NETWORK_ZONE="${HCLOUD_NETWORK_ZONE:-eu-central}"
+  TAILSCALE_TAG=""
+
+  # Validate required properties
+  REQUIRED=(HOSTNAME PRIVATE_IP)
+  for v in "${REQUIRED[@]}"; do
+    if [[ -z "${!v:-}" ]]; then
+      echo -e "${RED}Missing required variable ${v} in ${ENV_FILE}${NC}"; exit 1
+    fi
+  done
+
+  # Ensure PRIVATE_IP has CIDR notation
+  if [[ "${PRIVATE_IP}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PRIVATE_IP="${PRIVATE_IP}/16"
   fi
+  PRIVATE_IP_ADDR="${PRIVATE_IP%/*}"
+
+  # Determine if this node should join an existing master as a worker
+  WORKER_MODE=false
+  NODE_ROLE=server
+  if [[ -n "${MASTER_PRIVATE_IP:-}" ]]; then
+    WORKER_MODE=true
+    NODE_ROLE=private-worker
+    if [[ -z "${MASTER_HOSTNAME:-}" ]]; then
+      echo -e "${RED}MASTER_PRIVATE_IP is set but MASTER_HOSTNAME is missing in ${ENV_FILE}${NC}"; exit 1
+    fi
+  fi
+
+  # Derive server name from env name (Hetzner Cloud server names)
+  HCLOUD_SERVER_NAME="${ENV_NAME}"
+
+  # Network name derived from hostname base domain
+  HCLOUD_NETWORK_NAME="lh-network"
 fi
 
-# Derive server name from env name (Hetzner Cloud server names)
-HCLOUD_SERVER_NAME="${ENV_NAME}"
-
-# Network name derived from hostname base domain
-HCLOUD_NETWORK_NAME="lh-network"
+# Labels on every Hetzner resource this script creates, so destroy and a later run find them.
+HCLOUD_LABELS_JSON=$(jq -cn --arg node "$HCLOUD_SERVER_NAME" --arg tenant "${TENANT:-}" \
+  '{"managed-by": "infra-skills", "node": $node} + (if $tenant != "" then {tenant: $tenant} else {} end)')
 
 SSH_PORT=22
 
@@ -202,39 +318,107 @@ SSH_PUBKEY_CONTENT=$(cat "${PROV_SSH_PUB}")
 # Hetzner Cloud API functions
 # ============================================================================
 
-function hcloud::read_token(){
-  local token_file="${ENV_ROOT}/shared/secrets.plain/hetzner-cloud-token.txt"
-  if [[ ! -f "$token_file" ]]; then
-    err "Hetzner Cloud API token not found: $token_file"
-    err ""
-    err "Create this file with your Hetzner Cloud API token:"
-    err "  1. Go to https://console.hetzner.cloud → Project → Security → API Tokens"
-    err "  2. Create a Read/Write token"
-    err "  3. Save it to: $token_file"
-    err "  4. Encrypt with: tools/sops/encrypt.sh shared hetzner-cloud-token.txt"
-    return 1
+HCLOUD_API="${HCLOUD_API:-https://api.hetzner.cloud/v1}"
+HCLOUD_TOKEN=""
+
+# Where the API token of the project the node lives in is read from.
+# A tenant worker lives in the tenant's own project: only its own token file is ever used, never
+# the shared one and never an HCLOUD_TOKEN from the environment (the hcloud CLI uses that variable,
+# so it may hold the platform's own project).
+function hcloud::token_file(){
+  if $TENANT_MODE; then
+    if [[ -n "${HCLOUD_TOKEN_FILE:-}" ]]; then
+      if [[ "$HCLOUD_TOKEN_FILE" == /* ]]; then echo "$HCLOUD_TOKEN_FILE"; else echo "${ENV_ROOT}/${HCLOUD_TOKEN_FILE}"; fi
+    else
+      echo "${CLUSTER_DIR}/secrets.plain/hetzner-cloud-token-${TENANT}.txt"
+    fi
+  else
+    echo "${ENV_ROOT}/shared/secrets.plain/hetzner-cloud-token.txt"
   fi
-  HCLOUD_TOKEN=$(tr -d '\n\r' < "$token_file" | xargs)
+}
+
+function hcloud::read_token(){
+  local token_file sops_file
+  token_file=$(hcloud::token_file)
+  if [[ -f "$token_file" ]]; then
+    HCLOUD_TOKEN=$(tr -d '\n\r' < "$token_file" | xargs)
+  else
+    sops_file="${token_file/\/secrets.plain\//\/secrets.sops\/}"
+    if [[ "$sops_file" != "$token_file" && -f "$sops_file" ]]; then
+      HCLOUD_TOKEN=$(sops -d "$sops_file" 2>/dev/null | tr -d '\n\r' | xargs) || HCLOUD_TOKEN=""
+      [[ -z "$HCLOUD_TOKEN" ]] && { err "Cannot decrypt ${sops_file} (SOPS_AGE_KEY_FILE?)"; return 1; }
+    else
+      err "Hetzner Cloud API token not found: $token_file"
+      err ""
+      err "Create this file with the project's Hetzner Cloud API token:"
+      err "  1. Go to https://console.hetzner.cloud → Project → Security → API Tokens"
+      err "  2. Create a Read & Write token$($TENANT_MODE && echo " in the TENANT's project")"
+      err "  3. Save it to: $token_file"
+      err "  4. Encrypt with: tools/sops/encrypt.sh $($TENANT_MODE && echo "${ENV_NAME}" || echo shared) $(basename "$token_file")"
+      return 1
+    fi
+  fi
   if [[ -z "${HCLOUD_TOKEN:-}" ]]; then
     err "Hetzner Cloud API token file is empty: $token_file"
     return 1
   fi
-  [[ -n "${HCLOUD_TOKEN:-}" ]]
+  if $TENANT_MODE; then
+    # The tenant's node must not land in the platform's project (billing, and the platform's
+    # token would be the one the node's owner could act on). Compare without printing either.
+    local shared="${ENV_ROOT}/shared/secrets.plain/hetzner-cloud-token.txt"
+    if [[ -f "$shared" && "$(tr -d '\n\r' < "$shared" | xargs)" == "$HCLOUD_TOKEN" ]]; then
+      err "$(hcloud::token_file) holds the shared (platform) project token, not the tenant's"
+      return 1
+    fi
+  fi
+  dbg "Hetzner Cloud token read from $(hcloud::token_file) (or its sops copy)"
 }
 
-# Curl wrapper for Hetzner Cloud API
-# Usage: hcloud::api METHOD PATH [curl-args...]
+# Body shown in a dry-run plan: user_data (it carries a Tailscale auth key) is replaced by its size.
+function hcloud::redact_body(){
+  jq -c 'if type == "object" and has("user_data") then .user_data = "<cloud-init: \(.user_data | length) bytes, not shown>" else . end' 2>/dev/null <<<"$1" || echo "<body>"
+}
+
+# Curl wrapper for the Hetzner Cloud API.
+# Usage: hcloud::api METHOD PATH [JSON_BODY]
+# The token goes to curl through a config on a file descriptor and the body through a 0600 temp file,
+# so neither shows up in the process list.
+# --dry-run: a GET runs when a token is loaded (read-only) and is only printed otherwise; every other
+# method is printed and never sent, and answers with a stand-in so the plan can go on.
 function hcloud::api(){
-  local method="$1" path="$2"; shift 2
-  local url="https://api.hetzner.cloud/v1${path}"
+  local method="$1" path="$2" data="${3:-}"
+  local url="${HCLOUD_API}${path}"
   dbg "HCLOUD ${method} ${url}"
 
-  local response http body
+  if $DRY_RUN && { [[ "$method" != GET ]] || [[ -z "$HCLOUD_TOKEN" ]] || [[ "$path" == *"<"* ]]; }; then
+    if [[ -n "$data" ]]; then plan "HCLOUD ${method} ${url} $(hcloud::redact_body "$data")"; else plan "HCLOUD ${method} ${url}"; fi
+    HCLOUD_LAST_HTTP="000"; HCLOUD_LAST_BODY=""
+    case "${method} ${path}" in
+      "POST /ssh_keys")  printf '%s' '{"ssh_key":{"id":"<ssh-key-id>"}}' ;;
+      "POST /firewalls") printf '%s' '{"firewall":{"id":"<firewall-id>"}}' ;;
+      "POST /servers")   printf '%s' '{"server":{"id":"<server-id>","status":"running","public_net":{"ipv4":{"ip":"<public-ipv4>"},"firewalls":[]}},"action":{"id":"<action-id>"}}' ;;
+      "DELETE /servers/"*) printf '%s' '{"action":{"id":"<action-id>","status":"success"}}' ;;
+      *) printf '%s' '{}' ;;
+    esac
+    return 0
+  fi
+
+  $DRY_RUN && plan "HCLOUD ${method} ${url}  (read-only, run)"
+  local response http body body_file="" curl_rc
+  local -a data_args=()
+  if [[ -n "$data" ]]; then
+    body_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/hcloud-body.XXXXXX")
+    printf '%s' "$data" >"$body_file"
+    data_args=(--data-binary "@${body_file}")
+  fi
+  set +e
   response=$(curl -sS -X "$method" "$url" \
-    -H "Authorization: Bearer ${HCLOUD_TOKEN}" \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$HCLOUD_TOKEN") \
     -H "Content-Type: application/json" \
-    "$@" -w "\n%{http_code}" 2>&1)
-  local curl_rc=$?
+    ${data_args[@]+"${data_args[@]}"} -w "\n%{http_code}" 2>&1)
+  curl_rc=$?
+  set -e
+  [[ -n "$body_file" ]] && rm -f "$body_file"
 
   if [[ $curl_rc -ne 0 ]]; then
     err "HCLOUD curl failed with exit code $curl_rc"
@@ -264,6 +448,11 @@ function hcloud::api(){
   fi
 }
 
+# The API's own error message of the last failed call, one line.
+function hcloud::last_error(){
+  printf '%s' "${HCLOUD_LAST_BODY:-}" | jq -r '.error | "\(.code): \(.message)"' 2>/dev/null || printf '%s' "${HCLOUD_LAST_BODY:-no response}"
+}
+
 # Get server by name
 # Returns server JSON or empty string
 function hcloud::get_server(){
@@ -271,12 +460,58 @@ function hcloud::get_server(){
   local out
   out=$(hcloud::api GET "/servers?name=${name}" 2>/dev/null) || return 1
   local server
-  server=$(printf '%s' "$out" | jq -r '.servers[0] // empty' 2>/dev/null)
+  server=$(printf '%s' "$out" | jq -c '.servers[0] // empty' 2>/dev/null)
   if [[ -n "$server" && "$server" != "null" ]]; then
     printf '%s' "$server"
     return 0
   fi
   return 1
+}
+
+# Check that a server type exists, is x86 or ARM as expected, is not deprecated and is currently
+# available in the location (server_types[].locations[].available; GET /datacenters is gone since
+# 2026-10-01). Prints the monthly price. On "not available" it lists what is available there.
+function hcloud::check_server_type(){
+  local type="$1" location="$2" out st
+  out=$(hcloud::api GET "/server_types?name=${type}") || { err "Cannot read server type ${type}: $(hcloud::last_error)"; return 1; }
+  st=$(printf '%s' "$out" | jq -c '.server_types[0] // empty')
+  if [[ -z "$st" ]]; then
+    if $DRY_RUN && [[ -z "$HCLOUD_TOKEN" ]]; then
+      plan "(no token: server type ${type} in ${location} not checked)"
+      return 0
+    fi
+    err "Unknown Hetzner Cloud server type: ${type}"
+    return 1
+  fi
+  local summary available deprecated
+  summary=$(printf '%s' "$st" | jq -r --arg loc "$location" '
+    "\(.name): \(.architecture), \(.cores) vCPU (\(.cpu_type)), \(.memory) GB RAM, \(.disk) GB disk, " +
+    ((.prices[] | select(.location == $loc) | "EUR \(.price_monthly.net | tonumber * 100 | round / 100)/month net in \($loc)") // "no price in \($loc)")')
+  available=$(printf '%s' "$st" | jq -r --arg loc "$location" '[.locations[]? | select(.name == $loc) | .available] | if length == 0 then "unknown" else (first | tostring) end')
+  deprecated=$(printf '%s' "$st" | jq -r --arg loc "$location" '(.deprecation.unavailable_after // ([.locations[]? | select(.name == $loc) | .deprecation.unavailable_after // empty] | first)) // empty')
+  info "Server type ${summary}"
+  if [[ -n "$deprecated" ]]; then
+    err "Server type ${type} is deprecated in ${location} (unavailable after ${deprecated})"
+  fi
+  if [[ "$available" != "true" || -n "$deprecated" ]]; then
+    [[ -z "$deprecated" ]] && err "Server type ${type} is not available in ${location} right now (available=${available})"
+    local mem arch all
+    mem=$(printf '%s' "$st" | jq -r '.memory')
+    arch=$(printf '%s' "$st" | jq -r '.architecture')
+    all=$(hcloud::api GET "/server_types?per_page=50") || all='{}'
+    info "Available ${arch} types in ${location} with at least ${mem} GB (set HCLOUD_SERVER_TYPE):"
+    printf '%s' "$all" | jq -r --arg loc "$location" --arg arch "$arch" --argjson mem "$mem" '
+      [.server_types[]? | select(.architecture == $arch and .memory >= $mem and .deprecation == null)
+        | select(any(.locations[]?; .name == $loc and .available == true))
+        | {name, cores, memory, disk, cpu_type, price: ([.prices[] | select(.location == $loc) | .price_monthly.net | tonumber] | first)}]
+      | sort_by(.price)[] | "  \(.name)\t\(.cores) vCPU \(.cpu_type)\t\(.memory) GB\t\(.disk) GB\tEUR \(.price * 100 | round / 100)/month net"' >&2
+    if $DRY_RUN; then
+      warn "(--dry-run: continuing with ${type} anyway)"
+      return 0
+    fi
+    return 1
+  fi
+  ok "Server type ${type} is available in ${location}"
 }
 
 # Register SSH public key (idempotent)
@@ -293,24 +528,25 @@ function hcloud::create_ssh_key(){
     return 0
   fi
   # Create new key
-  local create_out
-  create_out=$(hcloud::api POST "/ssh_keys" \
-    -d "{\"name\":\"${name}\",\"public_key\":\"${pubkey}\"}" 2>/dev/null) || {
+  local create_out body
+  body=$(jq -cn --arg name "$name" --arg key "$pubkey" --argjson labels "$HCLOUD_LABELS_JSON" \
+    '{name: $name, public_key: $key, labels: ($labels | del(.node))}')
+  create_out=$(hcloud::api POST "/ssh_keys" "$body" 2>/dev/null) || {
     # Key might exist with different name but same fingerprint
     local error_code
     error_code=$(printf '%s' "${HCLOUD_LAST_BODY}" | jq -r '.error.code // empty' 2>/dev/null)
     if [[ "$error_code" == "uniqueness_error" ]]; then
-      # Find key by fingerprint
-      local fp_out all_keys
-      all_keys=$(hcloud::api GET "/ssh_keys" 2>/dev/null) || return 1
-      existing_id=$(printf '%s' "$all_keys" | jq -r ".ssh_keys[] | select(.public_key == \"${pubkey}\") | .id" 2>/dev/null | head -1)
+      # Find key by public key
+      local all_keys
+      all_keys=$(hcloud::api GET "/ssh_keys?per_page=50" 2>/dev/null) || return 1
+      existing_id=$(printf '%s' "$all_keys" | jq -r --arg key "$pubkey" '.ssh_keys[] | select(.public_key == $key) | .id' 2>/dev/null | head -1)
       if [[ -n "$existing_id" ]]; then
         dbg "SSH key already exists with different name, ID ${existing_id}"
         echo "$existing_id"
         return 0
       fi
     fi
-    err "Failed to create SSH key"
+    err "Failed to create SSH key: $(hcloud::last_error)"
     return 1
   }
   local key_id
@@ -336,19 +572,19 @@ function hcloud::ensure_network(){
   info "Creating Hetzner Cloud Network '${name}' (${ip_range})..."
   local create_out
   create_out=$(hcloud::api POST "/networks" \
-    -d "{\"name\":\"${name}\",\"ip_range\":\"${ip_range}\"}" 2>/dev/null) || {
-    err "Failed to create network '${name}'"
+    "$(jq -cn --arg name "$name" --arg range "$ip_range" '{name: $name, ip_range: $range}')" 2>/dev/null) || {
+    err "Failed to create network '${name}': $(hcloud::last_error)"
     return 1
   }
   local network_id
-  network_id=$(printf '%s' "$create_out" | jq -r '.network.id' 2>/dev/null)
+  network_id=$(printf '%s' "$create_out" | jq -r '.network.id // "<network-id>"' 2>/dev/null)
   ok "Created network '${name}' (ID: ${network_id})"
 
   # Create subnet
   info "Creating subnet in network ${network_id}..."
   hcloud::api POST "/networks/${network_id}/actions/add_subnet" \
-    -d "{\"type\":\"cloud\",\"network_zone\":\"${network_zone}\",\"ip_range\":\"${ip_range}\"}" >/dev/null 2>&1 || {
-    err "Failed to create subnet in network '${name}'"
+    "$(jq -cn --arg zone "$network_zone" --arg range "$ip_range" '{type: "cloud", network_zone: $zone, ip_range: $range}')" >/dev/null 2>&1 || {
+    err "Failed to create subnet in network '${name}': $(hcloud::last_error)"
     return 1
   }
   ok "Created subnet ${ip_range} in network '${name}'"
@@ -363,9 +599,9 @@ function hcloud::attach_to_network(){
 
   # Check if already attached
   local server_out
-  server_out=$(hcloud::api GET "/servers/${server_id}" 2>/dev/null) || return 1
+  server_out=$(hcloud::api GET "/servers/${server_id}" 2>/dev/null) || { $DRY_RUN || return 1; }
   local attached_network
-  attached_network=$(printf '%s' "$server_out" | jq -r ".server.private_net[] | select(.network == ${network_id}) | .ip // empty" 2>/dev/null)
+  attached_network=$(printf '%s' "$server_out" | jq -r --arg net "$network_id" '.server.private_net[]? | select((.network | tostring) == $net) | .ip // empty' 2>/dev/null)
   if [[ -n "$attached_network" ]]; then
     ok "Server already attached to network with IP ${attached_network}"
     return 0
@@ -374,54 +610,116 @@ function hcloud::attach_to_network(){
   set +e
   local attach_out
   attach_out=$(hcloud::api POST "/servers/${server_id}/actions/attach_to_network" \
-    -d "{\"network\":${network_id},\"ip\":\"${ip}\"}")
+    "$(jq -cn --arg net "$network_id" --arg ip "$ip" '{network: ($net | tonumber? // $net), ip: $ip}')")
   local attach_rc=$?
   set -e
   if [[ $attach_rc -ne 0 ]]; then
     err "Failed to attach server to network"
-    err "API response: ${HCLOUD_LAST_BODY:-no response}"
+    err "API response: $(hcloud::last_error)"
     return 1
   fi
   ok "Attached server to network with IP ${ip}"
 }
 
+# The firewall rules of a tenant worker. Inbound is default-deny: a Hetzner Cloud firewall drops
+# every inbound packet no rule matches. The only rule is Tailscale's direct-connection port
+# (WireGuard, udp/41641); without it Tailscale still works through DERP relays, only slower.
+# HCLOUD_FIREWALL_SSH_CIDRS (space- or comma-separated) adds public SSH for those sources: a
+# break-glass for when Tailscale on the node is down (the Hetzner console is the other one).
+# No outbound rule, so outbound stays open (apt, get.k3s.io, registries, Tailscale coordination).
+function hcloud::tenant_firewall_rules(){
+  jq -cn --arg ssh "${HCLOUD_FIREWALL_SSH_CIDRS:-}" '
+    [{direction: "in", protocol: "udp", port: "41641", source_ips: ["0.0.0.0/0", "::/0"],
+      description: "tailscale direct connections"}]
+    + (($ssh | split(",") | map(split(" ")) | add // [] | map(select(. != ""))) as $cidrs
+       | if ($cidrs | length) > 0
+         then [{direction: "in", protocol: "tcp", port: "22", source_ips: $cidrs, description: "ssh break-glass"}]
+         else [] end)'
+}
+
+# Ensure the node's firewall exists with exactly the tenant rules; return its ID.
+function hcloud::ensure_firewall(){
+  local name="$1" rules out fw_id
+  rules=$(hcloud::tenant_firewall_rules)
+  out=$(hcloud::api GET "/firewalls?name=${name}" 2>/dev/null) || { err "Cannot list firewalls: $(hcloud::last_error)"; return 1; }
+  fw_id=$(printf '%s' "$out" | jq -r '.firewalls[0].id // empty')
+  if [[ -n "$fw_id" ]]; then
+    if [[ "$(printf '%s' "$out" | jq -c '.firewalls[0].rules | map({direction, protocol, port, source_ips})')" \
+       == "$(printf '%s' "$rules" | jq -c 'map({direction, protocol, port, source_ips})')" ]]; then
+      ok "Firewall '${name}' exists with the expected rules (ID: ${fw_id})" >&2
+    else
+      info "Firewall '${name}' (ID: ${fw_id}) has other rules; setting the tenant rules..."
+      hcloud::api POST "/firewalls/${fw_id}/actions/set_rules" "$(jq -cn --argjson rules "$rules" '{rules: $rules}')" >/dev/null \
+        || { err "Cannot set firewall rules: $(hcloud::last_error)"; return 1; }
+      ok "Firewall rules set"
+    fi
+    echo "$fw_id"
+    return 0
+  fi
+  info "Creating firewall '${name}' (inbound: udp/41641 only$([[ -n "${HCLOUD_FIREWALL_SSH_CIDRS:-}" ]] && echo ", tcp/22 from ${HCLOUD_FIREWALL_SSH_CIDRS}"))..."
+  out=$(hcloud::api POST "/firewalls" "$(jq -cn --arg name "$name" --argjson rules "$rules" --argjson labels "$HCLOUD_LABELS_JSON" \
+    '{name: $name, labels: $labels, rules: $rules}')") || { err "Cannot create firewall: $(hcloud::last_error)"; return 1; }
+  fw_id=$(printf '%s' "$out" | jq -r '.firewall.id')
+  ok "Created firewall '${name}' (ID: ${fw_id})"
+  echo "$fw_id"
+}
+
+# True when the firewall is applied to the server's public interface.
+function hcloud::firewall_applied(){
+  local server_id="$1" fw_id="$2" out
+  out=$(hcloud::api GET "/servers/${server_id}") || return 1
+  printf '%s' "$out" | jq -e --arg fw "$fw_id" \
+    'any(.server.public_net.firewalls[]?; (.id | tostring) == $fw and .status == "applied")' >/dev/null
+}
+
+function hcloud::apply_firewall(){
+  local server_id="$1" fw_id="$2"
+  hcloud::api POST "/firewalls/${fw_id}/actions/apply_to_resources" \
+    "$(jq -cn --arg id "$server_id" '{apply_to: [{type: "server", server: {id: ($id | tonumber? // $id)}}]}')" >/dev/null \
+    || { err "Cannot apply firewall ${fw_id} to server ${server_id}: $(hcloud::last_error)"; return 1; }
+}
+
 # Create a server via Hetzner Cloud API
+# Usage: hcloud::create_server NAME TYPE IMAGE LOCATION SSH_KEY_ID USER_DATA [FIREWALL_ID]
 function hcloud::create_server(){
-  local name="$1" server_type="$2" image="$3" location="$4" ssh_key_id="$5" user_data="$6"
+  local name="$1" server_type="$2" image="$3" location="$4" ssh_key_id="$5" user_data="$6" firewall_id="${7:-}"
 
   info "Creating Hetzner Cloud server '${name}' (${server_type} in ${location})..."
 
-  # Build request body
+  # Build request body. A firewall given here is in force from the first boot.
   local request_body
   request_body=$(jq -n \
     --arg name "$name" \
     --arg server_type "$server_type" \
     --arg image "$image" \
     --arg location "$location" \
-    --argjson ssh_keys "[${ssh_key_id}]" \
+    --arg ssh_key "$ssh_key_id" \
     --arg user_data "$user_data" \
+    --arg firewall "$firewall_id" \
+    --argjson labels "$HCLOUD_LABELS_JSON" \
     '{
       name: $name,
       server_type: $server_type,
       image: $image,
       location: $location,
-      ssh_keys: $ssh_keys,
+      ssh_keys: [($ssh_key | tonumber? // $ssh_key)],
       user_data: $user_data,
+      labels: $labels,
+      public_net: {enable_ipv4: true, enable_ipv6: true},
       start_after_create: true
-    }') || {
+    } + (if $firewall != "" then {firewalls: [{firewall: ($firewall | tonumber? // $firewall)}]} else {} end)') || {
     err "Failed to build server creation request JSON"
     return 1
   }
-  dbg "Server creation request body (truncated): ${request_body:0:200}..."
 
   local create_out
   set +e
-  create_out=$(hcloud::api POST "/servers" -d "$request_body")
+  create_out=$(hcloud::api POST "/servers" "$request_body")
   local create_rc=$?
   set -e
   if [[ $create_rc -ne 0 ]]; then
     err "Failed to create server '${name}'"
-    err "API response: ${HCLOUD_LAST_BODY:-no response}"
+    err "API response: $(hcloud::last_error)"
     return 1
   fi
 
@@ -437,6 +735,7 @@ function hcloud::create_server(){
 # Wait for server action to complete
 function hcloud::wait_for_action(){
   local action_id="$1" timeout="${2:-120}"
+  $DRY_RUN && return 0
   local elapsed=0
   while [[ $elapsed -lt $timeout ]]; do
     local out status
@@ -458,6 +757,7 @@ function hcloud::wait_for_action(){
 # Wait for server to have status "running"
 function hcloud::wait_for_running(){
   local server_id="$1" timeout="${2:-120}"
+  if $DRY_RUN; then plan "wait until server ${server_id} is running"; return 0; fi
   info "Waiting for server ${server_id} to be running..."
   local elapsed=0
   while [[ $elapsed -lt $timeout ]]; do
@@ -476,14 +776,16 @@ function hcloud::wait_for_running(){
   return 1
 }
 
-# Delete server
+# Delete server and wait for the deletion to finish
 function hcloud::delete_server(){
-  local server_id="$1"
+  local server_id="$1" out action_id
   info "Deleting server ${server_id}..."
-  hcloud::api DELETE "/servers/${server_id}" >/dev/null 2>&1 || {
-    err "Failed to delete server ${server_id}"
+  out=$(hcloud::api DELETE "/servers/${server_id}") || {
+    err "Failed to delete server ${server_id}: $(hcloud::last_error)"
     return 1
   }
+  action_id=$(printf '%s' "$out" | jq -r '.action.id // empty')
+  [[ -n "$action_id" ]] && { hcloud::wait_for_action "$action_id" 180 || return 1; }
   ok "Server ${server_id} deleted"
 }
 
@@ -492,7 +794,7 @@ function hcloud::set_rdns(){
   local server_id="$1" ip="$2" hostname="$3"
   info "Setting reverse DNS for ${ip} -> ${hostname}..."
   hcloud::api POST "/servers/${server_id}/actions/change_dns_ptr" \
-    -d "{\"ip\":\"${ip}\",\"dns_ptr\":\"${hostname}\"}" >/dev/null 2>&1 || {
+    "$(jq -cn --arg ip "$ip" --arg ptr "$hostname" '{ip: $ip, dns_ptr: $ptr}')" >/dev/null 2>&1 || {
     warn "Failed to set reverse DNS (non-fatal)"
     return 0
   }
@@ -502,6 +804,8 @@ function hcloud::set_rdns(){
 # ============================================================================
 # Tailscale API functions (same pattern as baremetal script)
 # ============================================================================
+
+TS_API_TOKEN=""
 
 function tailscale::read_api_token(){
   local ts_file="${ENV_ROOT}/shared/secrets.plain/tailscale-api-key.txt"
@@ -513,16 +817,34 @@ function tailscale::read_api_token(){
   [[ -n "${TS_API_TOKEN:-}" ]]
 }
 
+# Usage: tailscale::api METHOD PATH [JSON_BODY]  (dry-run: as hcloud::api)
 function tailscale::api(){
-  local method="$1" path="$2"; shift 2
+  local method="$1" path="$2" data="${3:-}"
   local url="https://api.tailscale.com/api/v2${path}"
   dbg "TAILSCALE ${method} ${url}"
 
-  local response http body
-  response=$(curl -sS -u "${TS_API_TOKEN}:" -X "$method" \
-    -H 'Content-Type: application/json' \
-    "$url" "$@" -w "\n%{http_code}" 2>&1)
-  local curl_rc=$?
+  if $DRY_RUN && { [[ "$method" != GET ]] || [[ -z "$TS_API_TOKEN" ]] || [[ "$path" == *"<"* ]]; }; then
+    plan "TAILSCALE ${method} ${url}${data:+ ${data}}"
+    TS_LAST_HTTP="000"; TS_LAST_BODY=""
+    if [[ "$method" == POST && "$path" == */keys ]]; then
+      printf '%s' '{"key":"<tailscale-auth-key>"}'
+    else
+      printf '%s' '{}'
+    fi
+    return 0
+  fi
+
+  $DRY_RUN && plan "TAILSCALE ${method} ${url}  (read-only, run)"
+  local response http body curl_rc
+  local -a data_args=()
+  [[ -n "$data" ]] && data_args=(--data-binary "$data")
+  set +e
+  response=$(curl -sS -X "$method" \
+    -K <(printf 'user = "%s:"\n' "$TS_API_TOKEN") \
+    -H 'Content-Type: application/json' -H 'Accept: application/json' \
+    "$url" ${data_args[@]+"${data_args[@]}"} -w "\n%{http_code}" 2>&1)
+  curl_rc=$?
+  set -e
 
   if [[ $curl_rc -ne 0 ]]; then
     err "TAILSCALE curl failed with exit code $curl_rc"
@@ -546,67 +868,35 @@ function tailscale::api(){
   fi
 }
 
+# "-" is the API's alias for the tailnet of the key.
 function tailscale::get_tailnet(){
-  local out
-  out=$(tailscale::api GET "/tailnet" 2>/dev/null || true)
-  if [[ -n "$out" ]] && command -v jq >/dev/null 2>&1; then
-    printf '%s' "$out" | jq -r '.name // empty' 2>/dev/null | head -1
-  else
-    echo "-"
-  fi
+  echo "-"
 }
 
+# Create a one-off auth key: single use, valid one hour, preauthorized.
+# Usage: tailscale::create_authkey HOSTNAME [EPHEMERAL] [PREAUTHORIZED] [TAG]
+# With TAG the device joins as that tag (tagged devices have key expiry off by default). Minting a
+# tagged key needs the API key's owner to be an admin or an owner of the tag in the tailnet policy
+# file (tagOwners).
 function tailscale::create_authkey(){
   local hostname="$1"
   local ephemeral="${2:-false}"
   local preauthorized="${3:-true}"
+  local tag="${4:-}"
 
-  info "Creating Tailscale auth key for ${hostname}..."
+  info "Creating Tailscale auth key for ${hostname}${tag:+ (${tag})}..."
 
-  local tailnet
-  tailnet=$(tailscale::get_tailnet)
-  [[ -z "$tailnet" || "$tailnet" == "tailnet" ]] && tailnet="-"
-
-  local safe_hostname
+  local safe_hostname json_data out key
   safe_hostname=$(printf '%s' "$hostname" | tr '.' '-' | tr -cd 'A-Za-z0-9-_')
+  json_data=$(jq -cn --argjson eph "$ephemeral" --argjson pre "$preauthorized" --arg tag "$tag" --arg desc "Provisioning ${safe_hostname}" '{
+    capabilities: {devices: {create: {reusable: false, ephemeral: $eph, preauthorized: $pre,
+      tags: (if $tag != "" then [$tag] else [] end)}}},
+    expirySeconds: 3600,
+    description: ($desc | .[0:50])
+  }')
 
-  local json_data
-  json_data=$(cat <<JSON
-{
-  "capabilities": {
-    "devices": {
-      "create": {
-        "reusable": false,
-        "ephemeral": ${ephemeral},
-        "preauthorized": ${preauthorized},
-        "tags": []
-      }
-    }
-  },
-  "expirySeconds": 3600,
-  "description": "Provisioning for ${safe_hostname}"
-}
-JSON
-)
-
-  local out http body
-  out=$(curl -sS -u "${TS_API_TOKEN}:" -X POST \
-    -H 'Content-Type: application/json' \
-    "https://api.tailscale.com/api/v2/tailnet/${tailnet}/keys" \
-    -d "${json_data}" -w "\n%{http_code}" 2>&1)
-  local rc=$?
-
-  if [[ $rc -ne 0 ]]; then
-    err "Tailscale API curl failed with exit code $rc"
-    return 1
-  fi
-
-  http=$(printf "%s" "$out" | tail -n1)
-  body=$(printf "%s\n" "$out" | sed '$d')
-
-  if [[ "$http" =~ ^2[0-9][0-9]$ ]] && command -v jq >/dev/null 2>&1; then
-    local key
-    key=$(printf '%s' "$body" | jq -r '.key // empty' 2>/dev/null)
+  if out=$(tailscale::api POST "/tailnet/$(tailscale::get_tailnet)/keys" "$json_data"); then
+    key=$(printf '%s' "$out" | jq -r '.key // empty' 2>/dev/null)
     if [[ -n "$key" ]]; then
       ok "Created Tailscale auth key"
       echo "$key"
@@ -614,34 +904,26 @@ JSON
     fi
   fi
 
-  warn "Failed to create Tailscale auth key via API (HTTP: ${http:-unknown})"
+  warn "Failed to create Tailscale auth key via API (HTTP: ${TS_LAST_HTTP:-unknown}): $(printf '%s' "${TS_LAST_BODY:-}" | jq -r '.message // empty' 2>/dev/null)"
+  [[ -n "$tag" ]] && warn "A tagged key needs ${tag} in tagOwners of the tailnet policy, owned by the API key's user (or an admin)"
   return 1
 }
 
-function tailscale::get_device_id(){
-  local hostname="$1"
-  local tailnet
-  tailnet=$(tailscale::get_tailnet)
-  [[ -z "$tailnet" || "$tailnet" == "tailnet" ]] && tailnet="-"
+# The devices of one node: same hostname, and in tenant mode also carrying the tenant tag, so that
+# a same-named device of someone else on a shared tailnet is never matched (or deleted).
+function tailscale::devices(){
+  local hostname="$1" out
+  out=$(tailscale::api GET "/tailnet/$(tailscale::get_tailnet)/devices" 2>/dev/null) || return 0
+  printf '%s' "$out" | jq -c --arg h "$hostname" --arg tag "${TAILSCALE_TAG:-}" \
+    '.devices[]? | select(.hostname == $h) | select($tag == "" or ((.tags // []) | index($tag)))' 2>/dev/null || true
+}
 
-  local out
-  out=$(tailscale::api GET "/tailnet/${tailnet}/devices" 2>/dev/null || true)
-  if [[ -n "$out" ]] && command -v jq >/dev/null 2>&1; then
-    printf '%s' "$out" | jq -r ".devices[] | select(.hostname == \"${hostname}\") | .id" 2>/dev/null | head -1
-  fi
+function tailscale::get_device_id(){
+  tailscale::devices "$1" | jq -r '.id' | head -1
 }
 
 function tailscale::get_device_ip(){
-  local hostname="$1"
-  local tailnet
-  tailnet=$(tailscale::get_tailnet)
-  [[ -z "$tailnet" || "$tailnet" == "tailnet" ]] && tailnet="-"
-
-  local out
-  out=$(tailscale::api GET "/tailnet/${tailnet}/devices" 2>/dev/null || true)
-  if [[ -n "$out" ]] && command -v jq >/dev/null 2>&1; then
-    printf '%s' "$out" | jq -r ".devices[] | select(.hostname == \"$hostname\") | .addresses[] | select(startswith(\"100.\")) | select(contains(\":\") | not)" 2>/dev/null | head -1
-  fi
+  tailscale::devices "$1" | jq -r '.addresses[]? | select(test("^100\\."))' | head -1
 }
 
 function tailscale::delete_device(){
@@ -654,21 +936,36 @@ function tailscale::delete_device(){
   ok "Deleted Tailscale device ${device_id}"
 }
 
+# A tagged tenant node is only as isolated as the tailnet policy makes it. Check (read-only) that
+# the tag exists in tagOwners (else Tailscale refuses the tagged auth key) and that no rule lets it,
+# or every source ("*"), reach every destination: with the default allow-all policy the tenant's
+# node would reach every device on the tailnet. docs/HETZNER-CLOUD-TENANT.md has the rules to use.
+# Prints one problem per line; returns 1 when there is one. TAILSCALE_POLICY_CHECK=warn downgrades
+# the refusal in tenant::preflight (a tailnet of the tenant's own, a throwaway test tailnet).
+function tailscale::policy_problems(){
+  local tag="$1" policy
+  policy=$(tailscale::api GET "/tailnet/$(tailscale::get_tailnet)/acl") || {
+    echo "cannot read the tailnet policy (HTTP ${TS_LAST_HTTP:-?}): check it by hand"; return 1; }
+  printf '%s' "$policy" | jq -r --arg tag "$tag" '
+    def from_tag: (.src // []) | any(. == "*" or . == $tag);
+    (if ((.tagOwners // {}) | has($tag)) then empty
+     else "\($tag) is not in tagOwners: Tailscale refuses an auth key with it" end),
+    ((.acls // [])[] | select((.action // "accept") == "accept" and from_tag and ((.dst // []) | any(startswith("*:"))))
+     | "acls rule src=\(.src | join(",")) dst=\(.dst | join(",")) lets \($tag) reach every device"),
+    ((.grants // [])[] | select(from_tag and ((.dst // []) | any(. == "*")))
+     | "grants rule src=\(.src | join(",")) dst=\(.dst | join(",")) lets \($tag) reach every device")
+  ' | { problems=$(cat); [[ -z "$problems" ]] || { printf '%s\n' "$problems"; return 1; }; }
+}
+
 function tailscale::cleanup_stale_devices(){
   local hostname="$1"
-  if ! tailscale::read_api_token 2>/dev/null; then
+  if [[ -z "$TS_API_TOKEN" ]] && ! tailscale::read_api_token 2>/dev/null; then
     return 0
   fi
-  local tailnet
-  tailnet=$(tailscale::get_tailnet)
-  [[ -z "$tailnet" || "$tailnet" == "tailnet" ]] && tailnet="-"
-
-  local out device_ids
-  out=$(tailscale::api GET "/tailnet/${tailnet}/devices" 2>/dev/null || true)
-  [[ -z "$out" ]] && return 0
-  device_ids=$(printf '%s' "$out" | jq -r ".devices[] | select(.hostname == \"${hostname}\") | .id" 2>/dev/null || true)
+  local device_ids
+  device_ids=$(tailscale::devices "$hostname" | jq -r '.id')
   [[ -z "$device_ids" ]] && return 0
-  info "Cleaning up stale Tailscale devices for ${hostname}..."
+  info "Cleaning up stale Tailscale devices for ${hostname}${TAILSCALE_TAG:+ (${TAILSCALE_TAG})}..."
   while IFS= read -r did; do
     [[ -n "$did" ]] && tailscale::delete_device "$did" || true
   done <<< "$device_ids"
@@ -694,6 +991,7 @@ function cloudflare::api(){
   local method="$1" path="$2"; shift 2
   local url="https://api.cloudflare.com/client/v4${path}"
   dbg "CLOUDFLARE ${method} ${url}"
+  if $DRY_RUN && [[ "$method" != GET ]]; then plan "CLOUDFLARE ${method} ${url} $*"; printf "%s" '{"success":true,"result":[]}'; return 0; fi
   curl -sS -X "$method" "$url" \
     -H "Authorization: Bearer ${CF_API_TOKEN}" \
     -H "Content-Type: application/json" \
@@ -867,6 +1165,58 @@ users:
 CLOUDINIT_EOF
 }
 
+# Tenant worker: the public interface admits no SSH (Hetzner firewall), so the node must reach the
+# tailnet on its own at first boot. cloud-init installs Tailscale and joins with a one-off, one-hour,
+# tagged auth key, then deletes the key file and cloud-init's copy of the user data. The key is
+# single-use: once the node has joined, the copy Hetzner's metadata service keeps serving is spent.
+# Root logs in with no key; admin (passwordless sudo) carries the operator's key.
+function gen_cloud_init_tenant(){
+  local ssh_pubkey="$1" ts_authkey="$2" node="$3"
+  cat <<CLOUDINIT_EOF
+#cloud-config
+hostname: ${node}
+preserve_hostname: false
+disable_root: true
+ssh_pwauth: false
+users:
+  - name: admin
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_pubkey}
+write_files:
+  - path: /run/infra-skills/ts-authkey
+    permissions: '0600'
+    owner: root:root
+    content: ${ts_authkey}
+  - path: /usr/local/sbin/infra-skills-tailscale-up
+    permissions: '0700'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Managed by infra-skills (provision-hetzner-cloud.sh --worker): first-boot Tailscale join.
+      set -euo pipefail
+      trap 'rm -f /run/infra-skills/ts-authkey /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i' EXIT
+      . /etc/os-release
+      for i in 1 2 3 4 5 6; do
+        curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/\${VERSION_CODENAME}.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg \\
+          && curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/\${VERSION_CODENAME}.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list \\
+          && break
+        sleep 10
+      done
+      # First boot: unattended-upgrades may hold the dpkg lock; wait for it instead of failing.
+      apt-get -o DPkg::Lock::Timeout=600 update -q
+      DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q tailscale
+      systemctl enable --now tailscaled
+      tailscale up --auth-key=file:/run/infra-skills/ts-authkey --hostname=${node}
+      echo "[infra-skills] tailscale up: \$(tailscale ip -4 | head -1)"
+runcmd:
+  - [/usr/local/sbin/infra-skills-tailscale-up]
+CLOUDINIT_EOF
+}
+
 # ============================================================================
 # Postinstall script generation (cloud-adapted from baremetal)
 # ============================================================================
@@ -910,7 +1260,9 @@ if [[ -f "$MARKER_COMPLETE" ]]; then
   exit 0
 fi
 
-echo "[postinstall] Starting postinstall provisioning (Hetzner Cloud)..."
+echo "[postinstall] Starting postinstall provisioning (Hetzner Cloud, @NODE_ROLE@)..."
+NODE_ROLE="@NODE_ROLE@"
+. /etc/os-release
 echo "[postinstall] Step markers stored in: $MARKER_DIR"
 
 # Step 1: Tailscale APT repository
@@ -918,8 +1270,8 @@ if skip_if_done "01-tailscale-repo" "Tailscale APT repository"; then
   :
 else
   echo "[postinstall] Adding Tailscale APT repository ..."
-  curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
-  curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | sudo tee /etc/apt/sources.list.d/tailscale.list
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.noarmor.gpg" | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list" | sudo tee /etc/apt/sources.list.d/tailscale.list
   echo "[postinstall] Tailscale APT repository configured"
   mark_step "01-tailscale-repo"
 fi
@@ -932,10 +1284,18 @@ else
   apt update && apt -y dist-upgrade && apt -y autoremove
 
   echo "[postinstall] Installing base packages ..."
-  apt install -y --install-recommends linux-generic-hwe-24.04 \
-    locales ufw git binutils make \
-    libcurl4-openssl-dev libsqlite3-dev curl \
-    apt-transport-https gnupg2 sudo kubetail tailscale
+  if [[ "$NODE_ROLE" == "tenant-worker" ]]; then
+    # A tenant worker carries only what the k3s agent and the host firewall need.
+    apt install -y locales ufw curl iptables apt-transport-https gnupg2 sudo tailscale
+  else
+    # The HWE kernel metapackage exists per LTS release (linux-generic-hwe-24.04, ...).
+    HWE_PKG="linux-generic-hwe-${VERSION_ID}"
+    apt-cache show "$HWE_PKG" >/dev/null 2>&1 || HWE_PKG=""
+    apt install -y --install-recommends ${HWE_PKG} \
+      locales ufw git binutils make \
+      libcurl4-openssl-dev libsqlite3-dev curl \
+      apt-transport-https gnupg2 sudo kubetail tailscale
+  fi
   mark_step "02-apt-update-packages"
 fi
 
@@ -996,8 +1356,13 @@ else
 fi
 
 # Step 4: Create admin user with sudo
+# A tenant worker's admin comes from cloud-init with its own key. Copying root's authorized_keys
+# would replace that key with cloud-init's disable_root stub and lock admin out.
 if skip_if_done "04-admin-user" "Admin user creation"; then
   :
+elif [[ "$NODE_ROLE" == "tenant-worker" ]]; then
+  echo "[postinstall] Tenant worker: 'admin' comes from cloud-init; nothing to do"
+  mark_step "04-admin-user"
 else
   echo "[postinstall] Ensuring 'admin' user exists and has passwordless sudo ..."
   if ! id admin >/dev/null 2>&1; then
@@ -1017,6 +1382,29 @@ fi
 # Step 5: Configure UFW rules (using Cloud Network interface instead of vlan4000)
 if skip_if_done "05-ufw-rules" "UFW rules configuration"; then
   :
+elif [[ "$NODE_ROLE" == "tenant-worker" ]]; then
+  # Tenant worker: no private network, no ingress. The Hetzner Cloud firewall in front already
+  # drops every inbound packet but udp/41641; ufw is the same policy on the host, plus the k3s
+  # overlay. Everything from the cluster arrives over tailscale0 (API tunnel, kubelet 10250,
+  # flannel VXLAN 8472/udp), and what may arrive there is decided by the tailnet policy.
+  echo "[postinstall] Preparing UFW rules (tenant worker) ..."
+  ufw --force reset >/dev/null 2>&1 || true
+  ufw default deny incoming >/dev/null 2>&1 || true
+  ufw default allow outgoing >/dev/null 2>&1 || true
+  ufw allow 41641/udp comment 'tailscale direct' >/dev/null 2>&1 || true
+  ufw allow in on tailscale0 comment 'allow all via tailscale (tailnet policy decides)' >/dev/null 2>&1 || true
+  ufw allow from 10.42.0.0/16 to any comment 'k3s pods' >/dev/null 2>&1 || true
+  ufw allow from 10.43.0.0/16 to any comment 'k3s services' >/dev/null 2>&1 || true
+  ufw allow in on cni0 comment 'k3s cni0' >/dev/null 2>&1 || true
+  ufw allow in on flannel.1 comment 'flannel overlay' >/dev/null 2>&1 || true
+  if grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw 2>/dev/null; then
+    sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
+  else
+    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+  fi
+  echo "[postinstall] UFW rules configured (not enabled yet):"
+  ufw show added || true
+  mark_step "05-ufw-rules"
 else
   echo "[postinstall] Preparing UFW rules ..."
 
@@ -1080,6 +1468,9 @@ mark_step "06-vlan-8021q"
 # Step 7: Validate Cloud Network interface (instead of VLAN 4000 setup)
 if skip_if_done "07-cloud-network" "Cloud Network interface validation"; then
   :
+elif [[ "$NODE_ROLE" == "tenant-worker" ]]; then
+  echo "[postinstall] Tenant worker: no Cloud Network (the cluster is reached over Tailscale)"
+  mark_step "07-cloud-network"
 else
   echo "[postinstall] Validating Cloud Network interface ..."
   # Read the detected interface from step 5, or re-detect
@@ -1488,6 +1879,345 @@ function fetch_kubeconfig(){
 }
 
 # ============================================================================
+# env.properties writes
+# ============================================================================
+
+# Set KEY=VALUE in ENV_FILE (replace or append). --dry-run prints it instead.
+function env_set(){
+  local key="$1" val="$2"
+  if $DRY_RUN; then plan "set ${key}=${val} in ${ENV_FILE}"; return 0; fi
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    local current
+    current=$(grep "^${key}=" "${ENV_FILE}" | head -1 | cut -d= -f2-)
+    [[ "$current" == "$val" ]] && return 0
+    info "Updating ${key} in $(basename "$(dirname "${ENV_FILE}")")/env.properties: ${current:-<empty>} -> ${val:-<empty>}"
+    sed -i.bak "s|^${key}=.*|${key}=${val}|" "${ENV_FILE}"
+    rm -f "${ENV_FILE}.bak"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "${ENV_FILE}"
+  fi
+}
+
+# ============================================================================
+# Tenant worker (--worker): a node in the tenant's own Hetzner project that joins the cluster over
+# Tailscale through tools/k3s/join-worker.sh --tenant. docs/HETZNER-CLOUD-TENANT.md.
+# ============================================================================
+
+JOIN_WORKER="${REPO_ROOT}/tools/k3s/join-worker.sh"
+CLUSTER_KUBECONFIG="${CLUSTER_DIR}/kubeconfig.yaml"
+
+# Run a command on the node as admin over Tailscale; --dry-run prints it.
+function tenant::ssh(){
+  local host="$1"; shift
+  if $DRY_RUN; then plan "ssh admin@${host} $*"; return 0; fi
+  ssh -p "${SSH_PORT}" "${SSH_OPTS[@]}" "admin@${host}" "$@"
+}
+
+function tenant::kubectl(){
+  KUBECONFIG="${CLUSTER_KUBECONFIG}" kubectl "$@"
+}
+
+# join-worker.sh with this script's SSH key; the kubeconfig is pinned to the cluster's own file so a
+# different current context can never receive the node.
+function tenant::join_worker(){
+  local -a args=("$ENV_NAME" "$WORKER_NAME" --ssh-user admin)
+  [[ -n "${SSH_KEY}" ]] && args+=(--ssh-key "${SSH_KEY}")
+  args+=("$@")
+  if $DRY_RUN; then plan "KUBECONFIG=${CLUSTER_KUBECONFIG} ${JOIN_WORKER} ${args[*]}"; return 0; fi
+  KUBECONFIG="${CLUSTER_KUBECONFIG}" "${JOIN_WORKER}" "${args[@]}"
+}
+
+function tenant::preflight(){
+  info "Tenant worker ${NODE_NAME} of tenant ${TENANT} for cluster ${ENV_NAME}"
+  info "  Hetzner: ${HCLOUD_SERVER_TYPE} in ${HCLOUD_LOCATION}, image ${HCLOUD_IMAGE}, firewall '${HCLOUD_FIREWALL_NAME}'"
+  info "  Tailscale: hostname ${NODE_NAME}, tag ${TAILSCALE_TAG}; cluster server ${MASTER_HOSTNAME} (${MASTER_VLAN_IP%%/*})"
+  info "  Token: $(hcloud::token_file)"
+
+  if ! hcloud::read_token; then
+    if $DRY_RUN; then warn "(--dry-run: continuing without a token; GET calls are printed, not run)"; HCLOUD_TOKEN=""; else return 1; fi
+  fi
+  if ! tailscale::read_api_token; then
+    if $DRY_RUN; then
+      warn "(--dry-run: no Tailscale API key; Tailscale calls are printed, not run)"
+    else
+      err "Tailscale API key not found (${ENV_ROOT}/shared/secrets.plain/tailscale-api-key.txt): a tenant worker is reached only over Tailscale"
+      return 1
+    fi
+  fi
+
+  # Only for creating a node: destroy and re-provision must work whatever the policy says.
+  if $CREATE_SERVER && ! $DESTROY && [[ -n "$TS_API_TOKEN" ]]; then
+    local problems
+    if problems=$(tailscale::policy_problems "$TAILSCALE_TAG"); then
+      ok "Tailnet policy: ${TAILSCALE_TAG} is owned and confined"
+    else
+      while IFS= read -r p; do [[ -n "$p" ]] && err "Tailnet policy: $p"; done <<<"$problems"
+      if $DRY_RUN || [[ "${TAILSCALE_POLICY_CHECK:-}" == "warn" ]]; then
+        warn "(continuing: $($DRY_RUN && echo --dry-run || echo TAILSCALE_POLICY_CHECK=warn))"
+      else
+        err "Fix the tailnet policy first (docs/HETZNER-CLOUD-TENANT.md, \"Tailnet policy\"); TAILSCALE_POLICY_CHECK=warn overrides"
+        return 1
+      fi
+    fi
+  fi
+
+  if ! $NO_JOIN || $DESTROY; then
+    if [[ ! -f "$CLUSTER_KUBECONFIG" ]]; then
+      if $DRY_RUN; then warn "(--dry-run) ${CLUSTER_KUBECONFIG} not found"; else
+        err "${CLUSTER_KUBECONFIG} not found (restore it: tools/sops/kubeconfig.sh restore ${ENV_NAME}), or use --no-join"; return 1; fi
+    fi
+    # The tenant join (bootstrap token, tenant registries.yaml, taints) lives in join-worker.sh.
+    if ! grep -q -- '--tenant' "$JOIN_WORKER"; then
+      if $DRY_RUN; then warn "(--dry-run) ${JOIN_WORKER} has no --tenant yet"; else
+        err "${JOIN_WORKER} has no --tenant: it needs the tenant join (infra-skills INFRA-214). Use --no-join until then."; return 1; fi
+    fi
+  fi
+}
+
+function tenant::create(){
+  local existing fw_id ssh_key_id ts_authkey user_data fingerprint
+  existing=$(hcloud::get_server "${HCLOUD_SERVER_NAME}" 2>/dev/null || true)
+  if [[ -n "$existing" ]]; then
+    HCLOUD_SERVER_ID=$(printf '%s' "$existing" | jq -r '.id')
+    HCLOUD_PUBLIC_IP=$(printf '%s' "$existing" | jq -r '.public_net.ipv4.ip // empty')
+    ok "Server '${HCLOUD_SERVER_NAME}' already exists (ID: ${HCLOUD_SERVER_ID}, IP: ${HCLOUD_PUBLIC_IP})"
+    if [[ "$(printf '%s' "$existing" | jq -r '.labels.tenant // empty')" != "$TENANT" ]]; then
+      warn "Server '${HCLOUD_SERVER_NAME}' does not carry the label tenant=${TENANT}: not created by this script"
+    fi
+    fw_id=$(hcloud::ensure_firewall "${HCLOUD_FIREWALL_NAME}") || return 1
+    if ! hcloud::firewall_applied "$HCLOUD_SERVER_ID" "$fw_id"; then
+      info "Applying firewall '${HCLOUD_FIREWALL_NAME}' to the server..."
+      hcloud::apply_firewall "$HCLOUD_SERVER_ID" "$fw_id" || return 1
+    fi
+  else
+    hcloud::check_server_type "${HCLOUD_SERVER_TYPE}" "${HCLOUD_LOCATION}" || return 1
+
+    fingerprint=$(ssh-keygen -lf "${PROV_SSH_PUB}" 2>/dev/null | awk '{print $2}' | sed 's/^SHA256://' | tr -cd 'A-Za-z0-9' | cut -c1-12)
+    ssh_key_id=$(hcloud::create_ssh_key "infra-skills-${fingerprint:-operator}" "${SSH_PUBKEY_CONTENT}") || {
+      err "Failed to register SSH key"; return 1; }
+
+    fw_id=$(hcloud::ensure_firewall "${HCLOUD_FIREWALL_NAME}") || return 1
+
+    # A device left by an earlier node of the same name and tag would make the new one "<name>-1".
+    tailscale::cleanup_stale_devices "${NODE_NAME}"
+    ts_authkey=$(tailscale::create_authkey "${NODE_NAME}" false true "${TAILSCALE_TAG}") || {
+      err "No Tailscale auth key: the node would be unreachable (its public interface admits no SSH)"; return 1; }
+
+    user_data=$(gen_cloud_init_tenant "${SSH_PUBKEY_CONTENT}" "${ts_authkey}" "${NODE_NAME}")
+    unset ts_authkey
+    hcloud::create_server "${HCLOUD_SERVER_NAME}" "${HCLOUD_SERVER_TYPE}" "${HCLOUD_IMAGE}" \
+      "${HCLOUD_LOCATION}" "${ssh_key_id}" "${user_data}" "${fw_id}" || return 1
+    unset user_data
+    hcloud::wait_for_running "${HCLOUD_SERVER_ID}" 180 || return 1
+  fi
+
+  # The firewall must be in force before anything listens: refuse to go on without it.
+  if ! $DRY_RUN; then
+    local i
+    for i in $(seq 1 24); do
+      hcloud::firewall_applied "$HCLOUD_SERVER_ID" "$fw_id" && break
+      sleep 5
+    done
+    if ! hcloud::firewall_applied "$HCLOUD_SERVER_ID" "$fw_id"; then
+      err "Firewall '${HCLOUD_FIREWALL_NAME}' is not applied to server ${HCLOUD_SERVER_ID}; stopping"; return 1
+    fi
+    ok "Firewall '${HCLOUD_FIREWALL_NAME}' applied (inbound default-deny)"
+  else
+    plan "check GET /servers/${HCLOUD_SERVER_ID}: public_net.firewalls[] has ${fw_id} with status applied"
+  fi
+
+  EXTERNAL_IP="${HCLOUD_PUBLIC_IP}"
+  env_set EXTERNAL_IP "${EXTERNAL_IP}"
+}
+
+function tenant::lookup_server(){
+  [[ -n "${HCLOUD_SERVER_ID:-}" ]] && return 0
+  local existing
+  existing=$(hcloud::get_server "${HCLOUD_SERVER_NAME}" 2>/dev/null || true)
+  if [[ -z "$existing" ]]; then
+    if $DRY_RUN; then HCLOUD_SERVER_ID="<server-id>"; HCLOUD_PUBLIC_IP="<public-ipv4>"; return 0; fi
+    err "Server '${HCLOUD_SERVER_NAME}' not found in the tenant's project. Run without --provision-only first."
+    return 1
+  fi
+  HCLOUD_SERVER_ID=$(printf '%s' "$existing" | jq -r '.id')
+  HCLOUD_PUBLIC_IP=$(printf '%s' "$existing" | jq -r '.public_net.ipv4.ip // empty')
+  EXTERNAL_IP="${HCLOUD_PUBLIC_IP}"
+}
+
+function tenant::provision(){
+  tenant::lookup_server || return 1
+
+  # cloud-init installs Tailscale and joins; wait for the tagged device.
+  TAILSCALE_IP=""
+  if $DRY_RUN; then
+    plan "wait for Tailscale device ${NODE_NAME} with ${TAILSCALE_TAG} (GET /tailnet/-/devices)"
+    TAILSCALE_IP=$(tailscale::get_device_ip "${NODE_NAME}" 2>/dev/null || true)
+    TAILSCALE_IP="${TAILSCALE_IP:-<tailscale-ip>}"
+  else
+    info "Waiting for ${NODE_NAME} on the tailnet (cloud-init installs Tailscale; up to 10 min)..."
+    local i
+    for i in $(seq 1 120); do
+      TAILSCALE_IP=$(tailscale::get_device_ip "${NODE_NAME}" 2>/dev/null || true)
+      [[ -n "$TAILSCALE_IP" ]] && break
+      sleep 5
+    done
+    if [[ -z "$TAILSCALE_IP" ]]; then
+      err "${NODE_NAME} did not appear on the tailnet with ${TAILSCALE_TAG}."
+      err "Look at the Hetzner console of server ${HCLOUD_SERVER_ID}: /var/log/cloud-init-output.log"
+      return 1
+    fi
+    ok "Tailscale IP of ${NODE_NAME}: ${TAILSCALE_IP}"
+  fi
+  env_set VLAN_IP "${TAILSCALE_IP}"
+
+  ssh-keygen -R "${TAILSCALE_IP}" >/dev/null 2>&1 || true
+  if ! $DRY_RUN; then
+    wait_for_ssh_user "${TAILSCALE_IP}" "${SSH_PORT}" admin 60 || {
+      err "No SSH to admin@${TAILSCALE_IP}: the tailnet policy must let this machine reach ${TAILSCALE_TAG}:22"; return 1; }
+  fi
+  tenant::ssh "${TAILSCALE_IP}" 'cloud-init status --wait >/dev/null 2>&1 || true'
+
+  if ! $DRY_RUN && tenant::ssh "${TAILSCALE_IP}" 'sudo test -f /etc/infra-postinstall.done' 2>/dev/null; then
+    info "Postinstall already applied; skipping."
+  else
+    local content
+    content=$(gen_postinstall)
+    content=${content//@NODE_ROLE@/${NODE_ROLE}}
+    content=${content//@PRIVATE_IP_ADDR@/}
+    content=${content//@PUBLIC_HOSTNAME@/${NODE_NAME}}
+    content=${content//@EXTERNAL_IP@/${EXTERNAL_IP:-}}
+    content=${content//@MASTER_PRIVATE_IP@/}
+    content=${content//@WORKER_MODE@/true}
+    content=${content//@K3S_VERSION@/}
+    content=${content//@TAILSCALE_AUTHKEY@/}
+    content=${content//@TRAEFIK_CONFIG_YAML@/}
+    info "Running postinstall on ${NODE_NAME} (reboots at the end)..."
+    if $DRY_RUN; then
+      plan "upload postinstall ($(printf '%s\n' "$content" | wc -l | tr -d ' ') lines, role ${NODE_ROLE}) to admin@${TAILSCALE_IP}:/root/postinstall.sh and run it with sudo; it reboots"
+    else
+      printf '%s\n' "$content" | tenant::ssh "${TAILSCALE_IP}" 'sudo sh -c "umask 077; cat > /root/postinstall.sh"'
+      tenant::ssh "${TAILSCALE_IP}" 'sudo env TERM=xterm bash /root/postinstall.sh' || true
+      info "Waiting for the reboot..."
+      local i
+      for i in $(seq 1 30); do
+        ssh -p "${SSH_PORT}" "${SSH_OPTS[@]}" -o ConnectTimeout=5 "admin@${TAILSCALE_IP}" true >/dev/null 2>&1 || break
+        sleep 2
+      done
+      wait_for_ssh_user "${TAILSCALE_IP}" "${SSH_PORT}" admin 60 || { err "${NODE_NAME} did not come back after the reboot"; return 1; }
+      tenant::ssh "${TAILSCALE_IP}" 'sudo test -f /etc/infra-postinstall.done' \
+        || { err "Postinstall did not complete on ${NODE_NAME}: sudo cat /root/postinstall.sh, rerun with --provision-only"; return 1; }
+      ok "Postinstall complete"
+    fi
+  fi
+  tenant::verify "${TAILSCALE_IP}"
+}
+
+# What can be checked from here without the cluster: ufw active, Tailscale up with the tag,
+# and the public SSH port closed (the Hetzner firewall drops it unless HCLOUD_FIREWALL_SSH_CIDRS).
+function tenant::verify(){
+  local ts_ip="$1"
+  if $DRY_RUN; then
+    plan "verify on ${NODE_NAME}: ufw active, tailscale up; from here: ${EXTERNAL_IP:-<public-ipv4>}:22 closed"
+    return 0
+  fi
+  if tenant::ssh "$ts_ip" 'sudo ufw status | head -1' 2>/dev/null | grep -q 'Status: active'; then
+    ok "ufw active on ${NODE_NAME}"
+  else
+    warn "ufw is not active on ${NODE_NAME}"
+  fi
+  if [[ -z "${HCLOUD_FIREWALL_SSH_CIDRS:-}" && -n "${EXTERNAL_IP:-}" ]]; then
+    if nc -z -w 5 "${EXTERNAL_IP}" 22 >/dev/null 2>&1; then
+      err "${EXTERNAL_IP}:22 answers from the internet: the Hetzner firewall is not in force"; return 1
+    fi
+    ok "${EXTERNAL_IP}:22 is closed from the internet"
+  fi
+}
+
+function tenant::join(){
+  info "Joining ${NODE_NAME} to ${ENV_NAME} as a worker of tenant ${TENANT} (join-worker.sh --tenant)..."
+  tenant::join_worker --tenant "$TENANT"
+}
+
+function tenant::destroy(){
+  local existing server_id fw_out fw_id
+  echo -e "${RED}WARNING: This will remove node '${NODE_NAME}' from cluster ${ENV_NAME} and permanently delete server '${HCLOUD_SERVER_NAME}' in the tenant's Hetzner project${NC}" >&2
+  if $DRY_RUN; then
+    plan "confirm: type the server name ${HCLOUD_SERVER_NAME}"
+  else
+    local confirm="$DESTROY_CONFIRM"
+    [[ -z "$confirm" ]] && read -rp "Type the server name to confirm deletion [${HCLOUD_SERVER_NAME}]: " confirm
+    if [[ "$confirm" != "$HCLOUD_SERVER_NAME" ]]; then
+      err "Confirmation failed. Aborting."; return 1
+    fi
+  fi
+
+  existing=$(hcloud::get_server "${HCLOUD_SERVER_NAME}" 2>/dev/null || true)
+  if [[ -n "$existing" && "$(printf '%s' "$existing" | jq -r '.labels.tenant // empty')" != "$TENANT" ]]; then
+    err "Server '${HCLOUD_SERVER_NAME}' does not carry the label tenant=${TENANT}: refusing to delete what this script did not create"
+    return 1
+  fi
+
+  # 1. Out of the cluster first: drain and delete the node object, stop the agent.
+  if $DRY_RUN || tenant::kubectl get node "${NODE_NAME}" >/dev/null 2>&1; then
+    tenant::join_worker --remove || { err "join-worker.sh --remove failed; the server is kept"; return 1; }
+  else
+    info "Node ${NODE_NAME} is not in cluster ${ENV_NAME}"
+  fi
+
+  # 2. The server.
+  if [[ -n "$existing" ]]; then
+    server_id=$(printf '%s' "$existing" | jq -r '.id')
+    hcloud::delete_server "$server_id" || return 1
+  elif $DRY_RUN; then
+    hcloud::delete_server "<server-id>"
+  else
+    warn "Server '${HCLOUD_SERVER_NAME}' not found in the tenant's project"
+  fi
+
+  # 3. Its firewall (only one this script labelled for this node).
+  fw_out=$(hcloud::api GET "/firewalls?name=${HCLOUD_FIREWALL_NAME}" 2>/dev/null || echo '{}')
+  fw_id=$(printf '%s' "$fw_out" | jq -r --arg node "$NODE_NAME" '.firewalls[0] | select(.labels.node == $node and .labels["managed-by"] == "infra-skills") | .id // empty')
+  $DRY_RUN && [[ -z "$fw_id" ]] && fw_id="<firewall-id>"
+  if [[ -n "$fw_id" ]]; then
+    local i
+    for i in 1 2 3 4 5 6; do
+      hcloud::api DELETE "/firewalls/${fw_id}" >/dev/null 2>&1 && { ok "Deleted firewall '${HCLOUD_FIREWALL_NAME}'"; break; }
+      # still in use until the server deletion has detached it
+      [[ $i -eq 6 ]] && warn "Could not delete firewall ${fw_id}: $(hcloud::last_error)"
+      sleep 5
+    done
+  fi
+
+  # 4. The tailnet device(s) of this node, with the tenant tag only.
+  tailscale::cleanup_stale_devices "${NODE_NAME}"
+
+  env_set VLAN_IP ""
+  env_set EXTERNAL_IP ""
+  info "Left in place: the SSH key 'infra-skills-*' in the tenant's project (free; shared by its nodes)"
+  ok "Destroy complete"
+}
+
+function tenant::main(){
+  tenant::preflight || exit 1
+  if $DESTROY; then
+    tenant::destroy || exit 1
+    exit 0
+  fi
+  if $CREATE_SERVER; then tenant::create || exit 1; fi
+  if $PROVISION_SERVER; then
+    tenant::provision || exit 1
+    if $NO_JOIN; then
+      info "--no-join: join later with: KUBECONFIG=${CLUSTER_KUBECONFIG} ${JOIN_WORKER} ${ENV_NAME} ${WORKER_NAME} --tenant ${TENANT} --ssh-user admin"
+    else
+      tenant::join || exit 1
+    fi
+  fi
+  ok "Tenant worker ${NODE_NAME} done$($DRY_RUN && echo ' (dry-run: nothing was changed)')"
+  info "Server: ${HCLOUD_SERVER_NAME} (${HCLOUD_PUBLIC_IP:-unknown}), Tailscale: ${TAILSCALE_IP:-unknown}"
+  exit 0
+}
+
+# ============================================================================
 # MAIN FLOW
 # ============================================================================
 
@@ -1495,16 +2225,23 @@ function fetch_kubeconfig(){
 provision::require_tools || exit 1
 if ! command -v curl >/dev/null 2>&1; then err "curl is required"; exit 1; fi
 
+# Tenant worker: its own flow (create, provision over Tailscale, join-worker.sh --tenant)
+if $TENANT_MODE; then
+  tenant::main
+fi
+
 # Read Hetzner Cloud token
 if ! hcloud::read_token; then
-  exit 1
+  if $DRY_RUN; then warn "(--dry-run: continuing without a token; GET calls are printed, not run)"; HCLOUD_TOKEN=""; else exit 1; fi
 fi
 
 # --- DESTROY MODE ---
 if $DESTROY; then
   echo -e "${RED}WARNING: This will permanently delete the server '${HCLOUD_SERVER_NAME}'${NC}"
   echo -e "${RED}All data on the server will be lost!${NC}"
-  read -rp "Type the server name to confirm deletion [${HCLOUD_SERVER_NAME}]: " confirm
+  confirm="$DESTROY_CONFIRM"
+  if $DRY_RUN; then confirm="$HCLOUD_SERVER_NAME"; plan "confirm: type the server name ${HCLOUD_SERVER_NAME}"; fi
+  [[ -z "$confirm" ]] && read -rp "Type the server name to confirm deletion [${HCLOUD_SERVER_NAME}]: " confirm
   if [[ "$confirm" != "$HCLOUD_SERVER_NAME" ]]; then
     err "Confirmation failed. Aborting."
     exit 1
@@ -1557,6 +2294,8 @@ if $CREATE_SERVER; then
     HCLOUD_PUBLIC_IP=$(printf '%s' "$existing_server" | jq -r '.public_net.ipv4.ip' 2>/dev/null)
     ok "Server '${HCLOUD_SERVER_NAME}' already exists (ID: ${HCLOUD_SERVER_ID}, IP: ${HCLOUD_PUBLIC_IP})"
   else
+    hcloud::check_server_type "${HCLOUD_SERVER_TYPE}" "${HCLOUD_LOCATION}" || exit 1
+
     # Register SSH key
     info "Registering SSH public key in Hetzner Cloud..."
     SSH_KEY_ID=$(hcloud::create_ssh_key "infra-provisioning" "${SSH_PUBKEY_CONTENT}") || {
@@ -1602,18 +2341,9 @@ if $CREATE_SERVER; then
   fi
 
   # Update EXTERNAL_IP in env.properties if it changed
-  if [[ -n "${HCLOUD_PUBLIC_IP}" ]]; then
+  if [[ -n "${HCLOUD_PUBLIC_IP:-}" ]]; then
     EXTERNAL_IP="${HCLOUD_PUBLIC_IP}"
-    if grep -q '^EXTERNAL_IP=' "${ENV_FILE}"; then
-      current_ip=$(grep '^EXTERNAL_IP=' "${ENV_FILE}" | cut -d= -f2)
-      if [[ "$current_ip" != "$EXTERNAL_IP" ]]; then
-        info "Updating EXTERNAL_IP in env.properties: ${current_ip:-<empty>} -> ${EXTERNAL_IP}"
-        sed -i.bak "s/^EXTERNAL_IP=.*/EXTERNAL_IP=${EXTERNAL_IP}/" "${ENV_FILE}"
-        rm -f "${ENV_FILE}.bak"
-      fi
-    else
-      echo "EXTERNAL_IP=${EXTERNAL_IP}" >> "${ENV_FILE}"
-    fi
+    env_set EXTERNAL_IP "${EXTERNAL_IP}"
     ok "Server public IP: ${EXTERNAL_IP}"
   fi
 
@@ -1625,6 +2355,10 @@ if $CREATE_SERVER; then
 fi
 
 # --- PROVISIONING ---
+if $DRY_RUN && $PROVISION_SERVER; then
+  plan "provision ${HCLOUD_SERVER_NAME} over SSH (postinstall as ${NODE_ROLE}, k3s, kubeconfig): not simulated further"
+  PROVISION_SERVER=false
+fi
 if $PROVISION_SERVER; then
   # If we didn't create the server, look it up
   if [[ -z "${HCLOUD_PUBLIC_IP:-}" ]]; then
@@ -1706,6 +2440,7 @@ if $PROVISION_SERVER; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@EXTERNAL_IP@/${EXTERNAL_IP}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@MASTER_PRIVATE_IP@/${MASTER_PRIVATE_IP:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@WORKER_MODE@/${WORKER_MODE}}
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@NODE_ROLE@/${NODE_ROLE}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@K3S_VERSION@/${K3S_VERSION:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
     TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
