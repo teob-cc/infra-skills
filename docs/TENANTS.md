@@ -134,11 +134,14 @@ manual, because they hold its data.
   the tag). In your Tailscale ACL, allow the tag to reach only the server's k3s API (6443/tcp)
   and flannel (8472/udp). The server may reach the tag on 8472/udp and 10250/tcp (kubelet: logs
   and exec), and the operator on 22/tcp. The ACL lives outside infra-skills;
-  `provision-hetzner-cloud.sh` documents the snippet. A node whose public :22 is closed sets
-  `SSH_VIA=tailscale` in its env.properties.
+  `provision-hetzner-cloud.sh` documents the snippet. A tailnet still on the default policy
+  (grant `*` → `*:*`, no `tagOwners`) confines nothing. A tag can be minted only once
+  `tagOwners` names it. Confine the tag before the tenant gets root. A node whose public :22 is
+  closed sets `SSH_VIA=tailscale` in its env.properties.
 - **Host firewall.** Where ufw is installed, `join-worker.sh` persists its NAT rules with a
   oneshot unit (`infra-skills-worker-nat.service`) instead of installing iptables-persistent.
-  On Ubuntu that package removes ufw.
+  On Ubuntu 24.04 ufw declares `Breaks` on iptables-persistent and netfilter-persistent, so
+  installing either would remove ufw.
 - **The server token on platform workers.** Without `--token bootstrap`, a platform worker
   still joins with the server token, as before. Root on any such worker can join a server.
   Move platform workers with `join-worker.sh <env> <worker> --token bootstrap`, which takes

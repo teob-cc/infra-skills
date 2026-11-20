@@ -703,8 +703,8 @@ if [[ "${NEED_TUNNEL_NAT}" == "true" ]]; then
     addt \$src udp 8472 ""
   done
 fi
-# Persist across reboots. On Ubuntu, installing iptables-persistent removes ufw (the host
-# firewall of e.g. a cloud tenant node): where ufw is installed and iptables-persistent is
+# Persist across reboots. On Ubuntu 24.04 ufw declares Breaks on iptables-persistent, so
+# installing it removes ufw (the host firewall of e.g. a cloud tenant node): where ufw is installed and iptables-persistent is
 # not, a oneshot unit restores only these rules (appended, before k3s-agent) instead.
 mkdir -p /etc/iptables
 if dpkg -s ufw >/dev/null 2>&1 && ! dpkg -s iptables-persistent >/dev/null 2>&1; then
