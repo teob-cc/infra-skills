@@ -49,9 +49,10 @@ HCLOUD_LOCATION=hel1
 HCLOUD_IMAGE=ubuntu-24.04
 # Ingress hosts (Harbor) pinned to MASTER_VLAN_IP in /etc/hosts, for image pulls (join-worker.sh).
 REGISTRY_HOSTS=harbor.<cluster hostname>
-# Written by provision-hetzner-cloud.sh:
+# Written by provision-hetzner-cloud.sh (SSH_VIA=tailscale: join-worker.sh skips the closed public :22):
 EXTERNAL_IP=
 VLAN_IP=
+SSH_VIA=tailscale
 ```
 
 Optional keys:

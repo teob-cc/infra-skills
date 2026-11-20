@@ -49,7 +49,7 @@
 #   HCLOUD_SERVER_TYPE=cx33          # default cx33
 #   HCLOUD_LOCATION=hel1             # default hel1; put it where the cluster server is
 #   HCLOUD_IMAGE=ubuntu-24.04
-#   # Written by this script: EXTERNAL_IP (public IPv4), VLAN_IP (Tailscale IPv4)
+#   # Written by this script: EXTERNAL_IP (public IPv4), VLAN_IP (Tailscale IPv4), SSH_VIA=tailscale
 #   # Optional: HCLOUD_TOKEN_FILE, TAILSCALE_TAG (default tag:tenant-<tenant>), HCLOUD_FIREWALL_SSH_CIDRS,
 #   #           REGISTRY_HOSTS (join-worker.sh)
 #   The tenant project's API token: envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt (or the
@@ -2028,6 +2028,8 @@ function tenant::create(){
 
   EXTERNAL_IP="${HCLOUD_PUBLIC_IP}"
   env_set EXTERNAL_IP "${EXTERNAL_IP}"
+  # join-worker.sh: SSH straight to VLAN_IP; the public :22 is closed.
+  env_set SSH_VIA tailscale
 }
 
 function tenant::lookup_server(){
