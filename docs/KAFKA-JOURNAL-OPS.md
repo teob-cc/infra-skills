@@ -2,8 +2,9 @@
 
 Operational procedures for the Apache Kafka + ScyllaDB persistence stack backing
 kafka-journal apps (one per app-id, e.g. `myapp`). Referenced by the `kafka-journal`
-Prometheus alert group (baked into `tools/k3s/observability.sh`,
-mirrored in `envs/<env>/apps/observability/kafka-journal-alert-rules.yaml`).
+Prometheus alert group (baked into `tools/k3s/observability.sh`; tests in
+`tests/alert-rules/kafka-journal-test.yml`) and the `kafka-journal` Grafana dashboard (shipped by
+`tools/k3s/kafka.sh`).
 
 **Architecture recap:** events are appended to Kafka topics
 (`journal.<category>`, 7-day retention) and replicated by the kafka-journal
@@ -25,7 +26,15 @@ tools/k3s/kafka.sh  <env> --watch health|topics|groups|logs
 tools/k3s/scylla.sh <env> --watch status|compactions|logs
 tools/k3s/kafka.sh  <env> --show-credentials [app-id]
 tools/k3s/scylla.sh <env> --show-credentials [app-id]
+tools/k3s/kafka.sh  <env> --dashboard-only            # (re)apply the kafka-journal Grafana dashboard
 ```
+
+Dashboard: Grafana → Shared → `kafka-journal` (uid `kafka-journal`), shipped by `kafka.sh` as the
+ConfigMap `observability/grafana-dashboard-kafka-journal` from
+`tools/k3s/kafka/kafka-journal-dashboard.json`. It shows broker and exporter scrape health,
+partitions and their health, messages/s per topic, broker bytes in/out, replicator lag (both
+sources below), consumer-group lag, teob-rust replicator assignment/stalls/rebalances, the
+journal partitions nobody monitors, and the broker data volume.
 
 Namespaces: `kafka` (operator `strimzi-cluster-operator`, broker `kafka-dual-role-0`,
 `kafka-entity-operator` with the Topic and User Operators, `kafka-kafka-exporter`,
@@ -104,15 +113,40 @@ Single-node stack — restarts mean brief unavailability, apps retry.
 ## Replicator stall / lag {#replicator-stall}
 
 Alerts: `KafkaJournalReplicatorStalled` (p1), `KafkaJournalReplicatorLagHigh` (p2),
-`KafkaExporterDown` (p2: the lag alerts are blind while it lasts). Both replicator alerts
-look at replicator consumer groups only, one group at a time, and name the group: the
-groups matching `KAFKA_REPLICATOR_GROUP_REGEX` (env.properties or environment of
-`observability.sh`; default `.*replicator.*`, which matches kafka-journal's
-`<prefix>replicator.<keyspace>.<topic>`). An app's own consumers or a dead-letter reader
-with lag neither fire nor hide a stalled replicator.
+`KafkaJournalReplicatorUnmonitored` (warning), `KafkaExporterDown` (p2: every lag alert is
+blind while it lasts, since the log end comes from the exporter). Each alert names the journal
+topic and partition.
 
-1. Confirm from the broker's view: `tools/k3s/kafka.sh <env> --watch groups`
-   — look at the replicator group's lag per partition.
+Lag is the broker's log end (`kafka_topic_partition_current_offset`) minus the replicator's
+position, and the position has two sources, one per journal implementation:
+
+- **teob-rust apps** commit no Kafka offsets; the replicator keeps its position in Scylla and
+  exports it as `teob_replicator_published_next{topic,partition}` on the app's `:9090/metrics`
+  (the app's pods need the `prometheus.io/scrape` annotations). The rules take the max over
+  pods (after a rebalance the pod that lost a partition keeps its old, lower value) and hold the
+  last value for a day after the pods are gone, so a replicator that is scaled to 0 or
+  crash-looping still stalls instead of vanishing. Recording rules
+  `kafka_journal:replicator_published_next:max` and `kafka_journal:replicator_lag:offsets`.
+- **kafka-journal-pekko apps** commit consumer-group offsets, so `kafka_consumergroup_lag`
+  covers them. Only groups matching `KAFKA_REPLICATOR_GROUP_REGEX` count (env.properties or
+  environment of `observability.sh`; default `.*replicator.*`, which matches kafka-journal's
+  `<prefix>replicator.<keyspace>.<topic>`); these alerts also name the group. An app's own
+  consumers or a dead-letter reader with lag neither fire nor hide a stalled replicator.
+
+Journal topics are those matching `KAFKA_JOURNAL_TOPIC_REGEX` (default `.+[.]journal[.].+`).
+
+- `KafkaJournalReplicatorLagHigh`: more than 10k offsets behind for 15m.
+- `KafkaJournalReplicatorStalled`: behind, and the position has not moved for 15m, held 15m.
+  It measures the position, not the age of the oldest unreplicated event: nothing fires when
+  an event ages past the 7-day retention unreplicated (teob-rust counts that afterwards in
+  `teob_replicator_source_expired_total`), so the budget below runs from when the stall began.
+- `KafkaJournalReplicatorUnmonitored`: a journal partition has events but neither source
+  reports a position for it, for 1h. The other two cannot fire for it. Usually the app is not
+  scraped yet; for a pekko app, its replicator group has never committed.
+
+1. Confirm in the `kafka-journal` dashboard (replicator lag per partition) or from the
+   broker's view: `tools/k3s/kafka.sh <env> --watch groups` — for a pekko app, look at the
+   replicator group's lag per partition (teob-rust replicators have no committed offsets).
 2. Check the replicator pod (deployed as `<app>-replicator`): logs,
    restarts, OOM. A restart usually resumes from committed offsets — this is
    the first fix: `kubectl rollout restart deploy/<app>-replicator`.
@@ -279,5 +313,6 @@ Quarterly, on your reference env:
    → `KafkaBrokerDown` fires within ~6m; set it back to 9404 (or rerun kafka.sh), confirm
    resolve. (A NetworkPolicy cannot do this: policies add up, and Strimzi's own policy
    opens 9404.) Later: scale the replicator to 0 with traffic →
-   `KafkaJournalReplicatorStalled`.
+   `KafkaJournalReplicatorStalled` after about 30m (for a teob-rust app the held position keeps
+   the lag growing after its pods are gone).
 3. **Failure-mode review:** check lag history and disk trends for the quarter.

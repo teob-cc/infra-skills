@@ -292,7 +292,8 @@ tools/k3s/kafka.sh <env>         # Strimzi operator + Apache Kafka 4.3.2, one KR
 tools/k3s/scylla.sh <env>        # Scylla operator + single node (Cassandra API, password auth)
 ```
 Both use static local PVs under `/data` pinned to the main node, and support `--watch` and
-`--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive.
+`--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive. kafka.sh also
+ships the `kafka-journal` Grafana dashboard (`kafka.sh <env> --dashboard-only` re-applies just that).
 `kafka.sh --provision-credentials` writes the password Secrets to `secrets.plain/` (encrypt them)
 and the KafkaUser to `kafka-users/<app>.yaml` (commit it; every kafka.sh run re-applies it); the
 default ACLs cover names starting with `<app-id>.` (`KAFKA_ACL_PREFIX` changes that), and a rerun

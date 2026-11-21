@@ -1548,6 +1548,9 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   # Consumer groups the kafka-journal replicator alerts watch (Prometheus regex, anchored).
   # kafka-journal names them <prefix>replicator.<keyspace>.<topic>, e.g. teob-replicator.*.
   KAFKA_REPLICATOR_GROUP_REGEX="${KAFKA_REPLICATOR_GROUP_REGEX:-.*replicator.*}"
+  # Journal topics the replicator alerts watch (Prometheus regex, anchored): kafka-journal
+  # names them <app>.journal.<category>. [.] instead of \. keeps the heredoc escape-free.
+  KAFKA_JOURNAL_TOPIC_REGEX="${KAFKA_JOURNAL_TOPIC_REGEX:-.+[.]journal[.].+}"
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
   # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
   NAMESPACE_MYSQL="${NAMESPACE_MYSQL:-mysql}"
@@ -3578,8 +3581,16 @@ serverFiles:
       # docs/KAFKA-JOURNAL-OPS.md). Rules are inert until the kafka/kafka-exporter/scylla
       # scrape jobs have live targets and the replicator consumer group exists — like the
       # uce-* rules they activate the moment the metrics appear.
-      # Lag comes from the Strimzi kafka-exporter (kafka_consumergroup_lag, per partition;
-      # -1 where a group has no committed offset yet, hence clamp_min).
+      # Replicator lag has two sources, one per journal implementation:
+      #  - teob-rust replicators commit no Kafka offsets; they keep their position in Scylla
+      #    and publish it as the app gauge teob_replicator_published_next{topic,partition}
+      #    (the next source offset to replicate). Lag = the broker's log end from the
+      #    Strimzi kafka-exporter (kafka_topic_partition_current_offset) minus that gauge.
+      #  - kafka-journal-pekko replicators commit consumer-group offsets, so the exporter's
+      #    kafka_consumergroup_lag covers them (-1 where a group has no committed offset
+      #    yet, hence the > 0 / >= 0 filters).
+      # The replicator rules fire on either source and carry topic and partition either way;
+      # the consumer-group source adds consumergroup.
       # ScyllaSnapshotOverdue keys off a node-exporter textfile stamp written
       # by the scylla-backup CronJob (nas-backup-stamp pattern).
       - name: kafka-journal
@@ -3620,34 +3631,103 @@ serverFiles:
                 replicator write path are degraded; the journal itself keeps
                 accepting appends (Kafka) until topic retention runs out.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#scylla-loss"
-          # Per replicator consumer group (KAFKA_REPLICATOR_GROUP_REGEX): an app's own
-          # consumers, dead-letter readers or a stopped tool group neither raise nor mask
-          # these. Both sides of the "and" are per group.
+          # The replicator's position per journal partition from the app gauge. After a
+          # rebalance the pod that lost a partition keeps reporting its last, lower value
+          # until it restarts, so only the max over the pods reporting now is the position.
+          - record: kafka_journal:replicator_published_next:live
+            expr: |
+              max by (topic, partition) (teob_replicator_published_next{topic=~"${KAFKA_JOURNAL_TOPIC_REGEX}"})
+          # The same, held for a day after the replicator's pods are gone (scaled to 0,
+          # crash-looping, unscraped), so the lag keeps growing and the stall rule fires
+          # instead of every series vanishing with the replicator. It holds the recorded
+          # max, not the raw gauge: a last_over_time of the raw gauge would bring back pods
+          # from before a topic was recreated (on test the pre-cutover wallet pods still
+          # held 552002 against a log end of 0 on 2026-11-21) and hide the lag for a day.
+          - record: kafka_journal:replicator_published_next:max
+            expr: |
+              last_over_time(kafka_journal:replicator_published_next:live[1d])
+          # Offsets between the journal's log end and the replicator's position. Journal
+          # producers are not transactional (teob-kafka refuses a transactional.id on a
+          # journal flow), so there are no commit markers and a caught-up partition is 0.
+          - record: kafka_journal:replicator_lag:offsets
+            expr: |
+              max by (topic, partition) (kafka_topic_partition_current_offset{topic=~"${KAFKA_JOURNAL_TOPIC_REGEX}"})
+              - on (topic, partition) kafka_journal:replicator_published_next:max
+          # Consumer groups count only when they match KAFKA_REPLICATOR_GROUP_REGEX: an
+          # app's own consumers, dead-letter readers or a stopped tool group neither raise
+          # nor mask these.
           - alert: KafkaJournalReplicatorLagHigh
             expr: |
-              max by (consumergroup) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
+              kafka_journal:replicator_lag:offsets > 10000
+              or max by (consumergroup, topic, partition) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
             for: 15m
             labels: { severity: p2, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator {{ \$labels.consumergroup }} lag > 10k events for >15m"
+              summary: "kafka-journal replicator {{ \$labels.topic }}/{{ \$labels.partition }} lag > 10k events for >15m"
               description: |
-                The replicator consumer group is more than 10k events behind
-                the journal head on at least one partition. Read models are
-                stale; check replicator throughput and Scylla write latency.
+                The replicator of {{ \$labels.topic }} partition {{ \$labels.partition }}
+                {{- with \$labels.consumergroup }} (consumer group {{ . }}){{ end }} is
+                {{ \$value }} offsets behind the journal's log end. Measured as the broker's
+                log end minus the replicator's position: teob_replicator_published_next
+                (max over pods) for teob-rust apps, the committed offset of the replicator
+                consumer group for kafka-journal-pekko apps. Read models are stale; check
+                replicator throughput and Scylla write latency.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
+          # Stalled: backlog present and the replicator's position has not moved for 15m.
+          # The teob-rust arm uses the max-over-pods position, not teob_replicator_stalled:
+          # that gauge has only a partition label, so an app replicating several topics
+          # (teob-wallet: round and player) reports one series for both, and it says
+          # nothing while the app is down. The consumer-group arm is per group: no partition
+          # of the group committed in 15m; it names each partition that has backlog.
           - alert: KafkaJournalReplicatorStalled
             expr: |
-              sum by (consumergroup) (clamp_min(kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}, 0)) > 0
-              and sum by (consumergroup) (delta(kafka_consumergroup_current_offset{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
+              (
+                kafka_journal:replicator_lag:offsets > 0
+                and on (topic, partition) changes(kafka_journal:replicator_published_next:max[15m]) == 0
+              )
+              or (
+                max by (consumergroup, topic, partition) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 0
+                and on (consumergroup) sum by (consumergroup) (delta(kafka_consumergroup_current_offset{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
+              )
             for: 15m
             labels: { severity: p1, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator {{ \$labels.consumergroup }} stalled: lag present, no commits for 15m"
+              summary: "kafka-journal replicator {{ \$labels.topic }}/{{ \$labels.partition }} stalled: backlog, position unchanged for 30m"
               description: |
-                There is uncommitted journal backlog but the replicator has not
-                committed any offsets in 15 minutes. If this persists past the
-                7-day topic retention, unreplicated events are lost — restart
-                the replicator and check Scylla availability.
+                {{ \$value }} journal events of {{ \$labels.topic }} partition {{ \$labels.partition }}
+                {{- with \$labels.consumergroup }} (consumer group {{ . }}){{ end }} are not
+                replicated, and the replicator's position has not advanced for 30 minutes
+                (15m window, held 15m). What is measured: the position, i.e.
+                teob_replicator_published_next (max over pods, held for a day after its pods
+                go away) for teob-rust apps, or the group's committed offsets for
+                kafka-journal-pekko apps, against the broker's log end. What is not measured:
+                how old the oldest unreplicated event is. Those events are lost once the
+                oldest of them ages past the 7-day topic retention, which is at most 7 days
+                after the stall began, and nothing here fires at that point (teob-rust counts it afterwards in
+                teob_replicator_source_expired_total). Restart the replicator and check
+                Scylla availability.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
+          # The blind spot made visible: a journal partition that has messages but no
+          # replicator position at all, neither the teob-rust gauge (an app not scraped, a
+          # replicator not started) nor a replicator group's committed offset (a pekko group
+          # that never committed). Neither alert above can fire for such a partition.
+          - alert: KafkaJournalReplicatorUnmonitored
+            expr: |
+              max by (topic, partition) (kafka_topic_partition_current_offset{topic=~"${KAFKA_JOURNAL_TOPIC_REGEX}"}) > 0
+              unless on (topic, partition) kafka_journal:replicator_published_next:max
+              unless on (topic, partition) max by (topic, partition) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"} >= 0)
+            for: 1h
+            labels: { severity: warning, app: kafka-journal }
+            annotations:
+              summary: "kafka-journal {{ \$labels.topic }}/{{ \$labels.partition }} has events but no replicator position"
+              description: |
+                Journal partition {{ \$labels.topic }}/{{ \$labels.partition }} holds events
+                (log end {{ \$value }}), but Prometheus has no teob_replicator_published_next
+                for it in the last day and no committed offset of a consumer group matching
+                KAFKA_REPLICATOR_GROUP_REGEX. KafkaJournalReplicatorLagHigh and
+                KafkaJournalReplicatorStalled cannot fire for it. Usually the app's pods
+                lack the prometheus.io/scrape annotations (port 9090, /metrics), or the
+                replicator never started for this topic.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
           - alert: KafkaJournalDataDiskLow
             # A static local PV reports the whole /data filesystem, so this is the free

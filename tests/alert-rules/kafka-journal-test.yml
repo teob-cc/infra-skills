@@ -3,10 +3,12 @@
 #   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
 #   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
 #   cd tests/alert-rules
+#   promtool test rules kafka-journal-test.yml      # or, without a local promtool:
 #   docker run --rm -v "$PWD":/w -w /w --entrypoint promtool \
 #     quay.io/prometheus/prometheus:v3.14.0 test rules kafka-journal-test.yml
 # The series are what the Strimzi kafka-exporter and JMX exporter publish (jobs kafka and
-# kafka-exporter from tools/k3s/kafka.sh).
+# kafka-exporter from tools/k3s/kafka.sh). teob_replicator_* are the teob-rust app
+# gauges (crates/teob-kafka), scraped through the prometheus.io annotations (job kubernetes-pods).
 rule_files:
   - rules.yml
 evaluation_interval: 1m
@@ -140,3 +142,183 @@ tests:
         exp_samples:
           - labels: '{alertname="KafkaJournalReplicatorStalled",consumergroup="teob-replicator.a"}'
             value: 1
+
+  # --- teob-rust replicators (INFRA-223) ---------------------------------------------------
+  # They commit no Kafka offsets: their position is the app gauge teob_replicator_published_next
+  # (scraped by job kubernetes-pods), and the lag is the exporter's log end minus it.
+
+  # 8. Position 49k behind the log end but advancing: lag high, not stalled. The alert
+  #    carries topic and partition, like the consumer-group arm.
+  - name: teob-rust replicator lag high, still advancing
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 50000+100x45
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="0"}
+        values: 1000+100x45
+    promql_expr_test:
+      - expr: count by (alertname, topic, partition) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 40m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorLagHigh",topic="app.journal.cart",partition="0"}'
+            value: 1
+      - expr: kafka_journal:replicator_lag:offsets
+        eval_time: 40m
+        exp_samples:
+          - labels: '{__name__="kafka_journal:replicator_lag:offsets",topic="app.journal.cart",partition="0"}'
+            value: 49000
+
+  # 9. Caught up (lag 0 on one partition, a few events in flight on another): nothing fires.
+  - name: teob-rust replicator caught up
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 500x45
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="0"}
+        values: 500x45
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="1"}
+        values: 100+10x45
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="1"}
+        values: 98+10x45
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{app="kafka-journal"})
+        eval_time: 40m
+        exp_samples: []
+
+  # 10. The position advances until 10m, then freezes 20 behind the log end: stalled (p1) once
+  #     it has not moved for 15m and that held 15m, on that partition only. The caught-up
+  #     partition 1 stays quiet although its position never moves.
+  - name: teob-rust replicator stalled
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 120x50
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="0"}
+        values: 40+6x10 100x40
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="1"}
+        values: 120x50
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="1"}
+        values: 120x50
+    promql_expr_test:
+      - expr: count by (alertname, topic, partition) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 45m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorStalled",topic="app.journal.cart",partition="0"}'
+            value: 1
+      # Not yet at 35m: unchanged since 10m, pending from about 25m.
+      - expr: count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 35m
+        exp_samples: []
+
+  # 11. After a rebalance the pod that lost the partition keeps its last value (0 here) while
+  #     the new owner replicates. Per pod, the old series would be 50k behind and frozen
+  #     (lag high and stalled); max over pods is the real position, 5 behind and moving.
+  - name: stale duplicate from the previous owner raises nothing
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 50005+10x45
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-old",topic="app.journal.cart",partition="0"}
+        values: 0x45
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-new",topic="app.journal.cart",partition="0"}
+        values: 50000+10x45
+    promql_expr_test:
+      - expr: count by (alertname) (ALERTS{app="kafka-journal"})
+        eval_time: 40m
+        exp_samples: []
+      - expr: kafka_journal:replicator_lag:offsets
+        eval_time: 40m
+        exp_samples:
+          - labels: '{__name__="kafka_journal:replicator_lag:offsets",topic="app.journal.cart",partition="0"}'
+            value: 5
+
+  # 12. The app is scaled to 0 at 10m while events keep arriving: its gauge goes stale, but
+  #     the held position keeps the lag growing, so the stall fires instead of every series
+  #     vanishing with the replicator. Unmonitored stays quiet: the position is known.
+  - name: replicator gone while events arrive is a stall
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 100+10x80
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.cart",partition="0"}
+        values: 100+10x10 stale
+    promql_expr_test:
+      - expr: count by (alertname, topic, partition) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 75m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorStalled",topic="app.journal.cart",partition="0"}'
+            value: 1
+
+  # 13. Unmonitored: journal partitions with events and no replicator position, per partition.
+  #     - app.journal.cart p0/p1: events, nothing reports a position -> fires (2 series)
+  #     - app.journal.cart p2: no events yet (log end 0) -> quiet
+  #     - app.journal.order p0: the teob-rust gauge reports it -> quiet
+  #     - pekko.journal.events p0: a replicator group committed (lag >= 0) -> quiet
+  #     - pekko.journal.events p1: the replicator group never committed (lag -1) -> fires
+  #     - app.dead-letter.cart p0: not a journal topic -> quiet
+  #     - app.journal.audit p0: covered only by a non-replicator group -> fires
+  - name: journal partitions without a replicator position
+    interval: 1m
+    input_series:
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="0"}
+        values: 16x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="1"}
+        values: 8x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.cart",partition="2"}
+        values: 0x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.order",partition="0"}
+        values: 30x80
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="app",pod="app-1",topic="app.journal.order",partition="0"}
+        values: 30x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="pekko.journal.events",partition="0"}
+        values: 40x80
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="pekko-replicator.ks.pekko.journal.events",topic="pekko.journal.events",partition="0"}
+        values: 0x80
+      - series: kafka_consumergroup_current_offset{job="kafka-exporter",consumergroup="pekko-replicator.ks.pekko.journal.events",topic="pekko.journal.events",partition="0"}
+        values: 40x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="pekko.journal.events",partition="1"}
+        values: 40x80
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="pekko-replicator.ks.pekko.journal.events",topic="pekko.journal.events",partition="1"}
+        values: -1x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.dead-letter.cart",partition="0"}
+        values: 5x80
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="app.journal.audit",partition="0"}
+        values: 7x80
+      - series: kafka_consumergroup_lag{job="kafka-exporter",consumergroup="reporting-tool",topic="app.journal.audit",partition="0"}
+        values: 0x80
+    promql_expr_test:
+      - expr: count by (alertname, severity, topic, partition) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 70m
+        exp_samples:
+          - labels: '{alertname="KafkaJournalReplicatorUnmonitored",severity="warning",topic="app.journal.cart",partition="0"}'
+            value: 1
+          - labels: '{alertname="KafkaJournalReplicatorUnmonitored",severity="warning",topic="app.journal.cart",partition="1"}'
+            value: 1
+          - labels: '{alertname="KafkaJournalReplicatorUnmonitored",severity="warning",topic="pekko.journal.events",partition="1"}'
+            value: 1
+          - labels: '{alertname="KafkaJournalReplicatorUnmonitored",severity="warning",topic="app.journal.audit",partition="0"}'
+            value: 1
+      # Held for an hour: pending, not firing, at 30m.
+      - expr: count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"})
+        eval_time: 30m
+        exp_samples: []
+
+  # 14. The topic was recreated (Redpanda -> Kafka cutover on test, 2026-11-21): a pod from
+  #     before it reported 552002 and is gone since 20m; the new pod reports 0 against a log
+  #     end of 3. The held position is the recorded live max, not the old pod's raw value, so
+  #     the lag is 3, not -552k: a later stall of the new replicator is not hidden for a day.
+  - name: pods from before a topic was recreated do not hide its lag
+    interval: 1m
+    input_series:
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="w",pod="w-old",topic="w.journal.round",partition="0"}
+        values: 552000+1x20 stale
+      - series: teob_replicator_published_next{job="kubernetes-pods",namespace="w",pod="w-new",topic="w.journal.round",partition="0"}
+        values: _x20 0x40
+      - series: kafka_topic_partition_current_offset{job="kafka-exporter",topic="w.journal.round",partition="0"}
+        values: _x20 3x40
+    promql_expr_test:
+      - expr: kafka_journal:replicator_lag:offsets
+        eval_time: 50m
+        exp_samples:
+          - labels: '{__name__="kafka_journal:replicator_lag:offsets",topic="w.journal.round",partition="0"}'
+            value: 3
