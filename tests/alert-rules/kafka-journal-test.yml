@@ -6,8 +6,7 @@
 #   docker run --rm -v "$PWD":/w -w /w --entrypoint promtool \
 #     quay.io/prometheus/prometheus:v3.14.0 test rules kafka-journal-test.yml
 # The series are what the Strimzi kafka-exporter and JMX exporter publish (jobs kafka and
-# kafka-exporter from tools/k3s/kafka.sh). Scenario 6 keeps the Redpanda branch working
-# while an environment still runs Redpanda next to Kafka.
+# kafka-exporter from tools/k3s/kafka.sh).
 rule_files:
   - rules.yml
 evaluation_interval: 1m
@@ -99,29 +98,7 @@ tests:
           - labels: '{alertname="KafkaJournalDataDiskLow",persistentvolumeclaim="data-0-kafka-dual-role-0"}'
             value: 1
 
-  # 6. Cutover: Redpanda still serves the journal. Its lag series keep the lag rule
-  #    working, and RedpandaDown still fires for its own target.
-  - name: redpanda branch during the cutover
-    interval: 1m
-    input_series:
-      - series: redpanda_kafka_consumer_group_lag_max{job="redpanda",redpanda_group="teob-replicator.j"}
-        values: 20000x40
-      - series: redpanda_kafka_consumer_group_lag_sum{job="redpanda",redpanda_group="teob-replicator.j"}
-        values: 20000x40
-      - series: redpanda_kafka_consumer_group_committed_offset{job="redpanda",redpanda_group="teob-replicator.j"}
-        values: 1000+100x40
-      - series: up{job="redpanda",namespace="redpanda",pod="redpanda-0"}
-        values: 0x40
-    promql_expr_test:
-      - expr: sort(count by (alertname) (ALERTS{alertstate="firing",app="kafka-journal"}))
-        eval_time: 35m
-        exp_samples:
-          - labels: '{alertname="KafkaJournalReplicatorLagHigh"}'
-            value: 1
-          - labels: '{alertname="RedpandaDown"}'
-            value: 1
-
-  # 7. Idle replicator (no lag, no commits) next to other groups with lag and no commits:
+  # 6. Idle replicator (no lag, no commits) next to other groups with lag and no commits:
   #    a dead-letter reader and an app consumer far behind. Only replicator groups count,
   #    so nothing fires — neither a stall nor lag high.
   - name: other groups with lag do not raise replicator alerts
@@ -144,7 +121,7 @@ tests:
         eval_time: 40m
         exp_samples: []
 
-  # 8. One replicator stalled while another replicator keeps committing: the busy group
+  # 7. One replicator stalled while another replicator keeps committing: the busy group
   #    must not mask the stalled one, and the alert names the stalled group.
   - name: stalled replicator is not masked by a committing one
     interval: 1m

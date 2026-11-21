@@ -65,7 +65,7 @@ script adds the jobs the chart lacks:
 | `cnpg` | every CNPG instance pod (`cnpg.io/podRole=instance`), port `metrics` :9187 | infra-cnpg |
 | `argocd` | Argo CD pods, port `metrics` | platform-services (Argo CD) |
 | `dex` | Service `dex`, port `telemetry` :5558 | platform-services (Dex) |
-| `postgres-exporter`, `mysql-exporter`, `kafka`, `kafka-exporter`, `scylla` | the data stacks (`redpanda` too while an env moves off it) | their own groups |
+| `postgres-exporter`, `mysql-exporter`, `kafka`, `kafka-exporter`, `scylla` | the data stacks | their own groups |
 
 k3s serves the API server and kubelet metrics from one process, so most control-plane
 series appear twice (jobs `kubernetes-api-servers` and `kubernetes-nodes`). Every rule

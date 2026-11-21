@@ -153,7 +153,7 @@ err() { echo "[kafka:error] $*" >&2; }
 : "${KAFKA_CPU_LIMIT:=2}"
 : "${KAFKA_DATA_DIR:=/data/kafka}"
 : "${KAFKA_NODE:=$ENV_NAME}"                  # kubernetes.io/hostname to pin PV + broker
-# Same as Redpanda on test (auto_create_topics_enabled=false): apps create their topics.
+# Apps create their topics (or declare KafkaTopics); the broker does not auto-create them.
 : "${KAFKA_AUTO_CREATE_TOPICS:=false}"
 : "${KAFKA_SUPERUSER:=admin}"
 
@@ -170,8 +170,8 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 : "${CLUSTER_ISSUER:=letsencrypt-prod}"
 : "${ENFORCE_POMERIUM:=true}"
 if [[ -n "${HOSTNAME:-}" ]]; then
-  # console.<env> is the host Redpanda Console used. While another Ingress or Pomerium route
-  # owns it, kafka.sh skips the console (deploy_console); --force-console takes it over.
+  # The Kafbat UI host. While another Ingress or Pomerium route owns it, kafka.sh skips the
+  # console (deploy_console); --force-console takes it over.
   KAFKA_CONSOLE_HOST="${KAFKA_CONSOLE_HOST:-console.${HOSTNAME}}"
 fi
 
@@ -670,7 +670,7 @@ YAML
   }
   info "✓ Data directory ready"
 
-  # StorageClass + static PV (same pattern as redpanda.sh/scylla.sh). claimRef pins the
+  # StorageClass + static PV (same pattern as scylla.sh). claimRef pins the
   # PV to the PVC name Strimzi derives (data-<volume id>-<pod>), so it cannot bind to
   # another local-storage claim.
   info "Applying StorageClass local-storage + PV ${DATA_PV}..."
@@ -809,7 +809,7 @@ spec:
     version: ${KAFKA_VERSION}
     metadataVersion: ${KAFKA_METADATA_VERSION}
     listeners:
-      # Same port the Redpanda internal listener used, so app configs change only the host.
+      # In-cluster apps connect here: SASL_PLAINTEXT, SCRAM-SHA-512.
       - name: internal
         port: 9093
         type: internal
@@ -1051,7 +1051,7 @@ deploy_console() {
     return 0
   fi
 
-  # console.<env> is also the host Redpanda Console used. Next to a running Redpanda, the
+  # Another Ingress or Pomerium route may own console.<env> (an older UI, another tool). The
   # route upsert would take the host from it, so leave it alone unless told otherwise.
   local owner
   owner=$(console_host_owner)
