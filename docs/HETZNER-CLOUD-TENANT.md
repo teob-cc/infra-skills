@@ -1,19 +1,44 @@
 # Tenant worker on Hetzner Cloud
 
-A **tenant worker** is a node that another organisation (the *tenant*) owns and pays for, and
-that runs only that tenant's workloads on your cluster. This page covers the case where the node
-is a Hetzner Cloud VM in the **tenant's own Hetzner project**, and the cluster is somewhere else:
-bare metal or cloud, reached over Tailscale. The isolation model itself (shared root, join token,
-admission policies, network policies) is in [TENANTS.md](TENANTS.md).
+A **tenant worker** is a node that runs only one tenant's workloads on your cluster. The *tenant*
+is another organisation; you, the *operating org*, run the cluster. This page covers the case where
+the node is a Hetzner Cloud VM and the cluster is somewhere else (bare metal or cloud), reached
+over Tailscale. The isolation model itself (join token, admission policies, network policies) is in
+[TENANTS.md](TENANTS.md).
+
+## Who owns what
+
+The operating org owns the node. The tenant gets pods.
+
+| | Operating org | Tenant |
+| --- | --- | --- |
+| Hetzner project, billing, console, rescue system, root password reset | yes: the VM is in your project | none |
+| Root and SSH on the node | yes: user `admin`, your provisioning key only | no shell, no key on the node |
+| Tailscale device, its tag, the tailnet policy | yes | none |
+| k3s join, kubelet credentials, registries.yaml | yes, set by `join-worker.sh --tenant` | its pull robot's credentials sit in registries.yaml |
+| Workloads | the platform's DaemonSets that tolerate the tenant taint | its pods, in its namespaces, through its Argo CD project |
+
+The tenant has no console or rescue access **by construction**: the VM is not in its Hetzner project,
+and no tenant key is ever placed on it. A tenant that wants infrastructure of its own gets its own
+envs repo, age key and cluster instead.
+
+The admission policies and network policies still treat the node as untrusted: a container escape
+there gives root, and root on an agent holds the kubelet certificate and the node's network.
+
+## Lifecycle
 
 `tools/provision-hetzner-cloud.sh <env> --worker <tenant>-<n>` does the whole lifecycle:
 
-1. **Create**, in the tenant's project, with the tenant's API token:
+1. **Create**, in your Hetzner project, with your ops token:
    - a firewall that drops all inbound traffic except `udp/41641` (Tailscale direct connections);
    - the server, with that firewall in place from the first boot;
-   - cloud-init that installs Tailscale and joins the tailnet with a one-off tagged auth key.
+   - cloud-init that creates `admin` with your provisioning key, installs Tailscale and joins the
+     tailnet with a one-off auth key tagged `tag:tenant-<tenant>`.
 
-   The node has no public SSH and no ingress, and gets no DNS records.
+   Every resource carries the labels `managed-by=infra-skills`, `tenant=<tenant>` and
+   `node=<tenant>-<n>`. The script refuses to change a server or firewall of that name without all
+   three (your project holds other things). The node has no public SSH and no ingress, and gets no
+   DNS records.
 2. **Provision** over Tailscale as `admin`. The postinstall runs in its `tenant-worker` role: minimal
    packages, ufw (deny inbound except Tailscale and the k3s overlay), swap off, SSH root login off.
    It then reboots the node.
@@ -23,11 +48,11 @@ admission policies, network policies) is in [TENANTS.md](TENANTS.md).
    - the quarantine and tenant taints, and the tenant label.
 4. **Destroy** in reverse:
    - `join-worker.sh --remove` drains the node and deletes it from the cluster;
-   - the server and its firewall are deleted;
-   - the node's Tailscale device is deleted;
+   - the server and its firewall are deleted, only when they carry all three labels;
+   - the node's Tailscale device (hostname and tenant tag) is deleted;
    - EXTERNAL_IP and VLAN_IP are cleared in env.properties.
 
-   Only resources labelled `managed-by=infra-skills` and `tenant=<tenant>` are deleted.
+   Your provisioning SSH key stays registered in the project; other nodes use it too.
 
 `--dry-run` prints every API call: method, URL and body, with user data replaced by its size.
 GET calls run when a token is loaded, so the plan shows what already exists. POST, PUT and DELETE
@@ -38,7 +63,7 @@ calls are never sent. The SSH steps and the join-worker.sh call are printed and 
 `envs/<env>/<tenant>-<n>/env.properties`, the same file `join-worker.sh` reads:
 
 ```properties
-# Tenant worker of <tenant> on cluster <env> (Hetzner Cloud, the tenant's own project).
+# Tenant worker of <tenant> on cluster <env> (Hetzner Cloud, the operating org's project).
 TENANT=symbioen
 # The cluster server: its Tailscale IP (k3s API and flannel over the tailnet) and hostname.
 MASTER_VLAN_IP=100.x.y.z
@@ -47,8 +72,8 @@ MASTER_HOSTNAME=<server hostname>
 HCLOUD_SERVER_TYPE=cx33
 HCLOUD_LOCATION=hel1
 HCLOUD_IMAGE=ubuntu-24.04
-# Ingress hosts (Harbor) pinned to MASTER_VLAN_IP in /etc/hosts, for image pulls (join-worker.sh).
-REGISTRY_HOSTS=harbor.<cluster hostname>
+# No REGISTRY_HOSTS: the node pulls from Harbor over public 443, like any client. join-worker.sh
+# would pin Harbor to MASTER_VLAN_IP, where the tenant tag is granted no 443; the script refuses it.
 # Written by provision-hetzner-cloud.sh (SSH_VIA=tailscale: join-worker.sh skips the closed public :22):
 EXTERNAL_IP=
 VLAN_IP=
@@ -59,77 +84,88 @@ Optional keys:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `HCLOUD_TOKEN_FILE` | `<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt` | The tenant project's token file, relative to `envs/`. The sops copy under `secrets.sops/` is used when the plain file is missing |
+| `HCLOUD_TOKEN_FILE` | `shared/secrets.plain/hetzner-cloud-token.txt` | Your ops project's token file, relative to `envs/`, when this env's cloud nodes live in another of your projects. The sops copy under `secrets.sops/` is used when the plain file is missing. `HCLOUD_TOKEN` from the environment is never used |
 | `TAILSCALE_TAG` | `tag:tenant-<tenant>` | The node's tailnet identity |
 | `HCLOUD_FIREWALL_NAME` | `<tenant>-<n>` | The node's Hetzner firewall |
-| `HCLOUD_FIREWALL_SSH_CIDRS` | empty | Sources allowed to SSH to the public IP: a break-glass for when Tailscale on the node is down. The Hetzner console is the other way in |
+| `HCLOUD_FIREWALL_SSH_CIDRS` | empty | Your sources allowed to SSH to the public IP: a break-glass for when Tailscale on the node is down. The Hetzner console of your project is the other way in |
+| `TAILSCALE_DENY_TESTS` | empty | Extra `host:port` destinations the tag must not reach, tested with Tailscale's evaluator (below): subnet routes such as a home LAN, which the device list does not show |
 | `TAILSCALE_POLICY_CHECK` | refuse | `warn`: create the node even though the tailnet policy check fails (only for a throwaway test tailnet) |
-
-**The tenant's token.** The tenant creates a *Read & Write* API token in its own project
-(Hetzner console, then Security, then API Tokens). It gives you that token, and you store it as
-`envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt`, encrypted with
-`tools/sops/encrypt.sh <env> hetzner-cloud-token-<tenant>.txt`. The script never uses the shared
-token (`envs/shared/secrets.plain/hetzner-cloud-token.txt`) or an `HCLOUD_TOKEN` from the
-environment for a tenant worker. It refuses a tenant token file that holds the shared token.
 
 ## Tailnet policy
 
-The node is isolated on the tailnet only if the tailnet policy confines its tag. With the default
-policy (`grants: [{src: ["*"], dst: ["*"], ip: ["*"]}]`, or the older `acls` allow-all), the
-tenant's node reaches every device on your tailnet, on every port. Before creating a node, the
-script reads the policy and refuses when either of these holds:
+One tailnet can carry several envs and tenants if the policy segments it by tags:
+
+- **operators** (user-owned devices, `autogroup:member`) reach everything;
+- **each env's servers** carry an env tag (`tag:env-prod`, `tag:env-test`, ...) and reach only the
+  flows they need;
+- **a tenant tag** (`tag:tenant-<tenant>`) reaches only its cluster server, on `tcp:6443` (k3s
+  supervisor and API) and `udp:8472` (flannel VXLAN). A tenant's nodes may also reach each other on
+  `udp:8472`.
+
+With the default policy (`grants: [{src: ["*"], dst: ["*"], ip: ["*"]}]`, or the older `acls`
+allow-all) and no `tagOwners`, a tenant node reaches every device on the tailnet on every port, and
+its tagged auth key cannot even be minted. Before creating a node, the script reads the policy and
+the device list (read-only) and **refuses** when:
 
 - the tag is missing from `tagOwners`;
-- a rule lets `*` or the tag reach `*`.
+- a rule whose source can be the node (`*`, the tag, `autogroup:tagged`, `0.0.0.0/0`, a `100.x`
+  range wider than /32) reaches anything other than the cluster server on `tcp:6443` or `udp:8472`.
+  The cluster server is `MASTER_VLAN_IP`, a `hosts` alias of it, or a tag that **only** the device
+  with that address carries. An env tag that workers carry too does not count; use a `hosts` alias;
+- nothing grants the tag the server's `tcp:6443` and `udp:8472`: the node could not join;
+- an `ssh` rule's source can be the node (Tailscale SSH from the tenant node to anything);
+- Tailscale's own evaluator disagrees. The script puts the same questions as tests to
+  `POST /api/v2/tailnet/-/acl/validate`, which runs them against the live policy and changes
+  nothing: the tag is accepted on the server's tcp:6443 and udp:8472; denied on its 22, 443,
+  10250 and 5432; denied on every other tailnet device (the tenant's own nodes aside) on 22, 443,
+  6443 and udp:8472; denied on each `TAILSCALE_DENY_TESTS` destination. The evaluator also covers
+  what the static reading cannot, such as groups and IP sets.
 
-The node needs:
+It **warns** when nothing grants the server `udp:8472` back to the tag (VXLAN from the server to
+the node's pods would be dropped), and when the policy has no `tests` entry for the tag. Destroy
+and `--provision-only` do not run the check.
 
-- **tenant node to cluster server**: `tcp:6443` (k3s supervisor and API) and `udp:8472` (flannel VXLAN);
-- **cluster server to tenant node**: `udp:8472`. kubelet `tcp:10250` goes through the agent's own tunnel to 6443;
-  grant it anyway if you reach kubelets directly;
-- **operators to tenant node**: `tcp:22`, for the provisioning SSH.
-
-A policy that keeps every existing device's reach, assuming all of them are user-owned today, and
-confines the tenant:
+The tenant part of a segmented policy, with the prod server tagged `tag:env-prod`:
 
 ```jsonc
 {
   "tagOwners": {
-    "tag:tenant-symbioen": ["autogroup:admin"]
-  },
-  "hosts": {
-    "k3s-prod": "100.x.y.z"
+    "tag:env-prod":         ["autogroup:admin"],
+    "tag:tenant-symbioen":  ["autogroup:admin"]
   },
   "grants": [
-    // What "*" -> "*" gave before, now from user-owned devices only (tagged devices are not members).
+    // Operators reach everything (tagged devices are not members).
     {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
-    // The tenant node reaches the cluster server's k3s API and flannel, nothing else.
-    {"src": ["tag:tenant-symbioen"], "dst": ["k3s-prod"], "ip": ["tcp:6443", "udp:8472"]}
+    // The tenant node reaches its cluster server's k3s API and flannel, nothing else.
+    {"src": ["tag:tenant-symbioen"], "dst": ["tag:env-prod"], "ip": ["tcp:6443", "udp:8472"]},
+    // The server reaches the node's flannel, and its kubelet for metrics-server and Prometheus.
+    {"src": ["tag:env-prod"], "dst": ["tag:tenant-symbioen"], "ip": ["udp:8472", "tcp:10250"]}
   ],
   "tests": [
-    {"src": "tag:tenant-symbioen", "accept": ["k3s-prod:6443"], "deny": ["k3s-prod:22", "k3s-prod:5432"]}
+    {"src": "tag:tenant-symbioen", "accept": ["tag:env-prod:6443"], "deny": ["tag:env-prod:22", "tag:env-prod:5432"]}
   ]
 }
 ```
 
-Check what the `tests` block covers, and run `--dry-run` before every create: it prints the policy
-problems it finds. If the cluster server is itself a tagged device, put its tag in the second
-grant's `dst`, and grant that tag the reach `*` had.
+The rest of the policy (what each env tag reaches) belongs to your tailnet as a whole. Tagging a
+device re-authenticates it and makes the tag, not a user, its identity, so roll the env tags out one device at a
+time. Run `--dry-run` before every create: it prints the problems it finds.
 
 ## What lands on the node
 
-| On the node | Whose | Lifetime |
+All of it is the operating org's; the tenant receives none of it.
+
+| On the node | What | Lifetime |
 | --- | --- | --- |
-| The operator's SSH **public** key, for user `admin` | yours, public | until destroy |
-| A Tailscale auth key, in user data and in `/run/infra-skills/ts-authkey` | yours | single use, one hour. Spent at first boot; the file and cloud-init's copy are deleted. The metadata service (169.254.169.254) keeps serving the spent key to anything on the node |
-| The node's own Tailscale node key, tagged `tag:tenant-<tenant>` | the node's | until the device is deleted |
-| A k3s bootstrap token, in `/etc/systemd/system/k3s-agent.service.env` | yours | deleted on the server when join-worker.sh ends; agent-only even before that |
+| Your provisioning SSH **public** key, for user `admin` (and root's, which cloud-init disables) | the only key on the node | until destroy |
+| A Tailscale auth key, in user data and in `/run/infra-skills/ts-authkey` | single use, one hour | spent at first boot; the file and cloud-init's copy are deleted. The metadata service (169.254.169.254) keeps serving the spent key to anything on the node |
+| The node's own Tailscale node key, tagged `tag:tenant-<tenant>` | the node's tailnet identity | until the device is deleted |
+| A k3s bootstrap token, in `/etc/systemd/system/k3s-agent.service.env` | agent-only | deleted on the server when join-worker.sh ends |
 | `/etc/rancher/k3s/registries.yaml` | the tenant's pull robot | until destroy |
 | kubelet client certificate (`system:node:<tenant>-<n>`) | the node's | confined by NodeRestriction and the admission policies (TENANTS.md) |
 
-No platform credential is placed on the node: no server token, no platform registry robot, no
-Hetzner token, no Tailscale API key. The provisioning machine uses the tenant's Hetzner token and
-your Tailscale API key, and they stay there.
+No platform credential beyond these is placed on the node: no server token, no platform registry
+robot, no Hetzner token, no Tailscale API key. They stay on the provisioning machine.
 
 ## Size for evse-ts (2026-11-20)
 
@@ -175,6 +211,8 @@ Sources:
 - **The tailnet policy** is yours to change, in the Tailscale admin console (above). infra-skills
   only checks it.
 - **Monitoring of the node.** Promtail and node-exporter do not run on tenant nodes (TENANTS.md).
-  Hetzner's own CPU, disk and network graphs are in the tenant's console.
+  Hetzner's CPU, disk and network graphs are in your project's console.
 - **Automatic restock.** When `HCLOUD_SERVER_TYPE` is unavailable, the script stops and lists what
   is available instead of choosing a type for you.
+- **Billing the tenant.** The node is on your Hetzner invoice; charge it on as you agree with the
+  tenant (the `tenant` label lets you find its resources).

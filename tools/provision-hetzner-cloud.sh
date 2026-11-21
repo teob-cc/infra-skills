@@ -5,9 +5,10 @@
 #
 #   server          (default) a K3s server on a cloud VM, with a Hetzner Cloud private network.
 #   private worker  MASTER_PRIVATE_IP set: a K3s agent that joins a cloud server over that network.
-#   tenant worker   --worker <tenant>-<n>: a VM in the TENANT's own Hetzner project (its own API
-#                   token) that joins an existing cluster (bare metal or cloud) over Tailscale as an
-#                   isolated tenant worker, through tools/k3s/join-worker.sh --tenant. No private
+#   tenant worker   --worker <tenant>-<n>: a VM in the OPERATING org's Hetzner project (the env's ops
+#                   token) that runs only one tenant's pods and joins an existing cluster (bare metal or
+#                   cloud) over Tailscale as an isolated tenant worker, through tools/k3s/join-worker.sh
+#                   --tenant. The ops org holds root and every key; the tenant gets no shell. No private
 #                   network, no public inbound port but Tailscale's, no DNS records.
 #                   See docs/HETZNER-CLOUD-TENANT.md.
 #
@@ -51,11 +52,11 @@
 #   HCLOUD_IMAGE=ubuntu-24.04
 #   # Written by this script: EXTERNAL_IP (public IPv4), VLAN_IP (Tailscale IPv4), SSH_VIA=tailscale
 #   # Optional: HCLOUD_TOKEN_FILE, TAILSCALE_TAG (default tag:tenant-<tenant>), HCLOUD_FIREWALL_SSH_CIDRS,
-#   #           REGISTRY_HOSTS (join-worker.sh)
-#   The tenant project's API token: envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt (or the
-#   sops copy in secrets.sops/, or HCLOUD_TOKEN_FILE relative to envs/). The shared token
-#   (envs/shared/secrets.plain/hetzner-cloud-token.txt) and an HCLOUD_TOKEN in the environment are
-#   never used for a tenant worker.
+#   #           TAILSCALE_DENY_TESTS. Not REGISTRY_HOSTS: a tenant node pulls over public 443.
+#   The API token is the ops org's: envs/shared/secrets.plain/hetzner-cloud-token.txt (or its sops copy
+#   in secrets.sops/), or HCLOUD_TOKEN_FILE (relative to envs/) for an env whose nodes live in another
+#   ops project. Every resource is labelled managed-by=infra-skills, tenant=<tenant>, node=<name>;
+#   nothing without those labels is changed or deleted.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -99,7 +100,7 @@ Tenant worker (--worker NAME): envs/<env>/NAME/env.properties with
   MASTER_HOSTNAME=<server hostname>
   HCLOUD_SERVER_TYPE=cx33          # default: cx33
   HCLOUD_LOCATION=hel1             # default: hel1
-  Token: envs/<env>/secrets.plain/hetzner-cloud-token-<tenant>.txt (or HCLOUD_TOKEN_FILE)
+  Token: the ops project's, envs/shared/secrets.plain/hetzner-cloud-token.txt (or HCLOUD_TOKEN_FILE)
   See docs/HETZNER-CLOUD-TENANT.md.
 USAGE
 }
@@ -321,17 +322,13 @@ SSH_PUBKEY_CONTENT=$(cat "${PROV_SSH_PUB}")
 HCLOUD_API="${HCLOUD_API:-https://api.hetzner.cloud/v1}"
 HCLOUD_TOKEN=""
 
-# Where the API token of the project the node lives in is read from.
-# A tenant worker lives in the tenant's own project: only its own token file is ever used, never
-# the shared one and never an HCLOUD_TOKEN from the environment (the hcloud CLI uses that variable,
-# so it may hold the platform's own project).
+# Where the API token of the project the node lives in is read from: the ops org's project (a
+# tenant worker too: the ops org owns the VM, so nobody else has its console, rescue system or
+# root password reset). HCLOUD_TOKEN_FILE, relative to envs/, points at another ops project. An
+# HCLOUD_TOKEN in the environment is never used (the hcloud CLI's variable may hold any project).
 function hcloud::token_file(){
-  if $TENANT_MODE; then
-    if [[ -n "${HCLOUD_TOKEN_FILE:-}" ]]; then
-      if [[ "$HCLOUD_TOKEN_FILE" == /* ]]; then echo "$HCLOUD_TOKEN_FILE"; else echo "${ENV_ROOT}/${HCLOUD_TOKEN_FILE}"; fi
-    else
-      echo "${CLUSTER_DIR}/secrets.plain/hetzner-cloud-token-${TENANT}.txt"
-    fi
+  if [[ -n "${HCLOUD_TOKEN_FILE:-}" ]]; then
+    if [[ "$HCLOUD_TOKEN_FILE" == /* ]]; then echo "$HCLOUD_TOKEN_FILE"; else echo "${ENV_ROOT}/${HCLOUD_TOKEN_FILE}"; fi
   else
     echo "${ENV_ROOT}/shared/secrets.plain/hetzner-cloud-token.txt"
   fi
@@ -352,24 +349,15 @@ function hcloud::read_token(){
       err ""
       err "Create this file with the project's Hetzner Cloud API token:"
       err "  1. Go to https://console.hetzner.cloud → Project → Security → API Tokens"
-      err "  2. Create a Read & Write token$($TENANT_MODE && echo " in the TENANT's project")"
+      err "  2. Create a Read & Write token in your own (operating org's) project"
       err "  3. Save it to: $token_file"
-      err "  4. Encrypt with: tools/sops/encrypt.sh $($TENANT_MODE && echo "${ENV_NAME}" || echo shared) $(basename "$token_file")"
+      err "  4. Encrypt with: tools/sops/encrypt.sh $(basename "$(dirname "$(dirname "$token_file")")") $(basename "$token_file")"
       return 1
     fi
   fi
   if [[ -z "${HCLOUD_TOKEN:-}" ]]; then
     err "Hetzner Cloud API token file is empty: $token_file"
     return 1
-  fi
-  if $TENANT_MODE; then
-    # The tenant's node must not land in the platform's project (billing, and the platform's
-    # token would be the one the node's owner could act on). Compare without printing either.
-    local shared="${ENV_ROOT}/shared/secrets.plain/hetzner-cloud-token.txt"
-    if [[ -f "$shared" && "$(tr -d '\n\r' < "$shared" | xargs)" == "$HCLOUD_TOKEN" ]]; then
-      err "$(hcloud::token_file) holds the shared (platform) project token, not the tenant's"
-      return 1
-    fi
   fi
   dbg "Hetzner Cloud token read from $(hcloud::token_file) (or its sops copy)"
 }
@@ -527,10 +515,11 @@ function hcloud::create_ssh_key(){
     echo "$existing_id"
     return 0
   fi
-  # Create new key
+  # Create new key. It is the operator's provisioning key, shared by every node in the ops
+  # project, so it carries no node or tenant label.
   local create_out body
   body=$(jq -cn --arg name "$name" --arg key "$pubkey" --argjson labels "$HCLOUD_LABELS_JSON" \
-    '{name: $name, public_key: $key, labels: ($labels | del(.node))}')
+    '{name: $name, public_key: $key, labels: ($labels | {"managed-by"})}')
   create_out=$(hcloud::api POST "/ssh_keys" "$body" 2>/dev/null) || {
     # Key might exist with different name but same fingerprint
     local error_code
@@ -644,6 +633,12 @@ function hcloud::ensure_firewall(){
   out=$(hcloud::api GET "/firewalls?name=${name}" 2>/dev/null) || { err "Cannot list firewalls: $(hcloud::last_error)"; return 1; }
   fw_id=$(printf '%s' "$out" | jq -r '.firewalls[0].id // empty')
   if [[ -n "$fw_id" ]]; then
+    # The ops project holds other resources: never take over a firewall this script did not label.
+    if ! printf '%s' "$out" | jq -e --argjson want "$HCLOUD_LABELS_JSON" \
+         '.firewalls[0].labels as $l | all($want | to_entries[]; $l[.key] == .value)' >/dev/null; then
+      err "Firewall '${name}' (ID: ${fw_id}) exists without the labels $(jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$HCLOUD_LABELS_JSON"): not this node's; set HCLOUD_FIREWALL_NAME"
+      return 1
+    fi
     if [[ "$(printf '%s' "$out" | jq -c '.firewalls[0].rules | map({direction, protocol, port, source_ips})')" \
        == "$(printf '%s' "$rules" | jq -c 'map({direction, protocol, port, source_ips})')" ]]; then
       ok "Firewall '${name}' exists with the expected rules (ID: ${fw_id})" >&2
@@ -823,7 +818,11 @@ function tailscale::api(){
   local url="https://api.tailscale.com/api/v2${path}"
   dbg "TAILSCALE ${method} ${url}"
 
-  if $DRY_RUN && { [[ "$method" != GET ]] || [[ -z "$TS_API_TOKEN" ]] || [[ "$path" == *"<"* ]]; }; then
+  # POST .../acl/validate only evaluates tests against the live policy and changes nothing: it runs
+  # in a dry-run like a GET.
+  local read_only=false
+  [[ "$method" == GET || ( "$method" == POST && "$path" == */acl/validate ) ]] && read_only=true
+  if $DRY_RUN && { ! $read_only || [[ -z "$TS_API_TOKEN" ]] || [[ "$path" == *"<"* ]]; }; then
     plan "TAILSCALE ${method} ${url}${data:+ ${data}}"
     TS_LAST_HTTP="000"; TS_LAST_BODY=""
     if [[ "$method" == POST && "$path" == */keys ]]; then
@@ -936,25 +935,116 @@ function tailscale::delete_device(){
   ok "Deleted Tailscale device ${device_id}"
 }
 
-# A tagged tenant node is only as isolated as the tailnet policy makes it. Check (read-only) that
-# the tag exists in tagOwners (else Tailscale refuses the tagged auth key) and that no rule lets it,
-# or every source ("*"), reach every destination: with the default allow-all policy the tenant's
-# node would reach every device on the tailnet. docs/HETZNER-CLOUD-TENANT.md has the rules to use.
-# Prints one problem per line; returns 1 when there is one. TAILSCALE_POLICY_CHECK=warn downgrades
-# the refusal in tenant::preflight (a tailnet of the tenant's own, a throwaway test tailnet).
+# A tagged tenant node is only as isolated as the tailnet policy makes it. The tailnet is segmented
+# by tags (INFRA-219): operators (autogroup:member) reach everything, each env's servers carry an
+# env tag, and a tenant tag reaches only its cluster server's tcp:6443 (k3s supervisor and API) and
+# udp:8472 (flannel VXLAN). Read-only check of the policy and the device list:
+#   REFUSE  the tag is not in tagOwners (Tailscale refuses the tagged auth key);
+#   REFUSE  a rule whose source can be the node ("*", the tag, autogroup:tagged, a 100.x range
+#           wider than /32, 0.0.0.0/0) reaches anything but the cluster server on tcp:6443 or
+#           udp:8472 (the tag's other nodes on udp:8472 are allowed too). The server is SERVER_IP,
+#           a hosts alias of it, or a tag that only the device with SERVER_IP carries;
+#   REFUSE  nothing grants the tag the server's tcp:6443 or udp:8472 (the node could not join);
+#   REFUSE  an ssh rule's source can be the node (Tailscale SSH from the tenant node);
+#   REFUSE  Tailscale's own evaluator (POST /acl/validate, tests only) fails tailscale::policy_tests;
+#   WARN    nothing visibly grants the server udp:8472 back to the tag, or no tests entry for it.
+# Usage: tailscale::policy_problems TAG SERVER_IP. Prints "REFUSE ..." and "WARN ..." lines; returns
+# 1 when there is a REFUSE line. TAILSCALE_POLICY_CHECK=warn downgrades the refusal in
+# tenant::preflight (a throwaway test tailnet only). docs/HETZNER-CLOUD-TENANT.md has a policy.
 function tailscale::policy_problems(){
-  local tag="$1" policy
+  local tag="$1" server_ip="${2%%/*}" policy devices out
   policy=$(tailscale::api GET "/tailnet/$(tailscale::get_tailnet)/acl") || {
-    echo "cannot read the tailnet policy (HTTP ${TS_LAST_HTTP:-?}): check it by hand"; return 1; }
-  printf '%s' "$policy" | jq -r --arg tag "$tag" '
-    def from_tag: (.src // []) | any(. == "*" or . == $tag);
-    (if ((.tagOwners // {}) | has($tag)) then empty
-     else "\($tag) is not in tagOwners: Tailscale refuses an auth key with it" end),
-    ((.acls // [])[] | select((.action // "accept") == "accept" and from_tag and ((.dst // []) | any(startswith("*:"))))
-     | "acls rule src=\(.src | join(",")) dst=\(.dst | join(",")) lets \($tag) reach every device"),
-    ((.grants // [])[] | select(from_tag and ((.dst // []) | any(. == "*")))
-     | "grants rule src=\(.src | join(",")) dst=\(.dst | join(",")) lets \($tag) reach every device")
-  ' | { problems=$(cat); [[ -z "$problems" ]] || { printf '%s\n' "$problems"; return 1; }; }
+    echo "REFUSE cannot read the tailnet policy (HTTP ${TS_LAST_HTTP:-?}): check it by hand"; return 1; }
+  devices=$(tailscale::api GET "/tailnet/$(tailscale::get_tailnet)/devices") || {
+    echo "REFUSE cannot list the tailnet devices (HTTP ${TS_LAST_HTTP:-?})"; return 1; }
+  out=$(jq -rn --slurpfile p <(printf '%s' "$policy") --slurpfile d <(printf '%s' "$devices") \
+    --arg tag "$tag" --arg ip "$server_ip" '
+    $p[0] as $pol | ($d[0].devices // []) as $devs | ($pol.hosts // {}) as $hosts
+    | def ip_of($sel): ($hosts[$sel] // $sel) | tostring | sub("/32$"; "");
+      def tag_devices($t): [$devs[] | select((.tags // []) | index($t))];
+      def is_server($sel):
+        if ($sel | startswith("tag:")) then
+          tag_devices($sel) as $td | ($td | length) > 0 and all($td[]; (.addresses // []) | index($ip))
+        else ip_of($sel) == $ip end;
+      def can_be_node:
+        . == "*" or . == $tag or . == "autogroup:tagged" or . == "0.0.0.0/0" or . == "::/0"
+        or (test("^100\\.[0-9.]+/[0-9]+$") and ((split("/")[1] | tonumber) < 32));
+      def proto: if . == "tcp" or . == "6" then "tcp" elif . == "udp" or . == "17" then "udp" else "" end;
+      # Every accept rule as {kind, src, targets: [{sel, ports: ["tcp:6443", "*", ...]}]}.
+      def rules:
+        ( ($pol.grants // [])[] | . as $g
+          | {kind: "grants", src: (.src // []),
+             targets: [(.dst // [])[] | {sel: ., ports: ($g.ip // ["<app capabilities>"])}]} ),
+        ( ($pol.acls // [])[] | select((.action // "accept") == "accept") | ((.proto // "") | proto) as $pr
+          | {kind: "acls", src: (.src // []),
+             targets: [(.dst // [])[] | capture("^(?<sel>.*):(?<ports>[^:]*)$")
+                       | {sel, ports: (.ports | split(",") | map(if $pr == "" then . else "\($pr):\(.)" end))}]} );
+      def allowed($t): ($t.ports - ["tcp:6443", "udp:8472"] | length) == 0 and is_server($t.sel)
+                       or ($t.sel == $tag and ($t.ports - ["udp:8472"] | length) == 0);
+      def desc: "\(.kind) rule src=\(.src | join(","))";
+      ([$devs[] | select((.addresses // []) | index($ip))] | first) as $srv
+    | (if (($pol.tagOwners // {}) | has($tag)) then empty
+       else "REFUSE \($tag) is not in tagOwners: Tailscale refuses an auth key with it" end),
+      (rules | select(any(.src[]; can_be_node)) as $r | $r.targets[] | select(allowed(.) | not)
+       | "REFUSE \($r | desc) lets \($tag) reach \(.sel) on \(.ports | join(","))"
+         + (if (.sel | startswith("tag:")) and .sel != $tag
+            then " (\(.sel) is on: \([tag_devices(.sel)[] | .hostname // "?"] | join(", ") | if . == "" then "no device" else . end))"
+            else "" end)),
+      ([rules | select(any(.src[]; can_be_node)) | .targets[] | select(is_server(.sel)) | .ports[]] as $granted
+       | ("tcp:6443", "udp:8472") | select(. as $want | $granted | index($want) | not)
+       | "REFUSE nothing grants \($tag) the cluster server \($ip) on \(.): the node cannot join"),
+      (if $srv == null then "WARN no tailnet device has the cluster server address \($ip)"
+       else
+         ($srv.tags // []) as $st
+         | [rules | select(any(.src[]; . == "*" or ip_of(.) == $ip or (. as $s | $st | index($s))
+                               or (($st | length) == 0 and (startswith("tag:") | not))))
+           | .targets[] | select(.sel == $tag or .sel == "*" or .sel == "autogroup:tagged")
+           | select(any(.ports[]; . == "*" or . == "udp:8472" or . == "udp:*" or . == "8472"))]
+         | if length > 0 then empty
+           else "WARN nothing grants the cluster server (\($srv.hostname // $ip)) udp:8472 to \($tag): VXLAN from the server to the node is dropped" end
+       end),
+      (($pol.ssh // [])[] | select(any((.src // [])[]; can_be_node))
+       | "REFUSE ssh rule src=\(.src | join(",")) lets \($tag) open Tailscale SSH sessions to \((.dst // []) | join(","))"),
+      (if any(($pol.tests // [])[]; .src == $tag) then empty
+       else "WARN the policy has no tests entry with src \($tag)" end)
+  ') || { echo "REFUSE cannot evaluate the tailnet policy (jq)"; return 1; }
+
+  # The same questions put to Tailscale's own evaluator: POST /acl/validate with tests only runs
+  # them against the live policy and changes nothing. It answers 200 either way; a "message" in
+  # the body means a test failed.
+  local tests verdict msg
+  tests=$(tailscale::policy_tests "$tag" "$server_ip" "$devices")
+  if verdict=$(tailscale::api POST "/tailnet/$(tailscale::get_tailnet)/acl/validate" "$tests"); then
+    msg=$(printf '%s' "$verdict" | jq -r '(.message // empty) as $m | if $m == "" then empty
+            else ([$m] + ([.data[]? | (.errors // [])[]] | unique) | join("; ")) end' 2>/dev/null)
+    [[ -n "$msg" ]] && out+=$'\n'"REFUSE Tailscale's test run ($(jq 'length' <<<"$tests") tests): ${msg}"
+  else
+    out+=$'\n'"REFUSE cannot run the policy tests (HTTP ${TS_LAST_HTTP:-?})"
+  fi
+
+  out=$(sed '/^$/d' <<<"$out")
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  ! grep -q '^REFUSE' <<<"$out"
+}
+
+# Tests for /acl/validate: the tag reaches the cluster server on tcp:6443 and udp:8472 and nothing
+# else there (22, 443, 10250, 5432), and no other tailnet device (its own tenant's nodes aside) on
+# 22, 443, 6443 or udp:8472. TAILSCALE_DENY_TESTS adds "host:port" destinations it must not reach
+# either (subnet routes such as a home LAN, which the device list does not show).
+# Usage: tailscale::policy_tests TAG SERVER_IP DEVICES_JSON
+function tailscale::policy_tests(){
+  jq -cn --slurpfile d <(printf '%s' "$3") --arg tag "$1" --arg ip "$2" --arg extra "${TAILSCALE_DENY_TESTS:-}" '
+    [($d[0].devices // [])[] | select((.addresses // []) | index($ip) | not)
+     | select((.tags // []) | index($tag) | not) | (.addresses // [])[] | select(test("^100\\."))] as $others
+    | ($extra | split(",") | map(split(" ")) | add // [] | map(select(. != ""))) as $x
+    | [{src: $tag, proto: "tcp", accept: ["\($ip):6443"],
+        deny: ["\($ip):22", "\($ip):443", "\($ip):10250", "\($ip):5432"]},
+       {src: $tag, proto: "udp", accept: ["\($ip):8472"]}]
+      + (if ($others | length) > 0 then
+           [{src: $tag, proto: "tcp", deny: [$others[] | "\(.):22", "\(.):443", "\(.):6443"]},
+            {src: $tag, proto: "udp", deny: [$others[] | "\(.):8472"]}]
+         else [] end)
+      + (if ($x | length) > 0 then [{src: $tag, deny: $x}] else [] end)'
 }
 
 function tailscale::cleanup_stale_devices(){
@@ -1899,9 +1989,18 @@ function env_set(){
 }
 
 # ============================================================================
-# Tenant worker (--worker): a node in the tenant's own Hetzner project that joins the cluster over
-# Tailscale through tools/k3s/join-worker.sh --tenant. docs/HETZNER-CLOUD-TENANT.md.
+# Tenant worker (--worker): a node in the ops org's Hetzner project, running one tenant's pods,
+# that joins the cluster over Tailscale through tools/k3s/join-worker.sh --tenant.
+# docs/HETZNER-CLOUD-TENANT.md.
 # ============================================================================
+
+# True when a Hetzner resource (JSON with .labels) carries all of this node's labels: the ops
+# project holds other servers and firewalls, and only this node's may be changed or deleted.
+function tenant::ours(){
+  jq -e --argjson want "$HCLOUD_LABELS_JSON" '.labels as $l | all($want | to_entries[]; $l[.key] == .value)' \
+    >/dev/null 2>&1 <<<"$1"
+}
+HCLOUD_LABELS_TEXT=$(jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$HCLOUD_LABELS_JSON")
 
 JOIN_WORKER="${REPO_ROOT}/tools/k3s/join-worker.sh"
 CLUSTER_KUBECONFIG="${CLUSTER_DIR}/kubeconfig.yaml"
@@ -1931,7 +2030,7 @@ function tenant::preflight(){
   info "Tenant worker ${NODE_NAME} of tenant ${TENANT} for cluster ${ENV_NAME}"
   info "  Hetzner: ${HCLOUD_SERVER_TYPE} in ${HCLOUD_LOCATION}, image ${HCLOUD_IMAGE}, firewall '${HCLOUD_FIREWALL_NAME}'"
   info "  Tailscale: hostname ${NODE_NAME}, tag ${TAILSCALE_TAG}; cluster server ${MASTER_HOSTNAME} (${MASTER_VLAN_IP%%/*})"
-  info "  Token: $(hcloud::token_file)"
+  info "  Token: $(hcloud::token_file) (the ops project); labels ${HCLOUD_LABELS_TEXT}"
 
   if ! hcloud::read_token; then
     if $DRY_RUN; then warn "(--dry-run: continuing without a token; GET calls are printed, not run)"; HCLOUD_TOKEN=""; else return 1; fi
@@ -1945,13 +2044,28 @@ function tenant::preflight(){
     fi
   fi
 
+  # join-worker.sh pins REGISTRY_HOSTS to the server's Tailscale IP. The tenant tag is granted
+  # no 443 there (and 100.64/10 is a trust signal for platform allowlists): pull over public 443.
+  if [[ -n "${REGISTRY_HOSTS:-}" ]] && ! $DESTROY; then
+    if $DRY_RUN; then warn "(--dry-run) REGISTRY_HOSTS is set in ${ENV_FILE}: remove it"; else
+      err "REGISTRY_HOSTS is set in ${ENV_FILE}: a tenant node pulls images over public 443, not through the server's Tailscale IP (the tag is granted no 443). Remove it."
+      return 1
+    fi
+  fi
+
   # Only for creating a node: destroy and re-provision must work whatever the policy says.
   if $CREATE_SERVER && ! $DESTROY && [[ -n "$TS_API_TOKEN" ]]; then
-    local problems
-    if problems=$(tailscale::policy_problems "$TAILSCALE_TAG"); then
+    local problems p
+    if problems=$(tailscale::policy_problems "$TAILSCALE_TAG" "$MASTER_VLAN_IP"); then
+      while IFS= read -r p; do [[ -n "$p" ]] && warn "Tailnet policy: ${p#WARN }"; done <<<"$problems"
       ok "Tailnet policy: ${TAILSCALE_TAG} is owned and confined"
     else
-      while IFS= read -r p; do [[ -n "$p" ]] && err "Tailnet policy: $p"; done <<<"$problems"
+      while IFS= read -r p; do
+        case "$p" in
+          REFUSE*) err "Tailnet policy: ${p#REFUSE }";;
+          WARN*) warn "Tailnet policy: ${p#WARN }";;
+        esac
+      done <<<"$problems"
       if $DRY_RUN || [[ "${TAILSCALE_POLICY_CHECK:-}" == "warn" ]]; then
         warn "(continuing: $($DRY_RUN && echo --dry-run || echo TAILSCALE_POLICY_CHECK=warn))"
       else
@@ -1981,8 +2095,9 @@ function tenant::create(){
     HCLOUD_SERVER_ID=$(printf '%s' "$existing" | jq -r '.id')
     HCLOUD_PUBLIC_IP=$(printf '%s' "$existing" | jq -r '.public_net.ipv4.ip // empty')
     ok "Server '${HCLOUD_SERVER_NAME}' already exists (ID: ${HCLOUD_SERVER_ID}, IP: ${HCLOUD_PUBLIC_IP})"
-    if [[ "$(printf '%s' "$existing" | jq -r '.labels.tenant // empty')" != "$TENANT" ]]; then
-      warn "Server '${HCLOUD_SERVER_NAME}' does not carry the label tenant=${TENANT}: not created by this script"
+    if ! tenant::ours "$existing"; then
+      err "Server '${HCLOUD_SERVER_NAME}' in the ops project lacks the labels ${HCLOUD_LABELS_TEXT}: not this node; refusing to touch it"
+      return 1
     fi
     fw_id=$(hcloud::ensure_firewall "${HCLOUD_FIREWALL_NAME}") || return 1
     if ! hcloud::firewall_applied "$HCLOUD_SERVER_ID" "$fw_id"; then
@@ -2038,7 +2153,7 @@ function tenant::lookup_server(){
   existing=$(hcloud::get_server "${HCLOUD_SERVER_NAME}" 2>/dev/null || true)
   if [[ -z "$existing" ]]; then
     if $DRY_RUN; then HCLOUD_SERVER_ID="<server-id>"; HCLOUD_PUBLIC_IP="<public-ipv4>"; return 0; fi
-    err "Server '${HCLOUD_SERVER_NAME}' not found in the tenant's project. Run without --provision-only first."
+    err "Server '${HCLOUD_SERVER_NAME}' not found in the ops project. Run without --provision-only first."
     return 1
   fi
   HCLOUD_SERVER_ID=$(printf '%s' "$existing" | jq -r '.id')
@@ -2142,7 +2257,7 @@ function tenant::join(){
 
 function tenant::destroy(){
   local existing server_id fw_out fw_id
-  echo -e "${RED}WARNING: This will remove node '${NODE_NAME}' from cluster ${ENV_NAME} and permanently delete server '${HCLOUD_SERVER_NAME}' in the tenant's Hetzner project${NC}" >&2
+  echo -e "${RED}WARNING: This will remove node '${NODE_NAME}' from cluster ${ENV_NAME} and permanently delete server '${HCLOUD_SERVER_NAME}' in the ops Hetzner project${NC}" >&2
   if $DRY_RUN; then
     plan "confirm: type the server name ${HCLOUD_SERVER_NAME}"
   else
@@ -2154,8 +2269,8 @@ function tenant::destroy(){
   fi
 
   existing=$(hcloud::get_server "${HCLOUD_SERVER_NAME}" 2>/dev/null || true)
-  if [[ -n "$existing" && "$(printf '%s' "$existing" | jq -r '.labels.tenant // empty')" != "$TENANT" ]]; then
-    err "Server '${HCLOUD_SERVER_NAME}' does not carry the label tenant=${TENANT}: refusing to delete what this script did not create"
+  if [[ -n "$existing" ]] && ! tenant::ours "$existing"; then
+    err "Server '${HCLOUD_SERVER_NAME}' lacks the labels ${HCLOUD_LABELS_TEXT}: refusing to delete what this script did not create"
     return 1
   fi
 
@@ -2173,12 +2288,17 @@ function tenant::destroy(){
   elif $DRY_RUN; then
     hcloud::delete_server "<server-id>"
   else
-    warn "Server '${HCLOUD_SERVER_NAME}' not found in the tenant's project"
+    warn "Server '${HCLOUD_SERVER_NAME}' not found in the ops project"
   fi
 
-  # 3. Its firewall (only one this script labelled for this node).
+  # 3. Its firewall (only one this script labelled for this node and tenant).
   fw_out=$(hcloud::api GET "/firewalls?name=${HCLOUD_FIREWALL_NAME}" 2>/dev/null || echo '{}')
-  fw_id=$(printf '%s' "$fw_out" | jq -r --arg node "$NODE_NAME" '.firewalls[0] | select(.labels.node == $node and .labels["managed-by"] == "infra-skills") | .id // empty')
+  fw_id=""
+  if tenant::ours "$(printf '%s' "$fw_out" | jq -c '.firewalls[0] // {}')"; then
+    fw_id=$(printf '%s' "$fw_out" | jq -r '.firewalls[0].id')
+  elif [[ "$(printf '%s' "$fw_out" | jq -r '.firewalls | length' 2>/dev/null)" -gt 0 ]]; then
+    warn "Firewall '${HCLOUD_FIREWALL_NAME}' lacks the labels ${HCLOUD_LABELS_TEXT}: left in place"
+  fi
   $DRY_RUN && [[ -z "$fw_id" ]] && fw_id="<firewall-id>"
   if [[ -n "$fw_id" ]]; then
     local i
@@ -2195,7 +2315,7 @@ function tenant::destroy(){
 
   env_set VLAN_IP ""
   env_set EXTERNAL_IP ""
-  info "Left in place: the SSH key 'infra-skills-*' in the tenant's project (free; shared by its nodes)"
+  info "Left in place: the operator's SSH key 'infra-skills-*' in the ops project (free; shared by every node)"
   ok "Destroy complete"
 }
 
