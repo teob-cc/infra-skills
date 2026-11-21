@@ -401,6 +401,18 @@ STALE=$(kubectl get networkpolicy -A -l "$SELECTOR" -o json | jq -r --slurpfile 
 
 # --- Plan ----------------------------------------------------------------------
 log "plan: ${COUNT} policies in ${#TARGET_NS[@]} namespaces (${TARGET_NS[*]:-none})"
+# NetworkPolicies add up: another policy in these namespaces with an ingress rule that has no
+# `from` admits every source, tenant nodes included, whatever the default deny says. Charts
+# ship such policies (the Argo CD chart's argocd-server policy is `ingress: [{}]`; INFRA-214
+# found it reachable from a tenant node). Named here; narrowing them is the chart's setting.
+if (( ${#TARGET_NS[@]} > 0 )); then
+  kubectl get networkpolicies -A -o json 2>/dev/null | jq -r --arg m "$MANAGER" --argjson ns "$(printf '%s\n' "${TARGET_NS[@]}" | jq -R . | jq -sc .)" '
+    .items[] | select(.metadata.namespace as $n | $ns | index($n))
+    | select((.metadata.labels["app.kubernetes.io/managed-by"] // "") != $m)
+    | select(any(.spec.ingress[]?; (.from // []) | length == 0))
+    | "\(.metadata.namespace)/\(.metadata.name) (pods \(.spec.podSelector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",") | if . == "" then "all" else . end))"' \
+  | while read -r p; do log "warning: ${p} admits ingress from anywhere (overrides the default deny for those pods, tenant nodes included)"; done
+fi
 if (( COUNT > 0 )); then
   set +e
   kubectl diff --server-side --field-manager="$MANAGER" -f "$RENDERED"
