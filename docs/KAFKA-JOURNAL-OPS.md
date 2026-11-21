@@ -51,7 +51,7 @@ route narrowed to admins.
   separator, or with `-`, would. Apps whose names do not start with `<app-id>.` set
   `KAFKA_ACL_PREFIX` (`*` grants every resource of those types), or keep hand-written ACLs.
   Apps that manage their own users through Argo CD put the same KafkaUser in their chart.
-- **ACL pattern types** are `literal` and `prefix` (Redpanda's `User` said `prefixed`).
+- **ACL pattern types** are `literal` and `prefix`.
   The cluster resource takes no name: `resource: {type: cluster}`.
 - **Topics** are created by the apps (`auto.create.topics.enable=false`) or declared as
   `KafkaTopic` resources. The Topic Operator owns a topic with a KafkaTopic: **deleting
@@ -75,15 +75,15 @@ route narrowed to admins.
   broker's own heap (`-Xms` = `-Xmx`, 1g by default), and a CLI JVM started with it inside
   the broker's memory limit can get the broker OOM-killed.
 
-| Redpanda (`rpk`) | Kafka (`/opt/kafka/bin`) |
+| Task | Kafka (`/opt/kafka/bin`) |
 |---|---|
-| `rpk cluster health` | `kafka-metadata-quorum.sh describe --status`, `kubectl -n kafka get kafka kafka` |
-| `rpk topic list --detailed` | `kafka-topics.sh --describe` |
-| `rpk topic alter-config <t> --set k=v` | `kafka-configs.sh --alter --entity-type topics --entity-name <t> --add-config k=v` (or the KafkaTopic's `config`) |
-| `rpk group list` / `describe <g>` | `kafka-consumer-groups.sh --list` / `--describe --group <g>` |
-| `rpk group delete <g>` | `kafka-consumer-groups.sh --delete --group <g>` |
-| `rpk group seek <g> --to start` | `kafka-consumer-groups.sh --reset-offsets --group <g> --all-topics --to-earliest --execute`; the group must have no active members, so stop its consumers first (scale to 0 through git) |
-| `rpk security user create` | a `KafkaUser` (`--provision-credentials`) |
+| cluster health | `kafka-metadata-quorum.sh describe --status`, `kubectl -n kafka get kafka kafka` |
+| list topics with their config | `kafka-topics.sh --describe` |
+| change a topic setting | `kafka-configs.sh --alter --entity-type topics --entity-name <t> --add-config k=v` (or the KafkaTopic's `config`) |
+| list / describe consumer groups | `kafka-consumer-groups.sh --list` / `--describe --group <g>` |
+| delete a consumer group | `kafka-consumer-groups.sh --delete --group <g>` |
+| rewind a group to the start | `kafka-consumer-groups.sh --reset-offsets --group <g> --all-topics --to-earliest --execute`; the group must have no active members, so stop its consumers first (scale to 0 through git) |
+| create a user | a `KafkaUser` (`--provision-credentials`) |
 
 ## Restart procedures {#restart}
 
@@ -195,49 +195,15 @@ there until replicated:
 
 ## Migrating from Redpanda {#migrate-from-redpanda}
 
-Earlier versions of this stack ran Redpanda (`tools/k3s/redpanda.sh`); a `tools/up.sh` run
-that would reach the old `redpanda` step stops while an env still lists it in
-`UP_OPTIONAL_STEPS`. A new broker restarts every offset at 0, and topic copies
-(MirrorMaker) do not keep offsets, so a running journal cannot be carried over by copying
-topics.
-
-**If the Redpanda workloads can be dropped** (experimental apps, test data), skip the
-side-by-side run: stop the apps, remove Redpanda (step 6 below), reset their journal state,
-then run `tools/k3s/kafka.sh <env>` and point the apps at Kafka.
-
-**Side by side**, to keep the apps' downtime short, per environment:
-
-1. Run `tools/k3s/kafka.sh <env>` next to Redpanda. While Redpanda Console's Ingress or
-   Pomerium route owns `console.<env>`, kafka.sh warns and skips the Kafbat UI and its
-   route (`--force-console` takes the host anyway; `KAFKA_CONSOLE_HOST` picks another).
-   Then `tools/k3s/observability.sh <env>`; the lag and disk alerts read both brokers
-   while both run, and `RedpandaDown` stays until Redpanda goes.
-2. Prepare one git change: Redpanda `User` → `KafkaUser` (namespace `kafka`,
-   `patternType: prefix`, cluster resource without a name), `Topic` → `KafkaTopic`
-   (keep the Argo `Prune=false,Delete=false` annotation), brokers →
-   `kafka-kafka-bootstrap.kafka.svc.cluster.local:9093`, password Secrets into `kafka`,
-   `UP_OPTIONAL_STEPS` `redpanda` → `kafka`.
-3. Freeze the writers through git (Argo CD reverts a `kubectl scale`), take
-   `tools/k3s/scylla.sh <env> --snapshot-now`.
-4. Reset the journal state that references Redpanda offsets, per the app owners'
-   procedure ([pointer reset](#kafka-loss)).
-5. Merge, unfreeze, verify: KafkaUsers Ready, topics with the expected config,
-   replicator groups at lag 0, alerts quiet.
-6. After a soak, remove Redpanda: the `Redpanda` CR, the `redpanda-operator` release,
-   Redpanda Console, the `redpanda-console-pomerium` Ingress in namespace `sso`, the
-   `cluster.redpanda.com` CRDs, namespace `redpanda`, PV `redpanda-data-pv` and
-   `/data/redpanda` on the node. The `https://console.<env>` route to Redpanda Console is
-   still in `envs/<env>/pomerium-routes.yaml`: rerun `tools/k3s/kafka.sh <env>
-   --force-console`, which deploys the Kafbat UI and replaces that route (or delete the
-   route from the file first and rerun without the flag). Commit the routes file and check
-   the UI behind SSO.
-
-### Redpanda during the cutover {#redpanda-loss}
-
-Alert: `RedpandaDown` (p1), only while an env still runs Redpanda. Restart with
-`kubectl -n redpanda delete pod redpanda-0`; `tools/k3s/redpanda.sh <env> --watch health`
-shows the broker's view. If the broker cannot be brought back, finish the migration
-instead of rebuilding it.
+Earlier versions of this stack ran Redpanda (`tools/k3s/redpanda.sh`, since removed). A
+`tools/up.sh` run that would reach the retired `redpanda` step stops until the env lists
+`kafka` in `UP_OPTIONAL_STEPS` instead. A journal cannot be carried over: a new broker
+restarts every offset at 0, and topic copies (MirrorMaker) do not keep offsets. Stop the
+apps, remove Redpanda, reset their journal state ([pointer reset](#kafka-loss)), run
+`tools/k3s/kafka.sh <env>` and point the apps at Kafka. Redpanda `User` resources become
+KafkaUsers with `patternType: prefix` (Redpanda said `prefixed`). If
+`envs/<env>/pomerium-routes.yaml` still routes `console.<env>` to Redpanda Console, run
+kafka.sh once with `--force-console` to replace that route.
 
 ## Disk full {#disk-full}
 

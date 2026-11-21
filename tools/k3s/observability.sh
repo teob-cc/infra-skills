@@ -1543,12 +1543,11 @@ if [[ "$SKIP_PROMETHEUS" != "true" ]]; then
   
   # Determine PostgreSQL namespace (default to 'postgres')
   NAMESPACE_POSTGRES="${NAMESPACE_POSTGRES:-postgres}"
-  # kafka-journal stack namespaces (kafka.sh / scylla.sh; redpanda.sh until it is removed)
+  # kafka-journal stack namespaces (kafka.sh / scylla.sh)
   NAMESPACE_KAFKA="${NAMESPACE_KAFKA:-kafka}"
   # Consumer groups the kafka-journal replicator alerts watch (Prometheus regex, anchored).
   # kafka-journal names them <prefix>replicator.<keyspace>.<topic>, e.g. teob-replicator.*.
   KAFKA_REPLICATOR_GROUP_REGEX="${KAFKA_REPLICATOR_GROUP_REGEX:-.*replicator.*}"
-  NAMESPACE_REDPANDA="${NAMESPACE_REDPANDA:-redpanda}"
   NAMESPACE_SCYLLA="${NAMESPACE_SCYLLA:-scylla}"
   # MySQL stack namespace (mysql.sh deploys the mysql-exporter Service there)
   NAMESPACE_MYSQL="${NAMESPACE_MYSQL:-mysql}"
@@ -1786,30 +1785,6 @@ ${BLACKBOX_SCRAPE_JOB_POST}
       - source_labels: [__meta_kubernetes_service_name]
         action: keep
         regex: kafka-exporter-metrics
-      - source_labels: [__meta_kubernetes_endpoint_port_name]
-        action: keep
-        regex: metrics
-      - source_labels: [__meta_kubernetes_namespace]
-        target_label: namespace
-      - source_labels: [__meta_kubernetes_service_name]
-        target_label: service
-      - source_labels: [__meta_kubernetes_pod_name]
-        target_label: pod
-  # Redpanda broker metrics, kept while an environment moves from Redpanda to Kafka
-  # (removed together with tools/k3s/redpanda.sh). Discovers the plain
-  # redpanda-metrics Service created by tools/k3s/redpanda.sh; the admin API
-  # serves Prometheus metrics on /public_metrics (not /metrics). Inert without it.
-  - job_name: 'redpanda'
-    metrics_path: /public_metrics
-    kubernetes_sd_configs:
-      - role: endpoints
-        namespaces:
-          names:
-            - ${NAMESPACE_REDPANDA}
-    relabel_configs:
-      - source_labels: [__meta_kubernetes_service_name]
-        action: keep
-        regex: redpanda-metrics
       - source_labels: [__meta_kubernetes_endpoint_port_name]
         action: keep
         regex: metrics
@@ -2495,7 +2470,7 @@ serverFiles:
           # a blind spot: every rule over its metrics goes quiet instead of firing.
           - alert: ScrapeTargetDown
             expr: |
-              up{job!~"alertmanager|mysql-exporter|kafka|kafka-exporter|redpanda|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
+              up{job!~"alertmanager|mysql-exporter|kafka|kafka-exporter|scylla|kubernetes-api-servers|kubernetes-nodes|cnpg|argocd|dex"} == 0
               unless on (node) node:on_demand_parked
             for: 15m
             labels: { severity: p3, app: infra }
@@ -3605,9 +3580,6 @@ serverFiles:
       # uce-* rules they activate the moment the metrics appear.
       # Lag comes from the Strimzi kafka-exporter (kafka_consumergroup_lag, per partition;
       # -1 where a group has no committed offset yet, hence clamp_min).
-      # While an environment moves from Redpanda, the lag and disk rules also read the
-      # Redpanda series (the second branch of each "or") and RedpandaDown stays; both go
-      # with redpanda.sh.
       # ScyllaSnapshotOverdue keys off a node-exporter textfile stamp written
       # by the scylla-backup CronJob (nas-backup-stamp pattern).
       - name: kafka-journal
@@ -3637,18 +3609,6 @@ serverFiles:
                 KafkaJournalReplicatorStalled cannot fire while it is down. Check the
                 kafka-kafka-exporter pod in namespace ${NAMESPACE_KAFKA}.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
-          - alert: RedpandaDown
-            expr: up{job="redpanda"} == 0
-            for: 5m
-            labels: { severity: p1, app: kafka-journal }
-            annotations:
-              summary: "Redpanda broker target down for >5m"
-              description: |
-                Prometheus cannot scrape the Redpanda admin API (:9644
-                /public_metrics). Journal appends are failing or about to —
-                check the broker pod and the redpanda CR status. Only while an
-                environment still runs Redpanda next to Kafka.
-              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#redpanda-loss"
           - alert: ScyllaDown
             expr: up{job="scylla"} == 0
             for: 5m
@@ -3666,11 +3626,10 @@ serverFiles:
           - alert: KafkaJournalReplicatorLagHigh
             expr: |
               max by (consumergroup) (kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
-              or max by (redpanda_group) (redpanda_kafka_consumer_group_lag_max{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 10000
             for: 15m
             labels: { severity: p2, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator {{ \$labels.consumergroup }}{{ \$labels.redpanda_group }} lag > 10k events for >15m"
+              summary: "kafka-journal replicator {{ \$labels.consumergroup }} lag > 10k events for >15m"
               description: |
                 The replicator consumer group is more than 10k events behind
                 the journal head on at least one partition. Read models are
@@ -3678,19 +3637,12 @@ serverFiles:
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
           - alert: KafkaJournalReplicatorStalled
             expr: |
-              (
-                sum by (consumergroup) (clamp_min(kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}, 0)) > 0
-                and sum by (consumergroup) (delta(kafka_consumergroup_current_offset{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
-              )
-              or
-              (
-                sum by (redpanda_group) (redpanda_kafka_consumer_group_lag_sum{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}) > 0
-                and sum by (redpanda_group) (delta(redpanda_kafka_consumer_group_committed_offset{redpanda_group=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
-              )
+              sum by (consumergroup) (clamp_min(kafka_consumergroup_lag{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}, 0)) > 0
+              and sum by (consumergroup) (delta(kafka_consumergroup_current_offset{consumergroup=~"${KAFKA_REPLICATOR_GROUP_REGEX}"}[15m])) == 0
             for: 15m
             labels: { severity: p1, app: kafka-journal }
             annotations:
-              summary: "kafka-journal replicator {{ \$labels.consumergroup }}{{ \$labels.redpanda_group }} stalled: lag present, no commits for 15m"
+              summary: "kafka-journal replicator {{ \$labels.consumergroup }} stalled: lag present, no commits for 15m"
               description: |
                 There is uncommitted journal backlog but the replicator has not
                 committed any offsets in 15 minutes. If this persists past the
@@ -3705,7 +3657,6 @@ serverFiles:
                 max by (persistentvolumeclaim) (kubelet_volume_stats_available_bytes{job="kubernetes-nodes", namespace="${NAMESPACE_KAFKA}", persistentvolumeclaim=~"data-.*"})
                   / max by (persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{job="kubernetes-nodes", namespace="${NAMESPACE_KAFKA}", persistentvolumeclaim=~"data-.*"})
               ) < 0.15
-              or (redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes) < 0.15
             for: 30m
             labels: { severity: p2, app: kafka-journal }
             annotations:

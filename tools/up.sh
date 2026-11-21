@@ -202,7 +202,7 @@ mark_done() {
 # stops, so an env that still lists it is not left without its component. A run that
 # does not reach its slot (--list, --only <other step>, --from a later step) only warns.
 # Format: "old:new:note"; the old step ran in the slot its replacement has now.
-RETIRED_STEPS=("redpanda:kafka:Redpanda was replaced by Apache Kafka on the Strimzi operator (tools/k3s/kafka.sh); an env that still runs Redpanda follows docs/KAFKA-JOURNAL-OPS.md#migrate-from-redpanda. tools/k3s/redpanda.sh still runs by hand until it is removed.")
+RETIRED_STEPS=("redpanda:kafka:Redpanda was replaced by Apache Kafka on the Strimzi operator (tools/k3s/kafka.sh); list kafka instead of redpanda in UP_OPTIONAL_STEPS. An env that still runs a Redpanda broker resets its journals first: docs/KAFKA-JOURNAL-OPS.md#migrate-from-redpanda.")
 # check_retired_steps <run|list>
 check_retired_steps() {
   local mode="$1" entry old new note reaches from_idx
