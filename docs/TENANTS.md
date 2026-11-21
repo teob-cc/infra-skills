@@ -74,6 +74,8 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
   - it writes a registries.yaml that holds only the tenant's pull robot
     (`secrets.plain/registry-tenant-<tenant>.yaml`, with `stringData.registry`, `.username`
     and `.password`);
+  - it refuses `REGISTRY_HOSTS`: a tenant worker pulls Harbor over the public address, not
+    over the tailnet, where its tag gets no 443 on the server;
   - it persists no labels;
   - the node registers with the quarantine taint and the tenant taint;
   - as cluster admin it sets the label `node-restriction.kubernetes.io/tenant=<tenant>`.
