@@ -322,3 +322,62 @@ tests:
         exp_samples:
           - labels: '{__name__="kafka_journal:replicator_lag:offsets",topic="w.journal.round",partition="0"}'
             value: 3
+
+  # INFRA-232: unreplicated records expired (teob_replicator_source_expired_total).
+  # A. The counter is born at its first loss (value 1). increase() needs two samples of the
+  #    series, so only the "new in the last hour" arm sees it; it fires at once and for an hour.
+  - name: source expired, counter born at the first loss
+    interval: 1m
+    input_series:
+      - series: teob_replicator_source_expired_total{job="kubernetes-pods",namespace="w",pod="w-1",partition="2"}
+        values: _x10 1x120
+    promql_expr_test:
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 11m
+        exp_samples:
+          - labels: '{namespace="w",partition="2"}'
+            value: 1
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 65m
+        exp_samples:
+          - labels: '{namespace="w",partition="2"}'
+            value: 1
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 75m
+        exp_samples: []
+
+  # B. A second loss on a counter that already exists: the increase() arm fires, for an hour.
+  - name: source expired, existing counter increments
+    interval: 1m
+    input_series:
+      - series: teob_replicator_source_expired_total{job="kubernetes-pods",namespace="w",pod="w-1",partition="0"}
+        values: 1x90 2x120
+    promql_expr_test:
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 85m
+        exp_samples: []
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 95m
+        exp_samples:
+          - labels: '{namespace="w",partition="0"}'
+            value: 1
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 160m
+        exp_samples: []
+
+  # C. A pod restart: the old pod's counter (an old loss) goes stale, the new pod has no
+  #    series until its own first loss. Nothing fires.
+  - name: source expired, old loss and pod restart stay quiet
+    interval: 1m
+    input_series:
+      - series: teob_replicator_source_expired_total{job="kubernetes-pods",namespace="w",pod="w-old",partition="1"}
+        values: 3x90 stale
+      - series: up{job="kubernetes-pods",namespace="w",pod="w-new"}
+        values: _x90 1x60
+    promql_expr_test:
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 80m
+        exp_samples: []
+      - expr: count by (namespace, partition) (ALERTS{alertname="KafkaJournalSourceRecordsExpired",alertstate="firing"})
+        eval_time: 120m
+        exp_samples: []
