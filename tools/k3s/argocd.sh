@@ -21,6 +21,9 @@ set -euo pipefail
 #   ARGOCD_ROOT_EXCLUDE    glob of files under envs/<env>/apps the root app skips (default
 #                          '*/templates/*'; add directory-type apps, e.g. '{*/templates/*,gpu-status/*}').
 #                          Ignored when envs/<env>/argocd/root-app.yaml exists: that file is applied.
+#   ARGOCD_NETWORK_POLICIES the chart's own NetworkPolicies for controller, repo server, redis,
+#                          notifications, ApplicationSet and commit server (default true). The
+#                          chart's argocd-server policy (ingress from anywhere) is never created.
 
 REPO_ROOT="$(cd "$(dirname "$0")"/../.. && pwd)"
 # shellcheck disable=SC1091
@@ -72,6 +75,8 @@ NAMESPACE_SSO="${NAMESPACE_SSO:-sso}"
 # the 2026-10-07 repo-server advisories; 3.3.4 -> 3.3.17 changes no CRDs. Move to the chart that
 # ships the tag once it exists, and clear ARGOCD_IMAGE_TAG then.
 ARGOCD_CHART_VERSION="${ARGOCD_CHART_VERSION:-9.4.15}"
+ARGOCD_NETWORK_POLICIES="${ARGOCD_NETWORK_POLICIES:-true}"
+[[ "$ARGOCD_NETWORK_POLICIES" == true || "$ARGOCD_NETWORK_POLICIES" == false ]] || { echo "ARGOCD_NETWORK_POLICIES must be true or false" >&2; exit 1; }
 ARGOCD_IMAGE_TAG="${ARGOCD_IMAGE_TAG-v3.3.17}"
 # The built-in `admin` account is off: Dex SSO is configured below and the org's admins team
 # maps to role:admin, so the script deletes argocd-initial-admin-secret. Break-glass: re-run
@@ -361,9 +366,20 @@ provision_argocd() {
   # the value in argocd-secret is the one wanted and re-run with ARGOCD_FORCE_CONFLICTS=true:
   # Helm takes the fields over (--force-conflicts).
   {
+    # NetworkPolicies (INFRA-214). Chart 10.x turns global.networkPolicy.create on by default,
+    # and its argocd-server policy is always `ingress: [{}]`: it admits every source, past the
+    # default deny of network-policies.sh and past Pomerium (a tenant node reached
+    # argocd-server:8080 directly on test, 2026-11-21). Each component's template creates its
+    # policy when its own flag OR the global one is set, so the global flag stays off, every
+    # component except the server gets its own policy back (ARGOCD_NETWORK_POLICIES), and
+    # argocd-server is left to network-policies.sh (same namespace, Traefik, Pomerium,
+    # Prometheus). The same keys exist in chart 9.x, where all of them default to off.
     cat <<YAML
 global:
   domain: ${ARGOCD_HOST}
+  networkPolicy:
+    create: false
+    defaultDenyIngress: false
 YAML
     if [[ -n "$ARGOCD_IMAGE_TAG" ]]; then
       cat <<YAML
@@ -436,6 +452,8 @@ configs:
       g, ${github_org}:*, role:readonly
 
 repoServer:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
   env:
     - name: ARGOCD_GIT_USE_SSH_AGENT
       value: "false"
@@ -453,7 +471,26 @@ applicationController:
 dex:
   enabled: false
 
+controller:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
+redis:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
+notifications:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
+applicationSet:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
+commitServer:
+  networkPolicy:
+    create: ${ARGOCD_NETWORK_POLICIES}
+
 server:
+  # The chart's argocd-server policy admits ingress from anywhere; never create it (see global).
+  networkPolicy:
+    create: false
   service:
     type: ClusterIP
   # No direct ingress: argocd-server is reached via Pomerium (SSO / GitHub-team gate).
