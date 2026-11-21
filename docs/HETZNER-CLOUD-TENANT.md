@@ -121,9 +121,10 @@ the device list (read-only) and **refuses** when:
   6443 and udp:8472; denied on each `TAILSCALE_DENY_TESTS` destination. The evaluator also covers
   what the static reading cannot, such as groups and IP sets.
 
-It **warns** when nothing grants the server `udp:8472` back to the tag (VXLAN from the server to
-the node's pods would be dropped), and when the policy has no `tests` entry for the tag. Destroy
-and `--provision-only` do not run the check.
+It **warns** when the evaluator says the server (its first tag, else its address) does not reach
+the tag on `udp:8472` and `tcp:10250`: VXLAN and metrics from the server to the node would be
+dropped. It also warns when the policy has no `tests` entry for the tag. Destroy and
+`--provision-only` do not run the check.
 
 The tenant part of a segmented policy, with the prod server tagged `tag:env-prod`:
 
