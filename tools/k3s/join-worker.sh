@@ -10,7 +10,7 @@ set -euo pipefail
 #
 # Reads env.properties from envs/<env>/<worker-name>/env.properties
 # Expects: VLAN_IP (Tailscale IP), MASTER_VLAN_IP, MASTER_HOSTNAME, EXTERNAL_IP
-# Optional: TENANT, NODE_LABELS, NODE_TAINTS, REGISTRY_HOSTS, MASTER_SSH_USER,
+# Optional: TENANT, NODE_LABELS, NODE_TAINTS, REGISTRY_HOSTS (not with TENANT), MASTER_SSH_USER,
 #   SSH_VIA=tailscale (SSH straight to VLAN_IP, e.g. when the public :22 is firewalled)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -168,6 +168,13 @@ if [[ -n "$TENANT" ]]; then
     bootstrap|agent) TOKEN_MODE="${TOKEN_MODE:-bootstrap}" ;;
     *) err "A tenant worker joins with an agent-only token (--token bootstrap, the default, or agent), never with the server token"; exit 1 ;;
   esac
+  # REGISTRY_HOSTS pins Harbor to the master's Tailscale address, which a tenant worker's tag
+  # may not reach on 443 (INFRA-219), and the tailnet range is a trust signal elsewhere (the
+  # Nexus allowlist). A tenant worker pulls over the public address.
+  if [[ -n "${REGISTRY_HOSTS:-}" ]]; then
+    err "REGISTRY_HOSTS is not for a tenant worker: it pulls Harbor over the public address. Remove it from ${ENV_FILE}"
+    exit 1
+  fi
 fi
 TOKEN_MODE="${TOKEN_MODE:-auto}"
 case "$TOKEN_MODE" in bootstrap|agent|server|auto) ;; *) err "--token must be bootstrap, agent, server or auto"; exit 1 ;; esac
