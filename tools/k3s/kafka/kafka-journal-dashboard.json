@@ -1,0 +1,261 @@
+{
+  "annotations": { "list": [] },
+  "description": "kafka-journal stack: Kafka broker and exporter health, partitions, message and byte rates, replicator lag (teob-rust app gauge and kafka-journal-pekko consumer groups), replicator assignment, broker data disk. Shipped by tools/k3s/kafka.sh; runbook docs/KAFKA-JOURNAL-OPS.md.",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["kafka", "kafka-journal"],
+  "title": "kafka-journal",
+  "uid": "kafka-journal",
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "1m",
+  "links": [
+    {
+      "title": "Runbook",
+      "type": "link",
+      "url": "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md",
+      "targetBlank": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "topic",
+        "label": "Topic",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(kafka_topic_partition_current_offset{topic!~\"__.*\"}, topic)",
+        "query": { "query": "label_values(kafka_topic_partition_current_offset{topic!~\"__.*\"}, topic)", "refId": "topic" },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Broker scrape",
+      "description": "up{job=\"kafka\"}: Prometheus scrapes the broker's JMX exporter (:9404). DOWN raises KafkaBrokerDown after 5m.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "up{job=\"kafka\"}", "legendFormat": "{{pod}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 2,
+      "title": "Exporter scrape",
+      "description": "up{job=\"kafka-exporter\"}: the Strimzi kafka-exporter, source of log ends and consumer-group lag. While it is DOWN every replicator lag alert is blind (KafkaExporterDown).",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "up{job=\"kafka-exporter\"}", "legendFormat": "{{pod}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 3,
+      "title": "Brokers",
+      "description": "Brokers the exporter sees in the cluster metadata (kafka_brokers).",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "max(kafka_brokers)", "legendFormat": "brokers" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 4,
+      "title": "Partitions",
+      "description": "Partitions hosted by the brokers, internal topics included (kafka_server_replicamanager_partitioncount).",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "sum(kafka_server_replicamanager_partitioncount{job=\"kafka\"})", "legendFormat": "partitions" }],
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 5,
+      "title": "Under-replicated partitions",
+      "description": "kafka_server_replicamanager_underreplicatedpartitions summed over brokers. On a single-node cluster (replication factor 1) this stays 0; offline partitions are in the partition health panel.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [{ "refId": "A", "expr": "sum(kafka_server_replicamanager_underreplicatedpartitions{job=\"kafka\"})", "legendFormat": "under-replicated" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } } },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 6,
+      "title": "Unmonitored journal partitions",
+      "description": "Journal partitions (topic *.journal.*) with events but no replicator position: no teob_replicator_published_next and no committed offset of a *replicator* consumer group. Lag and stall alerts cannot fire for them (KafkaJournalReplicatorUnmonitored). Usually an app whose pods lack the prometheus.io/scrape annotations.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(max by (topic, partition) (kafka_topic_partition_current_offset{topic=~\".+[.]journal[.].+\"}) > 0 unless on (topic, partition) max by (topic, partition) (teob_replicator_published_next) unless on (topic, partition) max by (topic, partition) (kafka_consumergroup_lag{consumergroup=~\".*replicator.*\"} >= 0)) or vector(0)",
+          "legendFormat": "unmonitored"
+        }
+      ],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }] } } },
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "id": 7,
+      "title": "Messages/s per topic",
+      "description": "Rate of the log end offset per topic (kafka-exporter kafka_topic_partition_current_offset): events appended per second.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (topic) (rate(kafka_topic_partition_current_offset{topic=~\"$topic\"}[$__rate_interval]))", "legendFormat": "{{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "fillOpacity": 10 } } }
+    },
+    {
+      "id": 8,
+      "title": "Broker bytes in/out",
+      "description": "Strimzi JMX kafka_server_brokertopicmetrics_bytesin_total / bytesout_total. 'all topics' is the broker total (the series without a topic label); the per-topic lines follow the topic variable. Bytes out includes every consumer fetch, replicators included.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(kafka_server_brokertopicmetrics_bytesin_total{job=\"kafka\",topic=\"\"}[$__rate_interval]))", "legendFormat": "in, all topics" },
+        { "refId": "B", "expr": "-sum(rate(kafka_server_brokertopicmetrics_bytesout_total{job=\"kafka\",topic=\"\"}[$__rate_interval]))", "legendFormat": "out, all topics" },
+        { "refId": "C", "expr": "sum by (topic) (rate(kafka_server_brokertopicmetrics_bytesin_total{job=\"kafka\",topic=~\"$topic\"}[$__rate_interval]))", "legendFormat": "in {{topic}}" },
+        { "refId": "D", "expr": "-sum by (topic) (rate(kafka_server_brokertopicmetrics_bytesout_total{job=\"kafka\",topic=~\"$topic\"}[$__rate_interval]))", "legendFormat": "out {{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } } }
+    },
+    {
+      "id": 9,
+      "title": "Replicator lag (teob-rust)",
+      "description": "Offsets between the journal's log end and the replicator's position, per topic and partition: max(kafka_topic_partition_current_offset) - max over pods(teob_replicator_published_next). The max over pods drops the stale value a pod keeps after losing a partition in a rebalance. KafkaJournalReplicatorLagHigh fires above 10k for 15m; KafkaJournalReplicatorStalled when it stays above 0 with the position unchanged. Empty for apps Prometheus does not scrape (see Unmonitored).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (topic, partition) (kafka_topic_partition_current_offset{topic=~\"$topic\"}) - on (topic, partition) max by (topic, partition) (teob_replicator_published_next{topic=~\"$topic\"})",
+          "legendFormat": "{{topic}}/{{partition}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 10000 }] }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Consumer-group lag",
+      "description": "kafka_consumergroup_lag per group, topic and partition, for groups with a committed offset. kafka-journal-pekko replicators commit offsets and show here; teob-rust replicators keep their position in Scylla and never do (see the panel to the left).",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (consumergroup, topic, partition) (kafka_consumergroup_lag{topic=~\"$topic\"} >= 0)",
+          "legendFormat": "{{consumergroup}} {{topic}}/{{partition}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "fillOpacity": 10 } } }
+    },
+    {
+      "id": 11,
+      "title": "Replicator partitions assigned / stalled (teob-rust)",
+      "description": "Per app pod: partitions assigned to it (teob_replicator_assigned), partitions retrying or held (teob_replicator_stalled), partitions whose supervisor ended while still assigned (teob_replicator_ended_while_assigned). These gauges carry only a partition label, no topic, so the topic variable does not apply and an app replicating several topics counts each partition number once.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (namespace, pod) (teob_replicator_assigned)", "legendFormat": "assigned {{namespace}}/{{pod}}" },
+        { "refId": "B", "expr": "sum by (namespace, pod) (teob_replicator_stalled)", "legendFormat": "stalled {{namespace}}/{{pod}}" },
+        { "refId": "C", "expr": "sum by (namespace, pod) (teob_replicator_ended_while_assigned)", "legendFormat": "ended while assigned {{namespace}}/{{pod}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "custom": { "fillOpacity": 0 } } }
+    },
+    {
+      "id": 12,
+      "title": "Replicator rebalances / exits (teob-rust)",
+      "description": "Rebalance events by event (assigned, revoked, lost) from teob_replicator_rebalances_total, and supervisor exits by reason from teob_replicator_exits_total. The exit counter has no series until the first exit.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum by (namespace, event) (increase(teob_replicator_rebalances_total[$__rate_interval]))", "legendFormat": "rebalance {{event}} {{namespace}}" },
+        { "refId": "B", "expr": "sum by (namespace, reason) (increase(teob_replicator_exits_total[$__rate_interval]))", "legendFormat": "exit {{reason}} {{namespace}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "drawStyle": "bars", "fillOpacity": 60 } } }
+    },
+    {
+      "id": 13,
+      "title": "Partition health",
+      "description": "Broker view (JMX): under-replicated, under min ISR, and offline partitions (controller). Exporter view: under-replicated partitions per topic.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        { "refId": "A", "expr": "sum(kafka_server_replicamanager_underreplicatedpartitions{job=\"kafka\"})", "legendFormat": "under-replicated (broker)" },
+        { "refId": "B", "expr": "sum(kafka_server_replicamanager_underminisrpartitioncount{job=\"kafka\"})", "legendFormat": "under min ISR (broker)" },
+        { "refId": "C", "expr": "max(kafka_controller_kafkacontroller_offlinepartitionscount{job=\"kafka\"})", "legendFormat": "offline (controller)" },
+        { "refId": "D", "expr": "sum by (topic) (kafka_topic_partition_under_replicated_partition{topic=~\"$topic\"})", "legendFormat": "under-replicated {{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "custom": { "fillOpacity": 0 } } }
+    },
+    {
+      "id": 14,
+      "title": "Kafka data volume used",
+      "description": "kubelet_volume_stats used / capacity of the PVCs in the broker's namespace (job kubernetes-nodes; k3s publishes the stats twice). The broker's static local PV reports the whole /data filesystem it shares with Scylla and backups. KafkaJournalDataDiskLow fires under 15% free.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (persistentvolumeclaim) (kubelet_volume_stats_used_bytes{job=\"kubernetes-nodes\"} and on (namespace) group by (namespace) (up{job=\"kafka\"})) / max by (persistentvolumeclaim) (kubelet_volume_stats_capacity_bytes{job=\"kubernetes-nodes\"} and on (namespace) group by (namespace) (up{job=\"kafka\"}))",
+          "legendFormat": "{{persistentvolumeclaim}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.85 }] }
+        }
+      }
+    }
+  ]
+}

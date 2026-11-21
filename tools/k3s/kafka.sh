@@ -15,6 +15,8 @@ set -euo pipefail
 # 4. kafka-metrics and kafka-exporter-metrics Services for Prometheus endpoint discovery
 # 5. App KafkaUsers from envs/<env>/kafka-users/*.yaml (written by --provision-credentials)
 # 6. Kafbat UI behind Pomerium (console.<env>, pgweb pattern)
+# 7. Grafana dashboard `kafka-journal` (ConfigMap grafana-dashboard-kafka-journal, labelled
+#    grafana_dashboard=1, from tools/k3s/kafka/kafka-journal-dashboard.json)
 #
 # Usage:
 #   tools/k3s/kafka.sh <env-name> [options]
@@ -28,6 +30,7 @@ set -euo pipefail
 #                            the cluster ID kept, so the broker comes back with its data)
 #   --show-credentials [app-id]  Display Kafka credentials and exit
 #   --show-resources         Display current Kafka resource usage and exit
+#   --dashboard-only         Only (re)apply the kafka-journal Grafana dashboard and exit
 #   --watch [kind]           Inspect a running broker (kind: help|health|topics|groups|logs)
 #   --provision-credentials <app-id>  Provision a SCRAM-SHA-512 KafkaUser for an application
 #                            (keeps an existing password; add --rotate-password for a new one)
@@ -43,7 +46,7 @@ ENVS_ROOT=$(provision::envs_root)
 
 # --- Parse arguments ---
 if [[ -z "${1:-}" ]]; then
-  echo "Usage: $0 <env-name> [--skip-operator] [--skip-console] [--force-console] [--force-cleanup] [--show-credentials [app-id]] [--show-resources] [--watch [kind]] [--provision-credentials <app-id> [--rotate-password]]" >&2
+  echo "Usage: $0 <env-name> [--skip-operator] [--skip-console] [--force-console] [--force-cleanup] [--show-credentials [app-id]] [--show-resources] [--dashboard-only] [--watch [kind]] [--provision-credentials <app-id> [--rotate-password]]" >&2
   echo "Available environments:" >&2
   find "$(provision::envs_root)" -maxdepth 2 -type f -name env.properties -print | sed "s#$(provision::envs_root)/##; s#/env.properties##" | sort || true
   exit 1
@@ -64,6 +67,7 @@ FORCE_CLEANUP=false
 SHOW_CREDENTIALS=false
 SHOW_CREDENTIALS_APP_ID=""
 SHOW_RESOURCES=false
+DASHBOARD_ONLY=false
 WATCH=false
 WATCH_KIND="help"
 PROVISION_CREDENTIALS=false
@@ -85,6 +89,7 @@ while [[ $# -gt 0 ]]; do
       fi
       ;;
     --show-resources) SHOW_RESOURCES=true; shift ;;
+    --dashboard-only) DASHBOARD_ONLY=true; shift ;;
     --watch)
       WATCH=true
       if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
@@ -185,6 +190,8 @@ BOOTSTRAP_SERVERS="${KAFKA_CLUSTER_NAME}-kafka-bootstrap.${NAMESPACE_KAFKA}.svc.
 KAFKA_BIN="/opt/kafka/bin"
 USERS_DIR="$ENVS_ROOT/${ENV_NAME}/kafka-users"
 METRICS_RULES_FILE="$REPO_ROOT/tools/k3s/kafka/kafka-metrics-config.yml"
+DASHBOARD_FILE="$REPO_ROOT/tools/k3s/kafka/kafka-journal-dashboard.json"
+: "${NAMESPACE_OBSERVABILITY:=observability}"
 
 # --- Shared helpers ---
 
@@ -559,6 +566,38 @@ YAML
 
 if [[ "$PROVISION_CREDENTIALS" == "true" ]]; then
   provision_credentials "$APP_ID"
+fi
+
+# ============================================================================
+# Grafana dashboard (ConfigMap for the Grafana sidecar, mysql.sh pattern)
+# ============================================================================
+# The `kafka-journal` dashboard that docs/KAFKA-JOURNAL-OPS.md points at: broker and
+# exporter health, partitions, message and byte rates, replicator lag (the expression of
+# the kafka-journal alert group in observability.sh), replicator assignment, data disk.
+# Grafana's dashboard sidecar loads ConfigMaps labelled grafana_dashboard=1 in the
+# observability namespace into the "Shared" folder; no Grafana restart is needed.
+deploy_dashboard() {
+  log "=== Grafana dashboard: kafka-journal ==="
+  if ! kubectl get ns "$NAMESPACE_OBSERVABILITY" >/dev/null 2>&1; then
+    info "Namespace ${NAMESPACE_OBSERVABILITY} not found - skipping the kafka-journal dashboard"
+    info "  After tools/k3s/observability.sh ${ENV_NAME}: tools/k3s/kafka.sh ${ENV_NAME} --dashboard-only"
+    return 0
+  fi
+  if ! jq -e '.uid == "kafka-journal"' "$DASHBOARD_FILE" >/dev/null 2>&1; then
+    err "Invalid dashboard JSON: ${DASHBOARD_FILE}"
+    return 1
+  fi
+  kubectl -n "$NAMESPACE_OBSERVABILITY" create configmap grafana-dashboard-kafka-journal \
+    --from-file=kafka-journal.json="$DASHBOARD_FILE" \
+    --dry-run=client -o yaml \
+    | yq eval '.metadata.labels.grafana_dashboard = "1"' - \
+    | kubectl apply -f - >/dev/null
+  info "✓ ConfigMap ${NAMESPACE_OBSERVABILITY}/grafana-dashboard-kafka-journal applied (Grafana folder 'Shared', uid kafka-journal)"
+}
+
+if [[ "$DASHBOARD_ONLY" == "true" ]]; then
+  deploy_dashboard
+  exit 0
 fi
 
 log "Starting Kafka provisioning for environment: ${ENV_NAME}"
@@ -1225,6 +1264,8 @@ YAML
 
 expose_console || true
 
+deploy_dashboard || warn "kafka-journal dashboard not applied; retry with: tools/k3s/kafka.sh ${ENV_NAME} --dashboard-only"
+
 # ============================================================================
 # Summary
 # ============================================================================
@@ -1237,6 +1278,7 @@ info "Auth:               SASL/SCRAM-SHA-512, simple authorization (superuser: $
 if [[ "$SKIP_CONSOLE" != "true" && -n "${KAFKA_CONSOLE_HOST:-}" ]]; then
   info "Console:            https://${KAFKA_CONSOLE_HOST} (Kafbat UI, GitHub OAuth via Pomerium)"
 fi
+info "Dashboard:          Grafana > Shared > kafka-journal (uid kafka-journal)"
 info ""
 info "Next steps:"
 info "  tools/k3s/kafka.sh ${ENV_NAME} --watch health"
