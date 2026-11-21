@@ -3729,6 +3729,29 @@ serverFiles:
                 lack the prometheus.io/scrape annotations (port 9090, /metrics), or the
                 replicator never started for this topic.
               runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#replicator-stall"
+          # The broken promise itself (INFRA-232): a teob-rust replicator found its cursor
+          # below the broker's log start, so retention deleted journal records before they
+          # reached Scylla. It counts each continuation past the gap in
+          # teob_replicator_source_expired_total{partition} (no topic label; the namespace
+          # names the app) and moves on. The series is born at its first increment, which
+          # increase() cannot see, hence the second arm for series that are new in the window.
+          # Fires for an hour after each loss; the loss itself is permanent.
+          - alert: KafkaJournalSourceRecordsExpired
+            expr: |
+              sum by (namespace, partition) (increase(teob_replicator_source_expired_total[1h])) > 0
+              or
+              sum by (namespace, partition) (teob_replicator_source_expired_total unless teob_replicator_source_expired_total offset 1h) > 0
+            labels: { severity: p1, app: kafka-journal }
+            annotations:
+              summary: "kafka-journal {{ \$labels.namespace }} partition {{ \$labels.partition }} lost unreplicated journal records"
+              description: |
+                A replicator in {{ \$labels.namespace }} found journal partition
+                {{ \$labels.partition }} expired below its replication cursor: Kafka retention
+                deleted records that had not reached Scylla ({{ \$value }} continuation(s) in the
+                last hour). The replicator moved to the log start and continues; entities with
+                records in the lost offsets are broken and will not recover them. The app's
+                ERROR log line names the cursor, the log start and the number of lost offsets.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/KAFKA-JOURNAL-OPS.md#source-expired"
           - alert: KafkaJournalDataDiskLow
             # A static local PV reports the whole /data filesystem, so this is the free
             # space under the broker's data directory.

@@ -137,9 +137,9 @@ Journal topics are those matching `KAFKA_JOURNAL_TOPIC_REGEX` (default `.+[.]jou
 
 - `KafkaJournalReplicatorLagHigh`: more than 10k offsets behind for 15m.
 - `KafkaJournalReplicatorStalled`: behind, and the position has not moved for 15m, held 15m.
-  It measures the position, not the age of the oldest unreplicated event: nothing fires when
-  an event ages past the 7-day retention unreplicated (teob-rust counts that afterwards in
-  `teob_replicator_source_expired_total`), so the budget below runs from when the stall began.
+  It measures the position, not the age of the oldest unreplicated event, so the budget below
+  runs from when the stall began. When an event does age past retention unreplicated,
+  `KafkaJournalSourceRecordsExpired` fires ([below](#source-expired)).
 - `KafkaJournalReplicatorUnmonitored`: a journal partition has events but neither source
   reports a position for it, for 1h. The other two cannot fire for it. Usually the app is not
   scraped yet; for a pekko app, its replicator group has never committed.
@@ -156,6 +156,28 @@ Journal topics are those matching `KAFKA_JOURNAL_TOPIC_REGEX` (default `.+[.]jou
 4. **Time budget:** unreplicated events age out of Kafka after 7 days. A stall
    is a p1 long before that; escalate hard if lag is older than ~3 days.
 5. After recovery, watch lag drain in the `kafka-journal` dashboard.
+
+### Unreplicated records expired {#source-expired}
+
+Alert: `KafkaJournalSourceRecordsExpired` (p1), per app namespace and partition. A teob-rust
+replicator found its cursor below the broker's log start: retention deleted journal records
+before they reached Scylla. It counts this in `teob_replicator_source_expired_total{partition}`,
+logs it at ERROR (partition, cursor, log start, number of lost offsets), moves its cursor to
+the log start and continues. The records are gone; nothing replays them. The alert fires for
+an hour after each loss.
+
+1. Read the app's ERROR line for the partition: `lost` is the number of offsets that
+   expired unreplicated, between `cursor` and `log_start`.
+2. The entities with records in those offsets are broken: their recovery reports a
+   `TailExpired` history gap until the cursor moves, and afterwards they recover to their
+   last replicated head. Which entities they are is the app's question, not the broker's.
+3. Find why the replicator fell a whole retention period behind (the stall alerts above
+   should have fired days earlier) and fix that first.
+4. If the app cannot live with the broken entities, the remaining remedy is a journal reset
+   ([Kafka loss / pointer reset](#kafka-loss)).
+
+kafka-journal-pekko apps export no such counter; for them a stall past retention shows only
+as a stall.
 
 ## Scylla loss / restore {#scylla-loss}
 
