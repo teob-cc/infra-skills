@@ -947,7 +947,8 @@ function tailscale::delete_device(){
 #   REFUSE  nothing grants the tag the server's tcp:6443 or udp:8472 (the node could not join);
 #   REFUSE  an ssh rule's source can be the node (Tailscale SSH from the tenant node);
 #   REFUSE  Tailscale's own evaluator (POST /acl/validate, tests only) fails tailscale::policy_tests;
-#   WARN    nothing visibly grants the server udp:8472 back to the tag, or no tests entry for it.
+#   WARN    the evaluator says the server (its first tag, else its address) does not reach the
+#           tag on udp:8472 and tcp:10250; the policy has no tests entry for the tag.
 # Usage: tailscale::policy_problems TAG SERVER_IP. Prints "REFUSE ..." and "WARN ..." lines; returns
 # 1 when there is a REFUSE line. TAILSCALE_POLICY_CHECK=warn downgrades the refusal in
 # tenant::preflight (a throwaway test tailnet only). docs/HETZNER-CLOUD-TENANT.md has a policy.
@@ -993,16 +994,7 @@ function tailscale::policy_problems(){
       ([rules | select(any(.src[]; can_be_node)) | .targets[] | select(is_server(.sel)) | .ports[]] as $granted
        | ("tcp:6443", "udp:8472") | select(. as $want | $granted | index($want) | not)
        | "REFUSE nothing grants \($tag) the cluster server \($ip) on \(.): the node cannot join"),
-      (if $srv == null then "WARN no tailnet device has the cluster server address \($ip)"
-       else
-         ($srv.tags // []) as $st
-         | [rules | select(any(.src[]; . == "*" or ip_of(.) == $ip or (. as $s | $st | index($s))
-                               or (($st | length) == 0 and (startswith("tag:") | not))))
-           | .targets[] | select(.sel == $tag or .sel == "*" or .sel == "autogroup:tagged")
-           | select(any(.ports[]; . == "*" or . == "udp:8472" or . == "udp:*" or . == "8472"))]
-         | if length > 0 then empty
-           else "WARN nothing grants the cluster server (\($srv.hostname // $ip)) udp:8472 to \($tag): VXLAN from the server to the node is dropped" end
-       end),
+      (if $srv == null then "WARN no tailnet device has the cluster server address \($ip)" else empty end),
       (($pol.ssh // [])[] | select(any((.src // [])[]; can_be_node))
        | "REFUSE ssh rule src=\(.src | join(",")) lets \($tag) open Tailscale SSH sessions to \((.dst // []) | join(","))"),
       (if any(($pol.tests // [])[]; .src == $tag) then empty
@@ -1020,6 +1012,21 @@ function tailscale::policy_problems(){
     [[ -n "$msg" ]] && out+=$'\n'"REFUSE Tailscale's test run ($(jq 'length' <<<"$tests") tests): ${msg}"
   else
     out+=$'\n'"REFUSE cannot run the policy tests (HTTP ${TS_LAST_HTTP:-?})"
+  fi
+
+  # The way back, a warning only: the server reaches the node's flannel (udp:8472) and kubelet
+  # (tcp:10250, metrics-server and Prometheus). Source: the server's first tag, else its address.
+  local server_src
+  server_src=$(printf '%s' "$devices" | jq -r --arg ip "$server_ip" \
+    '[.devices[]? | select((.addresses // []) | index($ip))] | first | if . == null then empty else ((.tags // [])[0] // $ip) end')
+  if [[ -n "$server_src" ]]; then
+    tests=$(jq -cn --arg s "$server_src" --arg tag "$tag" \
+      '[{src: $s, proto: "udp", accept: ["\($tag):8472"]}, {src: $s, proto: "tcp", accept: ["\($tag):10250"]}]')
+    if verdict=$(tailscale::api POST "/tailnet/$(tailscale::get_tailnet)/acl/validate" "$tests"); then
+      msg=$(printf '%s' "$verdict" | jq -r '(.message // empty) as $m | if $m == "" then empty
+              else ([$m] + ([.data[]? | (.errors // [])[]] | unique) | join("; ")) end' 2>/dev/null)
+      [[ -n "$msg" ]] && out+=$'\n'"WARN the cluster server (${server_src}) does not reach ${tag} on udp:8472 and tcp:10250 (pod traffic and metrics from the server would be dropped): ${msg}"
+    fi
   fi
 
   out=$(sed '/^$/d' <<<"$out")
