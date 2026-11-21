@@ -27,7 +27,9 @@ set -uo pipefail
 #                            (PG_WAL_ARCHIVE=minio) writes to it
 #  10. postgres  (optional)  CloudNativePG + pgweb (+ Barman Cloud plugin with PG_WAL_ARCHIVE)
 #  11. mysql     (optional)  Percona MySQL operator + Adminer
-#  12. redpanda  (optional)  Redpanda operator + broker (kafka-journal stack)
+#  12. kafka     (optional)  Strimzi operator + Apache Kafka broker (kafka-journal stack);
+#                            replaces the retired step redpanda (a run that would reach
+#                            it stops with a message naming kafka)
 #  13. scylla    (optional)  Scylla operator + node (kafka-journal stack)
 #  14. nexus     (optional)  artifact repository
 #  15. amneziawg (optional) AmneziaWG gateway: read-only Nexus over a tunnel, key page behind
@@ -36,14 +38,14 @@ set -uo pipefail
 #  17. network-policies      platform NetworkPolicies, after the components they fence
 #  18. backup    (optional)  host-level rdiff-backup cron to your backup host (tools/backup.sh)
 #
-# After redpanda/scylla ran, observability is re-applied automatically so their scrape jobs
+# After kafka/scylla ran, observability is re-applied automatically so their scrape jobs
 # and alert groups load. A step whose output shows a transient error (API connection lost,
 # TLS handshake timeout, Helm wait deadline) is retried once before it counts as failed.
 #
 # Optional steps are skipped by default. An environment declares the ones it needs in
-# env.properties:  UP_OPTIONAL_STEPS="postgres minio nexus redpanda scylla backup"  -- those
+# env.properties:  UP_OPTIONAL_STEPS="postgres minio nexus kafka scylla backup"  -- those
 # run in the default flow, always in the order above (the list's own order does not matter).
-# --with-optional includes ALL optional steps; --only/--from target one directly. After redpanda/scylla, rerun observability to load their scrape jobs.
+# --with-optional includes ALL optional steps; --only/--from target one directly. After kafka/scylla, rerun observability to load their scrape jobs.
 #
 # Usage:
 #   tools/up.sh <env-name> [options]
@@ -73,10 +75,10 @@ PROG="$(basename "$0")"
 
 # --- Ordered step definitions (parallel arrays; bash 3.2 compatible) ---------
 # STEP_NAMES[i] is both the step id and the tools/k3s/<name>.sh basename.
-STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image base-image minio postgres mysql redpanda scylla nexus amneziawg wireguard network-policies backup)
+STEP_NAMES=(identity secrets harbor github-action-runner argocd observability runner-image base-image minio postgres mysql kafka scylla nexus amneziawg wireguard network-policies backup)
 STEP_TIERS=(core     core    core   core                 core   core          core         core       optional optional optional optional optional optional optional  optional core             optional)
 # Script each step delegates to, relative to the repo root.
-STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/base-image.sh tools/k3s/minio.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/redpanda.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/amneziawg.sh tools/k3s/wireguard.sh tools/k3s/network-policies.sh tools/backup.sh)
+STEP_CMDS=(tools/k3s/identity.sh tools/sops/apply.sh tools/k3s/harbor.sh tools/k3s/github-action-runner.sh tools/k3s/argocd.sh tools/k3s/observability.sh tools/k3s/runner-image.sh tools/k3s/base-image.sh tools/k3s/minio.sh tools/k3s/postgres.sh tools/k3s/mysql.sh tools/k3s/kafka.sh tools/k3s/scylla.sh tools/k3s/nexus.sh tools/k3s/amneziawg.sh tools/k3s/wireguard.sh tools/k3s/network-policies.sh tools/backup.sh)
 
 # Optional steps the environment opted into (env.properties UP_OPTIONAL_STEPS, space or
 # comma separated). Read after load_env, see env_wants().
@@ -195,8 +197,42 @@ mark_done() {
   is_done "$1" || printf '%s\n' "$1" >>"$STATE_FILE"
 }
 
+# --- Retired steps ------------------------------------------------------------
+# A step that was replaced is not skipped as unknown: a run that would have reached it
+# stops, so an env that still lists it is not left without its component. A run that
+# does not reach its slot (--list, --only <other step>, --from a later step) only warns.
+# Format: "old:new:note"; the old step ran in the slot its replacement has now.
+RETIRED_STEPS=("redpanda:kafka:Redpanda was replaced by Apache Kafka on the Strimzi operator (tools/k3s/kafka.sh); an env that still runs Redpanda follows docs/KAFKA-JOURNAL-OPS.md#migrate-from-redpanda. tools/k3s/redpanda.sh still runs by hand until it is removed.")
+# check_retired_steps <run|list>
+check_retired_steps() {
+  local mode="$1" entry old new note reaches from_idx
+  for entry in "${RETIRED_STEPS[@]}"; do
+    old="${entry%%:*}"; new="${entry#*:}"; note="${new#*:}"; new="${new%%:*}"
+    if [[ "$mode" == run && ( "$ONLY_STEP" == "$old" || "$FROM_STEP" == "$old" ) ]]; then
+      provision::error "Step '${old}' is retired; its replacement is '${new}'. ${note}"
+      exit 1
+    fi
+    env_wants "$old" || continue
+    reaches=1
+    if [[ "$mode" == list || -n "$ONLY_STEP" ]]; then
+      reaches=0
+    elif [[ -n "$FROM_STEP" ]]; then
+      # An unknown --from step is reported by validate_step_name below.
+      from_idx="$(step_index "$FROM_STEP")"
+      if [[ "$from_idx" == "-1" ]] || (( from_idx > $(step_index "$new") )); then reaches=0; fi
+    fi
+    if [[ "$reaches" -eq 1 ]]; then
+      provision::error "env.properties of '${ENV_NAME}' lists the retired step '${old}' in UP_OPTIONAL_STEPS."
+      provision::error "Replace it with '${new}'. ${note}"
+      exit 1
+    fi
+    provision::warn "env.properties of '${ENV_NAME}' lists the retired step '${old}' in UP_OPTIONAL_STEPS; replace it with '${new}' (a full run stops on it)."
+  done
+}
+
 # --- --list (no cluster needed) ---------------------------------------------
 if [[ "$DO_LIST" -eq 1 ]]; then
+  check_retired_steps list
   echo "Stack steps for env '${ENV_NAME}':"
   echo "State file: ${STATE_FILE}"
   echo
@@ -214,6 +250,7 @@ fi
 # completed step is skipped.
 ACTIVE=()
 RESPECT_STATE=1
+check_retired_steps run
 
 if [[ -n "$ONLY_STEP" ]]; then
   validate_step_name "$ONLY_STEP"
@@ -339,7 +376,7 @@ for idx in "${ACTIVE[@]}"; do
     mark_done "$name"
     ran=$((ran + 1))
     provision::info "done  ${name}"
-    [[ "$name" == redpanda || "$name" == scylla ]] && RERUN_OBSERVABILITY=1
+    [[ "$name" == kafka || "$name" == scylla ]] && RERUN_OBSERVABILITY=1
   else
     rc=$?
     resume_hint "$name"
@@ -347,11 +384,11 @@ for idx in "${ACTIVE[@]}"; do
   fi
 done
 
-# Redpanda/Scylla ship scrape jobs and alert groups that observability.sh only picks up
+# Kafka/Scylla ship scrape jobs and alert groups that observability.sh only picks up
 # once their CRDs exist. Re-apply it after they ran (idempotent, a few minutes).
 if [[ "${RERUN_OBSERVABILITY:-0}" -eq 1 && -z "$ONLY_STEP" ]]; then
   echo
-  provision::info "step  observability (re-apply after redpanda/scylla)  →  tools/k3s/observability.sh ${ENV_NAME}"
+  provision::info "step  observability (re-apply after kafka/scylla)  →  tools/k3s/observability.sh ${ENV_NAME}"
   if ! run_step "${REPO_ROOT}/tools/k3s/observability.sh" "$ENV_NAME"; then
     provision::warn "observability re-apply failed; run tools/k3s/observability.sh ${ENV_NAME} by hand."
   fi

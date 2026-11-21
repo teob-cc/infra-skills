@@ -47,7 +47,7 @@ All commands run from the `infra-skills/` directory. Run them **in order** — e
 the previous ones. Always confirm with the user before executing destructive or remote commands.
 
 > **Orchestrated alternative:** `tools/up.sh <env>` runs Steps 2–9 in order (including the
-> runner-image step and a final observability re-apply after redpanda/scylla), resumable — it
+> runner-image step and a final observability re-apply after kafka/scylla), resumable — it
 > starts with `tools/preflight-cluster.sh <env>` (read-only: node, DNS, 443, pod MTU vs runner
 > dockerMTU, Tailscale freshness) and retries a transient step failure once. It
 > records completed steps under `~/.local/state/infra-skills/` and continues from the first
@@ -285,15 +285,23 @@ result. That doc also covers recovery after losing the node: restore the MinIO v
 then run postgres.sh with `PG_RECOVER_FROM=postgres-cluster` and a new `PG_BACKUP_SERVER_NAME`, and it
 bootstraps the cluster from its backups instead of initdb.
 
-**Redpanda + ScyllaDB** (Kafka-style journal persistence stack) — only for environments running
-apps that need it:
+**Apache Kafka + ScyllaDB** (journal persistence stack for kafka-journal apps) — only for
+environments running apps that need it:
 ```bash
-tools/k3s/redpanda.sh <env>      # Redpanda operator + single broker (Kafka API, SASL/SCRAM)
+tools/k3s/kafka.sh <env>         # Strimzi operator + Apache Kafka 4.3.2, one KRaft node (SASL/SCRAM-SHA-512)
 tools/k3s/scylla.sh <env>        # Scylla operator + single node (Cassandra API, password auth)
 ```
 Both use static local PVs under `/data` pinned to the main node, and support `--watch` and
-`--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive. After
-first install, rerun `tools/k3s/observability.sh <env>` to load their scrape jobs and alerts.
+`--provision-credentials <app-id>`; `scylla.sh --snapshot-now` is the backup primitive.
+`kafka.sh --provision-credentials` writes the password Secrets to `secrets.plain/` (encrypt them)
+and the KafkaUser to `kafka-users/<app>.yaml` (commit it; every kafka.sh run re-applies it); the
+default ACLs cover names starting with `<app-id>.` (`KAFKA_ACL_PREFIX` changes that), and a rerun
+keeps the password unless `--rotate-password`. The Kafbat UI is at `console.<HOSTNAME>`, read-only
+by default (`KAFBAT_UI_READONLY`); kafka.sh skips it while another Ingress or route owns the
+host. After first install, rerun `tools/k3s/observability.sh <env>` to load their scrape jobs and
+alerts. An environment that still runs Redpanda (`redpanda` in `UP_OPTIONAL_STEPS`, on which a
+full `up.sh` run now stops) follows docs/KAFKA-JOURNAL-OPS.md "Migrating from Redpanda": the
+journal offsets have to be reset, so it is a planned cutover, not a rerun.
 
 **AmneziaWG gateway for Nexus** — lets people outside the cluster use Nexus over a tunnel instead of
 an IP allowlist. Run it after Nexus (it creates a read-only Nexus account):

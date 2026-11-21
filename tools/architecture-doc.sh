@@ -82,7 +82,7 @@ endpoint_for() {
   local n="$1" h
   case "$n" in
     dex) h="dex" ;; harbor) h="harbor" ;; argocd) h="argocd" ;; grafana) h="grafana" ;;
-    pomerium) h="auth" ;; cnpg) h="pgweb" ;; ps-operator) h="adminer" ;; redpanda-operator) h="console" ;;
+    pomerium) h="auth" ;; cnpg) h="pgweb" ;; ps-operator) h="adminer" ;; strimzi-cluster-operator|redpanda-operator) h="console" ;;
     scylla-operator) h="cassandra" ;; nexus) h="nexus-api" ;; *) h="" ;;
   esac
   [[ -n "$h" ]] && echo "https://${h}.${HOSTNAME}" || echo "in-cluster"
