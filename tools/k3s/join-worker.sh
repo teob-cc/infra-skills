@@ -691,7 +691,9 @@ if [[ -n "${REGISTRY_HOSTS:-}" ]]; then
 fi
 # (2) tunnel DNAT from each non-Tailscale master address (TUNNEL_NAT_IPS)
 if [[ "${NEED_TUNNEL_NAT}" == "true" ]]; then
-  iptables -t nat -S OUTPUT | grep -E -- '--dport (6443|8472) .*DNAT' | grep -v -- "--to-destination ${MASTER_VLAN_IP_ADDR}" | sed 's/^-A //' | while read -r r; do iptables -t nat -D \$r; echo TUNNEL_CHANGED; done
+  # Stale DNAT rules (to an older master address). A fresh node has none: grep then exits 1, which
+  # pipefail would turn into an abort of the whole NAT step, so the empty match is tolerated.
+  { iptables -t nat -S OUTPUT | grep -E -- '--dport (6443|8472) .*DNAT' | grep -v -- "--to-destination ${MASTER_VLAN_IP_ADDR}" || true; } | sed 's/^-A //' | while read -r r; do iptables -t nat -D \$r; echo TUNNEL_CHANGED; done
   addt() { local src=\$1 proto=\$2 dport=\$3 dnat=\$4
     if ! iptables -t nat -C OUTPUT -d \$src -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat 2>/dev/null; then
       iptables -t nat -A OUTPUT -d \$src -p \$proto --dport \$dport -j DNAT --to-destination ${MASTER_VLAN_IP_ADDR}\$dnat; echo TUNNEL_CHANGED; fi
@@ -740,7 +742,7 @@ rm -f /etc/iptables/rules.v6
 fi
 echo "[OK] Worker NAT rules configured"
 NAT
-)
+) || { err "Worker NAT setup failed on ${NODE_NAME}; re-run this script once the cause is fixed"; exit 1; }
 if [[ $NEED_TUNNEL_NAT == true ]] && grep -q TUNNEL_CHANGED <<<"$NAT_OUT"; then
   info "Tunnel NAT changed — restarting k3s-agent..."
   ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo systemctl restart k3s-agent"
