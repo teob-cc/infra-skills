@@ -100,6 +100,17 @@ Nothing tells a parked node from one that crashed: both are simply not Ready. Do
 label a node that must stay up. Workloads that need the node are still watched: a pod
 that waits for a parked node fires KubePodUnschedulable.
 
+### Tenant workers
+
+A tenant worker (`join-worker.sh --tenant`, label `node-restriction.kubernetes.io/tenant`)
+runs only its tenant's pods. node-exporter and promtail do not run there: their DaemonSets
+do not tolerate the tenant taint, and the tenant admission policies refuse pods outside
+tenant namespaces that do. NodeExporterDown therefore skips nodes with that label;
+kube-state-metrics exports it as `label_node_restriction_kubernetes_io_tenant`. Everything
+else applies to a tenant worker as to any node: KubeNodeNotReady, KubeletDown and the
+alerts on its pods still fire. Its disk and memory are not watched from inside the node
+(INFRA-227).
+
 ## Runbook
 
 The alert descriptions carry the first steps; this section adds context per group.

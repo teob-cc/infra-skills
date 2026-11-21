@@ -2507,6 +2507,7 @@ serverFiles:
             expr: |
               kube_node_info unless on (node) (up{service=~".*node-exporter"} == 1)
               unless on (node) node:on_demand_parked
+              unless on (node) kube_node_labels{label_node_restriction_kubernetes_io_tenant!=""}
             for: 10m
             labels: { severity: p2, app: infra }
             annotations:
@@ -3688,9 +3689,11 @@ kube-state-metrics:
   enabled: true
   # Node labels are not exported unless listed here. The on-demand marker becomes
   # kube_node_labels{label_infra_skills_on_demand="true"}, which the node:on_demand_parked
-  # rule (infra-node group) reads to tell a parked worker from a dead one.
+  # rule (infra-node group) reads to tell a parked worker from a dead one. The tenant label
+  # (docs/TENANTS.md) becomes label_node_restriction_kubernetes_io_tenant: NodeExporterDown
+  # skips tenant workers, which run no node-exporter by design (INFRA-227).
   metricLabelsAllowlist:
-    - nodes=[infra-skills/on-demand]
+    - nodes=[infra-skills/on-demand,node-restriction.kubernetes.io/tenant]
 
 prometheus-node-exporter:
   enabled: true
