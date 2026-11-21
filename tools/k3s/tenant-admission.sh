@@ -38,6 +38,10 @@ set -euo pipefail
 #       platform pod, and none of its Secrets, ever lands on a tenant node. Namespaces in
 #       TENANT_NODE_SHARED_NAMESPACES are exempt from the second rule (a DaemonSet that must run
 #       on every node and holds no credential worth protecting); default none.
+#       TENANT_NODE_DAEMONSETS names node agents that run on tenant workers too, as
+#       <namespace>/<serviceaccount> (default observability/prometheus-prometheus-node-exporter,
+#       INFRA-227): a pod there, running as that service account and owned by a DaemonSet, may
+#       tolerate the tenant taints. Nothing else changes for it: no wildcard, no quarantine.
 #
 # The tenant label on a node (node-restriction.kubernetes.io/tenant=<tenant>) is set by a cluster
 # admin with kubectl: NodeRestriction stops a kubelet from setting it, and with it the k3s
@@ -65,6 +69,9 @@ set -euo pipefail
 #   NODE_REGISTRATION_ALLOWLIST      node names a kubelet may register without the quarantine
 #                                    taint (default none: every new node starts quarantined)
 #   TENANT_NODE_SHARED_NAMESPACES    namespaces whose pods may tolerate tenant taints (default none)
+#   TENANT_NODE_DAEMONSETS           <namespace>/<serviceaccount> of DaemonSets that run on tenant
+#                                    workers too (default observability/prometheus-prometheus-node-exporter;
+#                                    set it empty to keep every platform pod off tenant workers)
 #   K3S_SHARED_AGENT_USERS           shared agent identities to fence (default system:k3s-controller)
 #
 # Objects carry app.kubernetes.io/managed-by=infra-skills-tenant-admission and are applied
@@ -132,9 +139,12 @@ done
 TENANTS_J=$(json_words "${TENANTS:-}")
 ALLOW_J=$(json_words "${NODE_REGISTRATION_ALLOWLIST:-}")
 SHARED_NS_J=$(json_words "${TENANT_NODE_SHARED_NAMESPACES:-}")
+NODE_AGENTS_J=$(json_words "${TENANT_NODE_DAEMONSETS-observability/prometheus-prometheus-node-exporter}")
+jq -e "all(.[]; test(\"^[a-z0-9]([a-z0-9-]*[a-z0-9])?/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$\"))" <<<"$NODE_AGENTS_J" >/dev/null \
+  || { provision::error "TENANT_NODE_DAEMONSETS: entries must be <namespace>/<serviceaccount>: ${NODE_AGENTS_J}"; exit 1; }
 AGENT_USERS_J=$(json_words "${K3S_SHARED_AGENT_USERS:-system:k3s-controller}")
 
-log "env ${ENV_NAME}: tenants ${TENANTS_J}; registration allowlist ${ALLOW_J}; shared namespaces ${SHARED_NS_J}; shared agent users ${AGENT_USERS_J}; actions ${ACTIONS}"
+log "env ${ENV_NAME}: tenants ${TENANTS_J}; registration allowlist ${ALLOW_J}; shared namespaces ${SHARED_NS_J}; tenant-node daemonsets ${NODE_AGENTS_J}; shared agent users ${AGENT_USERS_J}; actions ${ACTIONS}"
 
 # --- Render -------------------------------------------------------------------
 # policy <name> <purpose> <spec-json>; each policy gets one binding of the same name
@@ -232,7 +242,7 @@ render_shared_agent_identity() {
 render_pod_placement() {
   policy infra-skills-tenant-pod-placement \
     "tenant pods run only on their tenant's nodes; no other pod tolerates a tenant or quarantine taint" \
-    "$(jq -nc --argjson tenants "$TENANTS_J" --argjson shared "$SHARED_NS_J" \
+    "$(jq -nc --argjson tenants "$TENANTS_J" --argjson shared "$SHARED_NS_J" --argjson agents "$NODE_AGENTS_J" \
         --arg nl "$TENANT_NS_LABEL" --arg tl "$TENANT_NODE_LABEL" --arg tt "$TENANT_TAINT" --arg q "$QUARANTINE_TAINT" '{
       matchConstraints: {resourceRules: [{apiGroups: [""], apiVersions: ["v1"], operations: ["CREATE", "UPDATE"], resources: ["pods"]}]},
       matchConditions: [
@@ -250,7 +260,9 @@ render_pod_placement() {
         {name: "tenantTols", expression: ("variables.noExecute.filter(t, has(t.key) && t.key == \"" + $tt + "\")")},
         {name: "quarantineTols", expression: ("variables.noExecute.filter(t, has(t.key) && t.key == \"" + $q + "\")")},
         {name: "nodeName", expression: "has(object.spec.nodeName) ? object.spec.nodeName : \"\""},
-        {name: "shared", expression: ("namespaceObject.metadata.name in " + ($shared | tojson))}
+        {name: "shared", expression: ("namespaceObject.metadata.name in " + ($shared | tojson))},
+        # a node agent (TENANT_NODE_DAEMONSETS): its namespace and service account, owned by a DaemonSet
+        {name: "nodeAgent", expression: ("(namespaceObject.metadata.name + \"/\" + (has(object.spec.serviceAccountName) ? object.spec.serviceAccountName : \"default\")) in " + ($agents | tojson) + " && has(object.metadata.ownerReferences) && object.metadata.ownerReferences.exists(o, o.kind == \"DaemonSet\" && o.apiVersion == \"apps/v1\")")}
       ],
       validations: [
         # --- tenant namespaces
@@ -267,8 +279,8 @@ render_pod_placement() {
          messageExpression: "\"pods of tenant \" + variables.tenant + \" may name only \" + variables.tenant + \"-* nodes\"",
          reason: "Forbidden"},
         # --- every other namespace
-        {expression: "variables.tenant != \"\" || variables.shared || (size(variables.wildcard) == 0 && size(variables.tenantTols) == 0 && size(variables.quarantineTols) == 0)",
-         message: ("pods outside tenant namespaces may not tolerate " + $tt + " or " + $q + " (a wildcard toleration with effect NoExecute or none counts); see docs/TENANTS.md"),
+        {expression: "variables.tenant != \"\" || variables.shared || (size(variables.wildcard) == 0 && (size(variables.tenantTols) == 0 || variables.nodeAgent) && size(variables.quarantineTols) == 0)",
+         message: ("pods outside tenant namespaces may not tolerate " + $tt + " or " + $q + " (a wildcard toleration with effect NoExecute or none counts; only a TENANT_NODE_DAEMONSETS node agent may tolerate " + $tt + "); see docs/TENANTS.md"),
          reason: "Forbidden"},
         {expression: ("variables.tenant != \"\" || request.operation != \"CREATE\" || !" + ($tenants | tojson) + ".exists(t, variables.nodeName.startsWith(t + \"-\"))"),
          message: "pods outside tenant namespaces may not name a tenant node",
@@ -310,11 +322,13 @@ preflight() {
       else empty end,
       (if ($taints | any(.key == $q)) then "node \($n): quarantined (\($q)); lift with: kubectl taint node \($n) \($q)-" else empty end)
   ' <<<"$nodes" | sed 's/^/[tenant-admission] preflight: /' >&2
-  jq -r --argjson tenants "$TENANTS_J" --argjson shared "$SHARED_NS_J" --slurpfile ns <(printf '%s' "$nss") \
+  jq -r --argjson tenants "$TENANTS_J" --argjson shared "$SHARED_NS_J" --argjson agents "$NODE_AGENTS_J" --slurpfile ns <(printf '%s' "$nss") \
      --arg nl "$TENANT_NS_LABEL" --arg tl "$TENANT_NODE_LABEL" --arg tt "$TENANT_TAINT" --arg q "$QUARANTINE_TAINT" '
     ($ns[0].items | map({key: .metadata.name, value: (.metadata.labels[$nl] // "")}) | from_entries) as $tenantOf
     | .items[] | .metadata.namespace as $pns | ($tenantOf[$pns] // "") as $t
     | (.metadata.ownerReferences[0].kind // "Pod") as $owner
+    | (.spec.serviceAccountName // "default") as $sa
+    | (($agents | index($pns + "/" + $sa)) != null and any(.metadata.ownerReferences[]?; .kind == "DaemonSet")) as $agent
     | [(.spec.tolerations // [])[] | select((.effect // "") == "" or .effect == "NoExecute")] as $ne
     | ([$ne[] | select((.key // "") == "" and .operator == "Exists")] | length) as $wild
     | ([$ne[] | select(.key == $tt)]) as $tten
@@ -325,7 +339,7 @@ preflight() {
               and ($tten | all((.operator // "Equal") == "Equal" and .value == $t)) then empty
          else "pod \($pns)/\(.metadata.name) (\($owner)): tolerations are not exactly \($tt)=\($t):NoExecute" end)
       elif ($shared | index($pns)) then empty
-      elif $wild > 0 or ($tten | length) > 0 or $quar > 0 then "pod \($pns)/\(.metadata.name) (\($owner)): tolerates tenant/quarantine taints (wildcard: \($wild))"
+      elif $wild > 0 or (($tten | length) > 0 and ($agent | not)) or $quar > 0 then "pod \($pns)/\(.metadata.name) (\($owner)): tolerates tenant/quarantine taints (wildcard: \($wild))"
       else empty end
   ' <<<"$pods" | sort -u | sed 's/^/[tenant-admission] preflight: /' >&2
 }
