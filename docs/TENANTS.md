@@ -144,10 +144,47 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
      label (kubelet: `/var/lib/rancher/k3s/agent/kubelet.kubeconfig`), and to patch another
      node's status (`client-k3s-controller.crt`). Each must be refused;
    - `tenant-admission.sh <env> --plan` reports nothing.
+8. Optionally, give the tenant an email alias: set `TENANT_EMAIL_FORWARD_LIKE` or `TENANT_EMAIL_TO`
+   in tenant.properties and re-run `tenant.sh <env> <tenant>` (see "Tenant email alias").
 
 To roll back, run `tenant-admission.sh <env> --remove`, `network-policies.sh <env> --remove`
 and `join-worker.sh <env> <node> --remove`. Removing a tenant's namespaces is deliberately
 manual, because they hold its data.
+
+## Tenant email alias
+
+A tenant often needs an address of its own for service accounts it holds through you: a data
+platform workspace, a cloud console, a status page. Sign these up with a tenant alias such as
+`<tenant>@<MAIL_DOMAIN>`, not with a person's address, so the account survives people leaving
+and the mail reaches whoever you route it to.
+
+`tools/cloudflare/email-route.sh` manages such aliases as Cloudflare Email Routing rules
+(forward only; Cloudflare receives the mail for `MAIL_DOMAIN`):
+
+```bash
+tools/cloudflare/email-route.sh <env> --list
+tools/cloudflare/email-route.sh <env> acme --forward-like ops --dry-run   # acme@ forwards like ops@
+tools/cloudflare/email-route.sh <env> acme --to ops-team@example.com     # a verified destination
+tools/cloudflare/email-route.sh <env> acme --remove
+```
+
+- **Settings** in `envs/<env>/env.properties`: `MAIL_DOMAIN` (the zone), and optionally
+  `CLOUDFLARE_EMAIL_TOKEN_FILE` (a file holding only the token; default: the token in
+  `shared/secrets.plain/cloudflare.yaml`) and `CLOUDFLARE_EMAIL_ZONE_ID`. The token needs
+  *Zone / Email Routing Rules: Edit*.
+- **Idempotent.** A rule for the alias with the same destinations is a no-op. A rule with other
+  destinations is reported and left alone.
+- **Verified destinations only.** Cloudflare delivers only to destination addresses verified on
+  the account. With *Email Routing Addresses: Read* on the account the script checks that list.
+  A token scoped to the zone cannot read it; then a destination counts as verified only when an
+  enabled rule of the zone already forwards to it, and anything else is refused. Add new
+  destinations in the Cloudflare dashboard (Email Routing, Destination addresses).
+- **From tenant.sh.** With `TENANT_EMAIL_FORWARD_LIKE=<alias>` (or `TENANT_EMAIL_TO=<address>`)
+  in `tenants/<tenant>/tenant.properties`, `tenant.sh` creates `<tenant>@<MAIL_DOMAIN>`
+  (`TENANT_EMAIL_ALIAS` changes the local part). `--plan` and `--dry-run=server` show the call
+  without making it; `--skip-email` leaves it out.
+- The alias forwards to you, the operating org. Forwarding it to the tenant's own people is a
+  choice per tenant; it gives them the password resets of the accounts signed up with it.
 
 ## What remains
 

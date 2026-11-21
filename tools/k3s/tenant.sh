@@ -18,6 +18,8 @@ set -euo pipefail
 #   * an Argo CD AppProject <tenant>: the tenant's repos only, destinations only its
 #     namespaces on this cluster, no cluster-scoped resource, no quota/limit/NetworkPolicy/RBAC
 #     objects, and a role read-only (applications and logs, get) for TENANT_ARGOCD_GROUPS.
+#   * optionally, an email alias <tenant>@<MAIL_DOMAIN> through Cloudflare Email Routing
+#     (tools/cloudflare/email-route.sh), when TENANT_EMAIL_FORWARD_LIKE or TENANT_EMAIL_TO is set.
 #
 # Usage:
 #   tools/k3s/tenant.sh <env-name> <tenant> [options]
@@ -28,6 +30,7 @@ set -euo pipefail
 #   --dry-run=server   server-side dry run of the rendered objects; change nothing
 #   --print            print the rendered objects (JSON List) and exit
 #   --skip-argocd      leave the AppProject out
+#   --skip-email       leave the email alias out
 #   -h, --help         show this help
 #
 # Settings: envs/<env>/tenants/<tenant>/tenant.properties (sourced when present), else the
@@ -45,6 +48,10 @@ set -euo pipefail
 #   TENANT_SOURCE_REPOS      repos the AppProject may deploy from (required for the AppProject)
 #   TENANT_ARGOCD_GROUPS     Dex groups (org:team) given the read-only project role
 #   NETPOL_TENANT_MINIO      tenants whose namespaces may reach MinIO (also network-policies.sh)
+#   TENANT_EMAIL_FORWARD_LIKE  an existing alias of MAIL_DOMAIN: <tenant>@<MAIL_DOMAIN> forwards like it
+#   TENANT_EMAIL_TO          or a verified destination address to forward to (not both)
+#   TENANT_EMAIL_ALIAS       the alias (default <tenant>); MAIL_DOMAIN and the Cloudflare token
+#                            come from env.properties (see email-route.sh)
 #
 # Objects carry app.kubernetes.io/managed-by=infra-skills-tenant and infra-skills/tenant=<tenant>;
 # applied server-side under the field manager infra-skills-tenant. Removing a tenant is
@@ -70,6 +77,7 @@ TENANT="$1"; shift
 
 MODE=apply
 SKIP_ARGOCD=false
+SKIP_EMAIL=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plan|--diff) MODE=plan; shift ;;
@@ -77,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) provision::error "use --dry-run=server"; exit 1 ;;
     --print) MODE=print; shift ;;
     --skip-argocd) SKIP_ARGOCD=true; shift ;;
+    --skip-email) SKIP_EMAIL=true; shift ;;
     *) provision::error "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
@@ -92,6 +101,26 @@ if [[ "$MODE" != print ]]; then
 fi
 
 log() { echo "[tenant] $*" >&2; }
+
+# The tenant's email alias (optional): email-route.sh does the work and is idempotent.
+# Usage: tenant_email [--dry-run]
+if [[ -n "${TENANT_EMAIL_FORWARD_LIKE:-}" && -n "${TENANT_EMAIL_TO:-}" ]]; then
+  provision::error "set TENANT_EMAIL_FORWARD_LIKE or TENANT_EMAIL_TO, not both"; exit 1
+fi
+tenant_email() {
+  $SKIP_EMAIL && return 0
+  [[ -n "${TENANT_EMAIL_FORWARD_LIKE:-}${TENANT_EMAIL_TO:-}" ]] || return 0
+  local -a args=("$ENV_NAME" "${TENANT_EMAIL_ALIAS:-$TENANT}" --name "infra-skills tenant ${TENANT}")
+  if [[ -n "${TENANT_EMAIL_FORWARD_LIKE:-}" ]]; then
+    args+=(--forward-like "$TENANT_EMAIL_FORWARD_LIKE")
+  else
+    args+=(--to "$TENANT_EMAIL_TO")
+  fi
+  [[ -n "${1:-}" ]] && args+=("$1")
+  log "email alias ${TENANT_EMAIL_ALIAS:-$TENANT}@${MAIL_DOMAIN:-<MAIL_DOMAIN unset>}"
+  "$REPO_ROOT/tools/cloudflare/email-route.sh" "${args[@]}"
+}
+
 words() { tr ', ' '\n\n' <<<"${1:-}" | sed '/^$/d'; }
 words_json() { words "${1:-}" | jq -R . | jq -sc .; }
 
@@ -249,10 +278,11 @@ set -e
 [[ -n "$MISSING_NS" ]] && log "namespaces to create first: ${MISSING_NS//$'\n'/ } (their contents are diffed once they exist)"
 
 case "$MODE" in
-  plan) exit 0 ;;
+  plan) tenant_email --dry-run; exit 0 ;;
   dry-run)
     kubectl apply --server-side --field-manager="$MANAGER" --dry-run=server -f "$NS_LIST"
     [[ -z "$MISSING_NS" ]] && kubectl apply --server-side --field-manager="$MANAGER" --dry-run=server -f "$REST"
+    tenant_email --dry-run
     log "server-side dry run passed; nothing changed"
     exit 0 ;;
 esac
@@ -261,3 +291,4 @@ kubectl apply --server-side --field-manager="$MANAGER" -f "$NS_LIST"
 kubectl apply --server-side --field-manager="$MANAGER" -f "$REST"
 log "applied. Tenant pods need nodeSelector node-restriction.kubernetes.io/tenant=${TENANT} and the toleration"
 log "  infra-skills/tenant=${TENANT}:NoExecute (tenant-admission.sh enforces both); Postgres via postgres.sh --provision-credentials --tenant ${TENANT} --pooler"
+tenant_email
