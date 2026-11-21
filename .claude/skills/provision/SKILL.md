@@ -88,6 +88,23 @@ tools/provision-hetzner-cloud.sh <env> --destroy            # Tear down (server 
 ```
 Requires `envs/shared/secrets.plain/hetzner-cloud-token.txt`. **`--destroy`** removes the server,
 the Tailscale device, and the Cloudflare DNS records — confirm with the user first.
+`--dry-run` prints every API call (bodies with user data redacted) and changes nothing; run it
+first. Before creating, the script checks that `HCLOUD_SERVER_TYPE` is available in
+`HCLOUD_LOCATION` and lists the alternatives when it is not (Hetzner's CX types are often out of stock).
+
+#### Tenant worker on Hetzner Cloud (a node for another organisation's pods)
+A VM in **your own** (the operating org's) Hetzner project, with the shared ops token, that runs
+only one tenant's pods and joins this cluster over Tailscale as an isolated tenant worker, through
+`join-worker.sh --tenant` (docs/TENANTS.md). You hold root and every key; the tenant gets pods,
+never a shell. The script refuses to create the node until the tailnet policy confines
+`tag:tenant-<tenant>` to the cluster server's tcp:6443 and udp:8472.
+Config in `envs/<env>/<tenant>-<n>/env.properties`; details in docs/HETZNER-CLOUD-TENANT.md.
+```bash
+tools/provision-hetzner-cloud.sh <env> --worker <tenant>-1 --dry-run   # the plan; nothing changes
+tools/provision-hetzner-cloud.sh <env> --worker <tenant>-1             # create, provision, join
+tools/provision-hetzner-cloud.sh <env> --worker <tenant>-1 --destroy   # remove from cluster, delete
+```
+Creates billable resources and joins a node to a live cluster: get the user's go first.
 
 #### k3s server defaults
 Both options write these on a new server before k3s first starts; `tools/doctor.sh` (check
