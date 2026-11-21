@@ -122,9 +122,9 @@ the device list (read-only) and **refuses** when:
   what the static reading cannot, such as groups and IP sets.
 
 It **warns** when the evaluator says the server (its first tag, else its address) does not reach
-the tag on `udp:8472` and `tcp:10250`: VXLAN and metrics from the server to the node would be
-dropped. It also warns when the policy has no `tests` entry for the tag. Destroy and
-`--provision-only` do not run the check.
+the tag on `udp:8472`, `tcp:10250` and `tcp:9100`: VXLAN, kubelet metrics and node-exporter
+scrapes from the server to the node would be dropped. It also warns when the policy has no
+`tests` entry for the tag. Destroy and `--provision-only` do not run the check.
 
 The tenant part of a segmented policy, with the prod server tagged `tag:env-prod`:
 
@@ -139,8 +139,8 @@ The tenant part of a segmented policy, with the prod server tagged `tag:env-prod
     {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
     // The tenant node reaches its cluster server's k3s API and flannel, nothing else.
     {"src": ["tag:tenant-symbioen"], "dst": ["tag:env-prod"], "ip": ["tcp:6443", "udp:8472"]},
-    // The server reaches the node's flannel, and its kubelet for metrics-server and Prometheus.
-    {"src": ["tag:env-prod"], "dst": ["tag:tenant-symbioen"], "ip": ["udp:8472", "tcp:10250"]}
+    // The server reaches the node's flannel, its kubelet (metrics-server, Prometheus) and node-exporter.
+    {"src": ["tag:env-prod"], "dst": ["tag:tenant-symbioen"], "ip": ["udp:8472", "tcp:10250", "tcp:9100"]}
   ],
   "tests": [
     {"src": "tag:tenant-symbioen", "accept": ["tag:env-prod:6443"], "deny": ["tag:env-prod:22", "tag:env-prod:5432"]}
@@ -211,8 +211,10 @@ Sources:
 
 - **The tailnet policy** is yours to change, in the Tailscale admin console (above). infra-skills
   only checks it.
-- **Monitoring of the node.** Promtail and node-exporter do not run on tenant nodes (TENANTS.md).
-  Hetzner's CPU, disk and network graphs are in your project's console.
+- **Monitoring of the node.** node-exporter runs on tenant nodes (hostNetwork); Prometheus on the
+  cluster server scrapes it over the tailnet on `tcp:9100`, and NodeExporterDown covers the node.
+  Promtail does not run there: it would need Loki credentials on the node (TENANTS.md). Hetzner's
+  CPU, disk and network graphs are in your project's console.
 - **Automatic restock.** When `HCLOUD_SERVER_TYPE` is unavailable, the script stops and lists what
   is available instead of choosing a type for you.
 - **Billing the tenant.** The node is on your Hetzner invoice; charge it on as you agree with the
