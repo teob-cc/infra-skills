@@ -948,7 +948,7 @@ function tailscale::delete_device(){
 #   REFUSE  an ssh rule's source can be the node (Tailscale SSH from the tenant node);
 #   REFUSE  Tailscale's own evaluator (POST /acl/validate, tests only) fails tailscale::policy_tests;
 #   WARN    the evaluator says the server (its first tag, else its address) does not reach the
-#           tag on udp:8472 and tcp:10250; the policy has no tests entry for the tag.
+#           tag on udp:8472, tcp:10250 and tcp:9100; the policy has no tests entry for the tag.
 # Usage: tailscale::policy_problems TAG SERVER_IP. Prints "REFUSE ..." and "WARN ..." lines; returns
 # 1 when there is a REFUSE line. TAILSCALE_POLICY_CHECK=warn downgrades the refusal in
 # tenant::preflight (a throwaway test tailnet only). docs/HETZNER-CLOUD-TENANT.md has a policy.
@@ -1015,17 +1015,18 @@ function tailscale::policy_problems(){
   fi
 
   # The way back, a warning only: the server reaches the node's flannel (udp:8472) and kubelet
-  # (tcp:10250, metrics-server and Prometheus). Source: the server's first tag, else its address.
+  # (tcp:10250, metrics-server and Prometheus) and node-exporter (tcp:9100, Prometheus).
+  # Source: the server's first tag, else its address.
   local server_src
   server_src=$(printf '%s' "$devices" | jq -r --arg ip "$server_ip" \
     '[.devices[]? | select((.addresses // []) | index($ip))] | first | if . == null then empty else ((.tags // [])[0] // $ip) end')
   if [[ -n "$server_src" ]]; then
     tests=$(jq -cn --arg s "$server_src" --arg tag "$tag" \
-      '[{src: $s, proto: "udp", accept: ["\($tag):8472"]}, {src: $s, proto: "tcp", accept: ["\($tag):10250"]}]')
+      '[{src: $s, proto: "udp", accept: ["\($tag):8472"]}, {src: $s, proto: "tcp", accept: ["\($tag):10250", "\($tag):9100"]}]')
     if verdict=$(tailscale::api POST "/tailnet/$(tailscale::get_tailnet)/acl/validate" "$tests"); then
       msg=$(printf '%s' "$verdict" | jq -r '(.message // empty) as $m | if $m == "" then empty
               else ([$m] + ([.data[]? | (.errors // [])[]] | unique) | join("; ")) end' 2>/dev/null)
-      [[ -n "$msg" ]] && out+=$'\n'"WARN the cluster server (${server_src}) does not reach ${tag} on udp:8472 and tcp:10250 (pod traffic and metrics from the server would be dropped): ${msg}"
+      [[ -n "$msg" ]] && out+=$'\n'"WARN the cluster server (${server_src}) does not reach ${tag} on udp:8472, tcp:10250 and tcp:9100 (pod traffic, kubelet metrics and node-exporter scrapes from the server would be dropped): ${msg}"
     fi
   fi
 
@@ -1483,7 +1484,8 @@ elif [[ "$NODE_ROLE" == "tenant-worker" ]]; then
   # Tenant worker: no private network, no ingress. The Hetzner Cloud firewall in front already
   # drops every inbound packet but udp/41641; ufw is the same policy on the host, plus the k3s
   # overlay. Everything from the cluster arrives over tailscale0 (API tunnel, kubelet 10250,
-  # flannel VXLAN 8472/udp), and what may arrive there is decided by the tailnet policy.
+  # node-exporter 9100, flannel VXLAN 8472/udp), and what may arrive there is decided by the
+  # tailnet policy. Narrowing the tailscale0 rule to ports must keep 10250, 9100 and 8472/udp.
   echo "[postinstall] Preparing UFW rules (tenant worker) ..."
   ufw --force reset >/dev/null 2>&1 || true
   ufw default deny incoming >/dev/null 2>&1 || true
