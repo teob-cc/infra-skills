@@ -2507,7 +2507,6 @@ serverFiles:
             expr: |
               kube_node_info unless on (node) (up{service=~".*node-exporter"} == 1)
               unless on (node) node:on_demand_parked
-              unless on (node) kube_node_labels{label_node_restriction_kubernetes_io_tenant!=""}
             for: 10m
             labels: { severity: p2, app: infra }
             annotations:
@@ -3689,14 +3688,23 @@ kube-state-metrics:
   enabled: true
   # Node labels are not exported unless listed here. The on-demand marker becomes
   # kube_node_labels{label_infra_skills_on_demand="true"}, which the node:on_demand_parked
-  # rule (infra-node group) reads to tell a parked worker from a dead one. The tenant label
-  # (docs/TENANTS.md) becomes label_node_restriction_kubernetes_io_tenant: NodeExporterDown
-  # skips tenant workers, which run no node-exporter by design (INFRA-227).
+  # rule (infra-node group) reads to tell a parked worker from a dead one.
   metricLabelsAllowlist:
-    - nodes=[infra-skills/on-demand,node-restriction.kubernetes.io/tenant]
+    - nodes=[infra-skills/on-demand]
 
 prometheus-node-exporter:
   enabled: true
+  # Every node, tenant workers included (INFRA-227): the chart's own NoSchedule wildcard, plus the
+  # tenant taint. tenant-admission.sh lets exactly this DaemonSet (observability/
+  # prometheus-prometheus-node-exporter, TENANT_NODE_DAEMONSETS) tolerate it; promtail stays off
+  # tenant workers, its Loki credentials would be on the node. Prometheus scrapes a tenant
+  # worker over the tailnet on tcp:9100 (hostNetwork), which the tailnet policy must grant.
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+    - key: infra-skills/tenant
+      operator: Exists
+      effect: NoExecute
   # Textfile collector: node crons (NAS rdiff syncs) drop success-stamp metrics
   # under /var/lib/node_exporter/textfile via /usr/local/bin/nas-backup-stamp
   # (installed by tools/backup.sh). Watched by the infra-backup alert group.

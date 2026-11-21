@@ -3,37 +3,43 @@
 #   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
 #   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
 #   cd tests/alert-rules && promtool test rules tenant-workers-test.yml
-# A tenant worker (label node-restriction.kubernetes.io/tenant) runs no node-exporter by
-# design: the DaemonSet does not tolerate the tenant taint. NodeExporterDown must skip it,
-# and still fire for a platform worker whose node-exporter is missing.
+# node-exporter runs on tenant workers too (owner decision 2026-11-21): its DaemonSet tolerates
+# the tenant taint, and Prometheus scrapes it over the tailnet on tcp:9100. A tenant worker is
+# watched like any other node: NodeExporterDown fires when its node-exporter is missing or
+# unreachable (a dead tenant node, a tailnet policy without the 9100 grant), and stays silent
+# when it answers.
 rule_files:
   - rules.yml
 evaluation_interval: 1m
 
 tests:
-  - name: tenant worker without node-exporter is silent, platform worker is not
+  - name: tenant worker without node-exporter fires, tenant worker with one is silent
     interval: 1m
     input_series:
       - series: kube_node_info{node="test"}
         values: 1x40
       - series: kube_node_info{node="demo-1"}
         values: 1x40
-      - series: kube_node_info{node="worker-2"}
+      - series: kube_node_info{node="demo-2"}
         values: 1x40
       - series: kube_node_status_condition{node="test",condition="Ready",status="true"}
         values: 1x40
       - series: kube_node_status_condition{node="demo-1",condition="Ready",status="true"}
         values: 1x40
-      - series: kube_node_status_condition{node="worker-2",condition="Ready",status="true"}
+      - series: kube_node_status_condition{node="demo-2",condition="Ready",status="true"}
         values: 1x40
       - series: kube_node_labels{node="test"}
         values: 1x40
       - series: kube_node_labels{node="demo-1",label_node_restriction_kubernetes_io_tenant="demo"}
         values: 1x40
-      - series: kube_node_labels{node="worker-2"}
+      - series: kube_node_labels{node="demo-2",label_node_restriction_kubernetes_io_tenant="demo"}
         values: 1x40
-      # node-exporter runs (and answers) only on test; neither demo-1 nor worker-2 has one.
+      # node-exporter answers on test and demo-2 (scraped over the tailnet); demo-1's is down.
       - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="1.1.1.1:9100",node="test"}
+        values: 1x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="100.95.235.76:9100",node="demo-1"}
+        values: 0x40
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="100.95.235.77:9100",node="demo-2"}
         values: 1x40
     alert_rule_test:
       - eval_time: 30m
@@ -42,11 +48,11 @@ tests:
           - exp_labels:
               severity: p2
               app: infra
-              node: worker-2
+              node: demo-1
             exp_annotations:
-              summary: "No node-exporter metrics from node worker-2"
+              summary: "No node-exporter metrics from node demo-1"
               description: |
-                Prometheus gets nothing from node-exporter on worker-2, so every disk,
+                Prometheus gets nothing from node-exporter on demo-1, so every disk,
                 RAID, NVMe, memory and backup alert for that node is blind. Check the
                 prometheus-prometheus-node-exporter DaemonSet pod on the node and the
                 Prometheus /targets page.

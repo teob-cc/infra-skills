@@ -103,13 +103,16 @@ that waits for a parked node fires KubePodUnschedulable.
 ### Tenant workers
 
 A tenant worker (`join-worker.sh --tenant`, label `node-restriction.kubernetes.io/tenant`)
-runs only its tenant's pods. node-exporter and promtail do not run there: their DaemonSets
-do not tolerate the tenant taint, and the tenant admission policies refuse pods outside
-tenant namespaces that do. NodeExporterDown therefore skips nodes with that label;
-kube-state-metrics exports it as `label_node_restriction_kubernetes_io_tenant`. Everything
-else applies to a tenant worker as to any node: KubeNodeNotReady, KubeletDown and the
-alerts on its pods still fire. Its disk and memory are not watched from inside the node
-(INFRA-227).
+runs only its tenant's pods, plus node-exporter: the ops org owns the node, so its disk and
+memory are watched like any other (INFRA-227). The node-exporter DaemonSet tolerates the
+tenant taint, and `tenant-admission.sh` admits exactly that DaemonSet there
+(`TENANT_NODE_DAEMONSETS`). Promtail does not run there (its Loki credentials).
+
+Prometheus scrapes a tenant worker's node-exporter (hostNetwork) over the tailnet on
+tcp:9100, from the cluster server's address. The tailnet policy must grant the server's tag
+that port on `tag:tenant-<tenant>` (INFRA-219); `provision-hetzner-cloud.sh` checks it.
+Every rule applies to a tenant worker as to any node. NodeExporterDown fires when the node is
+dead or when the 9100 grant is missing.
 
 ## Runbook
 

@@ -63,6 +63,8 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     `infra-skills/tenant=<tenant>` must select `node-restriction.kubernetes.io/tenant=<tenant>`
     and tolerate exactly their tenant's taint. Pods anywhere else may not tolerate a tenant
     taint or the quarantine taint, wildcard tolerations included.
+    One exception: the node-exporter DaemonSet (`TENANT_NODE_DAEMONSETS`) may tolerate the
+    tenant taint, so ops watches tenant workers too.
 
   `--warn` binds the policies with `[Warn, Audit]`, for a first look at a live cluster.
   `--plan` also lists the existing pods and nodes that the policies would refuse.
@@ -167,12 +169,18 @@ manual, because they hold its data.
   longer creates that policy (teob-cc/infra-skills#36): re-run it on clusters with chart 10.x.
   `network-policies.sh` names every such policy in its namespaces.
 - **The `postgres` database** stays open to every role. It holds no application data.
-- **Logs and metrics.** Promtail and node-exporter do not run on a tenant worker: their
-  DaemonSets do not tolerate the tenant taint, and the pod placement policy refuses pods
-  outside tenant namespaces that do. Promtail would put its Loki credentials on the node,
-  where an escaped pod could take them. The node-exporter alert treats a node without
-  node-exporter as down, so a tenant worker needs its exclusion (INFRA-227). The tenant sees
-  its own logs and metrics through a tenant console that queries server-side.
+- **Logs and metrics.** node-exporter runs on tenant workers (INFRA-227): the ops org owns
+  the node and watches its disk and memory like any other. Its DaemonSet tolerates the tenant
+  taint, and `tenant-admission.sh` lets exactly that DaemonSet do so (`TENANT_NODE_DAEMONSETS`,
+  default `observability/prometheus-prometheus-node-exporter`: namespace, service account and
+  a DaemonSet owner must all match). It holds no credential and mounts no service account
+  token. Prometheus on the cluster server scrapes it over the tailnet on tcp:9100, which the
+  tailnet policy must grant from the server's tag to `tag:tenant-<tenant>`. NodeExporterDown
+  covers tenant workers like any node. A pod that escapes to root on the node controls what
+  that node's node-exporter reports, its textfile metrics included: trust a tenant worker's
+  own metrics no more than the node itself. Promtail does not run there: its Loki
+  credentials would be on the node, where an escaped pod could take them. The tenant sees its
+  own logs and metrics through a tenant console that queries server-side.
 - **The tailnet.** The tenant worker carries `tag:tenant-<tenant>` (its Tailscale auth key
   carries the tag). The tailnet policy, segmented by tags (INFRA-219), lets the tag reach only
   its cluster's server on 6443/tcp and 8472/udp. The server may reach the tag on 8472/udp and
