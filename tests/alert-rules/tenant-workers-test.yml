@@ -1,0 +1,53 @@
+# promtool unit tests for tenant workers in tools/k3s/observability.sh (docs/ALERTING.md,
+# "Tenant workers"; INFRA-227). Render the rules first, as in on-demand-nodes-test.yml:
+#   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
+#   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
+#   cd tests/alert-rules && promtool test rules tenant-workers-test.yml
+# A tenant worker (label node-restriction.kubernetes.io/tenant) runs no node-exporter by
+# design: the DaemonSet does not tolerate the tenant taint. NodeExporterDown must skip it,
+# and still fire for a platform worker whose node-exporter is missing.
+rule_files:
+  - rules.yml
+evaluation_interval: 1m
+
+tests:
+  - name: tenant worker without node-exporter is silent, platform worker is not
+    interval: 1m
+    input_series:
+      - series: kube_node_info{node="test"}
+        values: 1x40
+      - series: kube_node_info{node="demo-1"}
+        values: 1x40
+      - series: kube_node_info{node="worker-2"}
+        values: 1x40
+      - series: kube_node_status_condition{node="test",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_status_condition{node="demo-1",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_status_condition{node="worker-2",condition="Ready",status="true"}
+        values: 1x40
+      - series: kube_node_labels{node="test"}
+        values: 1x40
+      - series: kube_node_labels{node="demo-1",label_node_restriction_kubernetes_io_tenant="demo"}
+        values: 1x40
+      - series: kube_node_labels{node="worker-2"}
+        values: 1x40
+      # node-exporter runs (and answers) only on test; neither demo-1 nor worker-2 has one.
+      - series: up{job="kubernetes-service-endpoints",service="prometheus-prometheus-node-exporter",instance="1.1.1.1:9100",node="test"}
+        values: 1x40
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NodeExporterDown
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              app: infra
+              node: worker-2
+            exp_annotations:
+              summary: "No node-exporter metrics from node worker-2"
+              description: |
+                Prometheus gets nothing from node-exporter on worker-2, so every disk,
+                RAID, NVMe, memory and backup alert for that node is blind. Check the
+                prometheus-prometheus-node-exporter DaemonSet pod on the node and the
+                Prometheus /targets page.
+              runbook: "https://github.com/teob-cc/infra-skills/blob/main/docs/ALERTING.md#node"
