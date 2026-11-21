@@ -131,8 +131,9 @@ manual, because they hold its data.
 - **Charts' own allow-all policies.** NetworkPolicies add up: a policy that admits ingress
   from anywhere overrides the default deny for its pods. The Argo CD chart's `argocd-server`
   policy is `ingress: [{}]`, so a tenant node reaches argocd-server directly, past Pomerium
-  (found on test, 2026-11-21); Argo CD's own login still applies. `network-policies.sh` names
-  every such policy in its namespaces; narrow them in the chart's values.
+  (found on test, 2026-11-21); Argo CD's own login still applies. `argocd.sh` no longer
+  creates that policy (teob-cc/infra-skills#36): re-run it on clusters with chart 10.x.
+  `network-policies.sh` names every such policy in its namespaces.
 - **The `postgres` database** stays open to every role. It holds no application data.
 - **Logs and metrics.** Promtail and node-exporter do not run on a tenant node. Promtail would
   hand the tenant its Loki credentials. The tenant sees its own logs and metrics through a
