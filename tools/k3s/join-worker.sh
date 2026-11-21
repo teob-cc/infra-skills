@@ -54,8 +54,8 @@ Flags:
                         when needed: alerts treat it as parked, not failed, while it is
                         not Ready (docs/ALERTING.md, "On-demand nodes")
   --taint KEY=VAL:EFF   Add taint to node (repeatable, e.g. --taint gpu=rtx4080:NoSchedule)
-  --tenant NAME         Join a shared-root tenant worker (docs/TENANTS.md; or TENANT= in the worker's
-                        env.properties): short-lived agent-only join token, tenant-only registries.yaml, node name
+  --tenant NAME         Join a tenant worker: a node the ops org runs for tenant NAME's pods
+                        (docs/TENANTS.md; or TENANT= in the worker's env.properties): short-lived agent-only join token, tenant-only registries.yaml, node name
                         NAME-*, taints infra-skills/quarantine + infra-skills/tenant=NAME:NoExecute,
                         label node-restriction.kubernetes.io/tenant=NAME set as cluster admin.
                         Needs tools/k3s/tenant-admission.sh first
@@ -151,7 +151,7 @@ NODE_NAME="${WORKER_ARG}"
 # Normalize: replace underscores with hyphens for K8s
 NODE_NAME="${NODE_NAME//_/-}"
 
-# --- Tenant worker (shared root, docs/TENANTS.md) ---
+# --- Tenant worker (ops-owned; only the tenant's pods run there; docs/TENANTS.md) ---
 TENANT="${TENANT_FLAG:-${TENANT:-}}"
 TENANT_NODE_LABEL="node-restriction.kubernetes.io/tenant"
 TENANT_TAINT="infra-skills/tenant"
@@ -183,7 +183,7 @@ for label in ${LABELS[@]+"${LABELS[@]}"}; do
 done
 
 info "K3s worker join for ${ENV_NAME}/${WORKER_ARG}"
-[[ -n "$TENANT" ]] && info "  Tenant: ${TENANT} (shared-root tenant worker)"
+[[ -n "$TENANT" ]] && info "  Tenant: ${TENANT} (tenant worker: the tenant's pods only)"
 info "  Node:   ${NODE_NAME}"
 info "  Worker: ${VLAN_IP_ADDR} (Tailscale)"
 info "  Master: ${MASTER_VLAN_IP_ADDR} (Tailscale)"
@@ -289,7 +289,8 @@ ok "Master K3s API reachable from worker"
 # --- Get the join token from the master ---
 # server/node-token is the server token: it also admits a new SERVER, which gets the
 # datastore and every Secret. An agent keeps its token in
-# /etc/systemd/system/k3s-agent.service.env, readable by whoever is root on it. Modes:
+# /etc/systemd/system/k3s-agent.service.env, readable by root on that node (on a tenant
+# worker: also by a pod that escapes its container). Modes:
 #   bootstrap  a bootstrap token made for this join (`k3s token create --ttl`), deleted again
 #              once the node registered. It joins agents only (a server join is refused) and
 #              the copy left on the node is dead afterwards; the agent keeps working through
@@ -371,11 +372,12 @@ delete_bootstrap_token() {
 trap delete_bootstrap_token EXIT
 
 # A node that once held the server token keeps it in the agent env file until rewritten
-# below; if the tenant already had root then, the server token must be rotated.
+# below; if anyone untrusted had root on it meanwhile (on a tenant worker: a pod that escaped its
+# container), the server token must be rotated.
 if [[ -n "$TENANT" ]] && ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
      "sudo grep -q '::server:' /etc/systemd/system/k3s-agent.service.env 2>/dev/null"; then
   warn "This node holds the SERVER token in /etc/systemd/system/k3s-agent.service.env; it is replaced now."
-  warn "  If the tenant was already root on it, rotate the server token (k3s token rotate) — see docs/TENANTS.md."
+  warn "  If anyone untrusted may have had root on it (e.g. a container escape), rotate the server token (k3s token rotate) — see docs/TENANTS.md."
 fi
 
 # --- Admission policies (tools/k3s/tenant-admission.sh) ---

@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Self-hosted CI runners for a shared-root tenant (INFRA-214, docs/TENANTS.md), registered with the TENANT's
-# GitHub organization and running only on the tenant's own nodes.
+# Self-hosted CI runners for a tenant (INFRA-214, docs/TENANTS.md), registered with the TENANT's GitHub
+# organization and running only on the tenant's own workers. The ops org runs those workers; the tenant gets
+# pods only, and its CI is such a pod pool.
 #
 # The platform pool (github-action-runner.sh) injects the platform's Nexus and Postgres credentials into every
 # runner and sits next to platform workloads. A tenant pool must see none of that:
 #
 #   - namespace <tenant>-ci, labelled infra-skills/tenant=<tenant>; runner pods can reference Secrets only from
-#     their own namespace, so no platform Secret can ever reach them. Pod Security "privileged" there: the pool
-#     uses Docker-in-Docker, and its pods run only on the tenant's nodes, where the tenant is root anyway;
+#     their own namespace, so no platform Secret can ever reach them;
+#   - no Docker by default: the runner pod is not privileged and the namespace enforces Pod Security "baseline".
+#     TENANT_RUNNER_DOCKER=true adds Docker-in-Docker, which runs PRIVILEGED (namespace "privileged"): anyone
+#     who can push a workflow in the tenant's organization then has root on the tenant worker. The node-level
+#     controls of docs/TENANTS.md (bootstrap token, admission policies, network policies) are what contain it;
 #   - every runner pod selects node-restriction.kubernetes.io/tenant=<tenant> and tolerates
 #     infra-skills/tenant=<tenant>:NoExecute (tenant-admission.sh denies anything else in a tenant namespace);
 #   - the GitHub App of the tenant's organization (Secret TENANT_RUNNER_APP_SECRET in <tenant>-ci, keys
@@ -20,7 +24,8 @@ set -euo pipefail
 #   - a NetworkPolicy: no ingress; egress to DNS, Traefik (the env's public hostnames, e.g. Harbor) and the
 #     internet, off every private range and every node address;
 #   - images the tenant node can pull without platform credentials: TENANT_RUNNER_IMAGE (default the public
-#     summerwind/actions-runner) and docker:dind. A tenant node's registries.yaml carries only the tenant's robot.
+#     summerwind/actions-runner), plus docker:dind with TENANT_RUNNER_DOCKER=true. A tenant worker's
+#     registries.yaml carries only the tenant's robot.
 #
 # Workflows in the tenant's repos use:  runs-on: [self-hosted, <tenant>-<env>]
 #
@@ -34,6 +39,7 @@ set -euo pipefail
 #   TENANT_RUNNER_SECRETS      Secrets in <tenant>-ci whose keys become the runners' env (space list)
 #   TENANT_RUNNER_IMAGE        runner image (default summerwind/actions-runner:latest)
 #   TENANT_RUNNER_MEMORY_LIMIT runner container memory limit (default 8Gi); TENANT_DOCKERD_MEMORY_LIMIT (4Gi)
+#   TENANT_RUNNER_DOCKER       true: Docker-in-Docker, PRIVILEGED (root on the tenant worker for the tenant's CI); default false
 #
 # Requires: github-action-runner.sh (the ARC controller), tenant-admission.sh, a joined tenant node.
 
@@ -75,6 +81,9 @@ ORG="${TENANT_GITHUB_ORG:-}"
 REPLICAS="${TENANT_RUNNER_REPLICAS:-1}"
 APP_SECRET="${TENANT_RUNNER_APP_SECRET:-${TENANT}-github-app}"
 IMAGE="${TENANT_RUNNER_IMAGE:-summerwind/actions-runner:latest}"
+DOCKER="${TENANT_RUNNER_DOCKER:-false}"
+[[ "$DOCKER" == true || "$DOCKER" == false ]] || { err "TENANT_RUNNER_DOCKER must be true or false"; exit 1; }
+PSA=$([[ "$DOCKER" == true ]] && echo privileged || echo baseline)
 LABEL="${TENANT}-${ENV_NAME}"
 NAME="${TENANT}-runners"
 TENANT_NODE_LABEL="node-restriction.kubernetes.io/tenant"
@@ -102,31 +111,32 @@ EXCEPT_J=$(kubectl get nodes -o json | jq -c --argjson p "$PRIVATE_J" '$p + ([.i
   | select(.type == "InternalIP" or .type == "ExternalIP") | .address | select(test("^[0-9.]+$")) | . + "/32"] | unique)')
 ENVFROM_J=$(printf '%s\n' "$SECRETS" | sed '/^$/d' | jq -R '{secretRef: {name: .}}' | jq -sc .)
 
-info "Tenant runners for ${ORG} on ${ENV_NAME}: ${REPLICAS} x ${IMAGE} in ${NS}, label ${LABEL}, env from: ${SECRETS:-nothing}"
+info "Tenant runners for ${ORG} on ${ENV_NAME}: ${REPLICAS} x ${IMAGE} in ${NS}, label ${LABEL}, Docker ${DOCKER}, env from: ${SECRETS:-nothing}"
+[[ "$DOCKER" == true ]] && warn "TENANT_RUNNER_DOCKER=true: privileged Docker-in-Docker; the tenant's CI gets root on its tenant workers (docs/TENANTS.md)"
 
 manifest=$(jq -n --arg ns "$NS" --arg t "$TENANT" --arg name "$NAME" --arg org "$ORG" --arg label "$LABEL" \
   --arg image "$IMAGE" --arg app "$APP_SECRET" --argjson replicas "$REPLICAS" --argjson envFrom "$ENVFROM_J" \
   --arg tl "$TENANT_NODE_LABEL" --arg tt "$TENANT_TAINT" --argjson except "$EXCEPT_J" \
-  --arg mem "${TENANT_RUNNER_MEMORY_LIMIT:-8Gi}" --arg dmem "${TENANT_DOCKERD_MEMORY_LIMIT:-4Gi}" '
+  --arg mem "${TENANT_RUNNER_MEMORY_LIMIT:-8Gi}" --arg dmem "${TENANT_DOCKERD_MEMORY_LIMIT:-4Gi}" --arg psa "$PSA" --argjson docker "$DOCKER" '
   {"app.kubernetes.io/managed-by": "infra-skills-tenant-runners", "infra-skills/tenant": $t} as $l
   | {apiVersion: "v1", kind: "List", items: [
     {apiVersion: "v1", kind: "Namespace", metadata: {name: $ns, labels: ($l + {
-      "pod-security.kubernetes.io/enforce": "privileged",
+      "pod-security.kubernetes.io/enforce": $psa,
       "pod-security.kubernetes.io/audit": "baseline", "pod-security.kubernetes.io/warn": "baseline"})}},
     {apiVersion: "actions.summerwind.dev/v1alpha1", kind: "RunnerDeployment",
      metadata: {name: $name, namespace: $ns, labels: $l},
-     spec: {replicas: $replicas, template: {metadata: {labels: ($l + {"infra-skills/runner-pool": $t})}, spec: {
+     spec: {replicas: $replicas, template: {metadata: {labels: ($l + {"infra-skills/runner-pool": $t})}, spec: ({
        organization: $org, labels: ["self-hosted", "linux", "x64", $label],
        githubAPICredentialsFrom: {secretRef: {name: $app}},
        image: $image, imagePullPolicy: "IfNotPresent",
-       dockerEnabled: true, dockerMTU: 1230,
+       dockerEnabled: $docker,
        automountServiceAccountToken: false,
        nodeSelector: {($tl): $t},
        tolerations: [{key: $tt, operator: "Equal", value: $t, effect: "NoExecute"}],
        envFrom: $envFrom,
        resources: {limits: {memory: $mem}, requests: {cpu: "500m", memory: "1Gi"}},
-       dockerdContainerResources: {limits: {memory: $dmem}, requests: {cpu: "250m", memory: "512Mi"}},
-       terminationGracePeriodSeconds: 300}}}},
+       terminationGracePeriodSeconds: 300}
+       + (if $docker then {dockerMTU: 1230, dockerdContainerResources: {limits: {memory: $dmem}, requests: {cpu: "250m", memory: "512Mi"}}} else {} end))}}},
     {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
      metadata: {name: ($name + "-egress"), namespace: $ns, labels: $l},
      spec: {podSelector: {}, policyTypes: ["Ingress", "Egress"], ingress: [],

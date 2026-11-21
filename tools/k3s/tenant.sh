@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ============================================================================
-# tenant — namespace scaffold for a shared-root tenant (INFRA-214, docs/TENANTS.md)
+# tenant — namespace scaffold for a tenant (pods only; INFRA-214, docs/TENANTS.md)
 # ============================================================================
 # Renders and applies what a tenant's workloads live in. The node side (tenant worker,
 # admission policies) is join-worker.sh --tenant and tenant-admission.sh.

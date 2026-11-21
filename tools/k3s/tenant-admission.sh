@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # ============================================================================
-# tenant-admission — ValidatingAdmissionPolicies for shared-root tenant workers (INFRA-214)
+# tenant-admission — ValidatingAdmissionPolicies for tenant workers (INFRA-214)
 # ============================================================================
-# A tenant worker is a node whose root is shared with a tenant (docs/TENANTS.md). The tenant can
-# read everything on that node: the kubelet's client certificate (system:node:<node>), the
+# A tenant worker is a node the ops org runs for one tenant's pods (docs/TENANTS.md). The tenant
+# has no shell there, but a pod that escapes its container is root on the node and can read
+# everything on it: the kubelet's client certificate (system:node:<node>), the
 # agent token it joined with, and the client certificate k3s gives every agent for flannel and
 # the network-policy controller (system:k3s-controller, one identity shared by all agents).
 # Four in-process admission policies (no webhook, nothing to keep running) stop that access from

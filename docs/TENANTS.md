@@ -1,15 +1,31 @@
 # Tenants on a shared cluster
 
-A **tenant** is an organisation that runs its own workloads on your cluster: on a node it owns
-(a *tenant worker*), in namespaces of its own, deployed through an Argo CD project of its own.
-The model assumes **shared root** on the tenant worker: the tenant is root there, and so are
-you. The tenant must not reach anything of yours from that node. Its workloads must stay off
-your nodes, and yours off its node.
+A **tenant** is an organisation whose workloads run as pods on your cluster, in namespaces of
+its own, deployed through an Argo CD project of its own. They run on **tenant workers**: nodes
+that the operating organisation (you, the ops org) creates in its own cloud project and runs.
+The ops org is root on every tenant worker and holds every key: provisioning, SSH, the join
+token, the registry credential and the Tailscale identity. **The tenant gets pods only**, never
+a node shell.
 
-This page explains what root on a k3s agent gives away, and which primitive closes each gap.
-It also gives the order to set a tenant up in, and the gaps that remain.
+The isolation primitives below still treat a tenant worker as untrusted. A container escape
+there gives root on the node, and that is the threat they answer: a tenant pod that breaks out
+must not reach anything of yours. Tenant workloads stay on tenant workers, and yours stay off
+them.
 
-## What root on an agent node holds
+## What a tenant can and can't do
+
+| A tenant can | A tenant can't |
+| --- | --- |
+| Deploy to its own namespaces through its Argo CD project (its repos only) | Log in to any node: no SSH, no console, no kubeconfig with node rights, no access to the cloud project or the tailnet |
+| Read its applications' status and logs (the AppProject's `read-only` role) | Create cluster-scoped objects, RBAC, ResourceQuotas, LimitRanges or NetworkPolicies |
+| Reach its own Postgres poolers, cluster DNS and the egress listed in its `tenant.properties` | Reach platform services, other tenants' pods, private ranges or node addresses |
+| Pull images with its own registry robot | Pull your private images |
+| Run CI on its own runner pool, on its own nodes (`tenant-runners.sh`) | Schedule a pod anywhere but its own tenant workers, or tolerate another tenant's taint |
+| Use what its quota allows (CPU, memory, pods, PVCs; no LoadBalancer or NodePort) | Run privileged pods outside the opt-in CI case below (Pod Security `restricted`) |
+
+## If a tenant pod escapes to its node
+
+Root on a k3s agent holds the following. Each row is closed by a primitive described below.
 
 | On the node | What it allows | Closed by |
 | --- | --- | --- |
@@ -18,25 +34,27 @@ It also gives the order to set a tenant up in, and the gaps that remain.
 | The shared agent certificate (`system:k3s-controller`) | `patch nodes/status` on **every** node (flannel writes its annotations with it); list pods, namespaces and NetworkPolicies cluster-wide | `infra-skills-node-shared-agent-identity` (writes); the reads remain, see below |
 | `/etc/rancher/k3s/registries.yaml` | Pull with whatever robot it holds | `join-worker.sh --tenant` writes a tenant-only file |
 | The host network | Reach every pod and node address the network allows | `network-policies.sh` (no trust in tenant node addresses), `tenant.sh` (tenant namespaces), `NETPOL_APP_NAMESPACES` (your app namespaces) |
+| The node's tailnet identity | Reach what the tailnet policy lets its tag reach | The tailnet policy (INFRA-219): `tag:tenant-<tenant>` reaches only its cluster's 6443/tcp and 8472/udp |
 
 ## The primitives
 
 - **The join token.** `join-worker.sh --tenant` joins with a k3s *bootstrap token*
   (`k3s token create --ttl`). The script makes it for this one join and deletes it when the
   run ends. A bootstrap token admits agents only: a server join with it is refused. Once
-  deleted, the copy left on the tenant node can register nothing more, and the joined agent
-  keeps working through restarts on its node password. The server needs no change and no
-  restart. All of this was checked on k3s v1.36.4, 2026-11-20. A permanent `agent-token` is
-  the other agent-only option, but only on a server installed with one: adding `agent-token`
-  to a running server (config drop-in plus restart) makes every k3s start after the first
-  fail with `cred/passwd newer than datastore`. That was reproduced on three fresh v1.36.4
-  servers; servers without it restarted cleanly.
+  deleted, the copy left on the tenant worker can register nothing more: on test it got 401
+  where a fresh token got 200 (2026-11-21). The joined agent keeps working through restarts
+  on its node password. The server needs no change and no restart. All of this was checked on
+  k3s v1.36.4, 2026-11-20. A permanent `agent-token` is the other agent-only option, but only
+  on a server installed with one: adding `agent-token` to a running server (config drop-in
+  plus restart) makes every k3s start after the first fail with `cred/passwd newer than
+  datastore`. That was reproduced on three fresh v1.36.4 servers; servers without it restarted
+  cleanly.
 - **`tools/k3s/tenant-admission.sh <env>`** installs four ValidatingAdmissionPolicies. They run
   inside the API server, with no webhook to keep alive:
   - `infra-skills-node-registration`: a new node registers only with the taint
     `infra-skills/quarantine=true:NoExecute`. A node named `<tenant>-*` also needs
     `infra-skills/tenant=<tenant>:NoExecute`.
-  - `infra-skills-tenant-node-self`: a tenant node's kubelet may not change its spec (taints)
+  - `infra-skills-tenant-node-self`: a tenant worker's kubelet may not change its spec (taints)
     or any label other than those the kubelet maintains itself (hostname, os, arch, instance
     type, zone, region).
   - `infra-skills-node-shared-agent-identity`: `system:k3s-controller` may change only
@@ -48,10 +66,11 @@ It also gives the order to set a tenant up in, and the gaps that remain.
 
   `--warn` binds the policies with `[Warn, Audit]`, for a first look at a live cluster.
   `--plan` also lists the existing pods and nodes that the policies would refuse.
-- **`tools/k3s/join-worker.sh <env> <tenant>-<n> --tenant <tenant>`** joins the tenant worker:
+- **`tools/k3s/join-worker.sh <env> <tenant>-<n> --tenant <tenant> --ssh-user admin`** joins
+  the tenant worker, logging in with the ops org's provisioning key:
   - it joins with a bootstrap token made for this join and deleted when the run ends
     (`--token agent` uses a separate agent token instead, on a server installed with one; the
-    server token is refused for a tenant);
+    server token is refused for a tenant worker);
   - it writes a registries.yaml that holds only the tenant's pull robot
     (`secrets.plain/registry-tenant-<tenant>.yaml`, with `stringData.registry`, `.username`
     and `.password`);
@@ -63,16 +82,19 @@ It also gives the order to set a tenant up in, and the gaps that remain.
     taint and the tenant label.
 
   With the registration policy installed, a platform worker also joins quarantined, and the
-  quarantine is lifted the same way.
+  quarantine is lifted the same way. `provision-hetzner-cloud.sh` creates the tenant worker
+  in the ops org's project and calls this script (docs/HETZNER-CLOUD-TENANT.md).
 - **`tools/k3s/network-policies.sh <env>`** works as follows:
-  - tenant nodes are left out of `platform-allow-from-nodes` and out of the addresses runners
+  - tenant workers are left out of `platform-allow-from-nodes` and out of the addresses runners
     may reach;
   - the Postgres and MinIO client allows admit only namespaces that are not a tenant's;
   - a tenant reaches only its own poolers (`cnpg.io/podRole=pooler`,
     `infra-skills/tenant=<tenant>`), and MinIO only when listed in `NETPOL_TENANT_MINIO`;
   - `NETPOL_APP_NAMESPACES` gives your own application namespaces default-deny ingress.
-    **Set it before the tenant joins.** An application namespace without a NetworkPolicy is
-    open to the tenant's node.
+    **Set it before the tenant worker joins.** An application namespace without a
+    NetworkPolicy is open to a pod that escapes to the tenant worker;
+  - it names every other policy in its namespaces that admits ingress from anywhere: such a
+    policy overrides the default deny for its pods.
 - **`tools/k3s/tenant.sh <env> <tenant>`** builds the namespace scaffold:
   - Pod Security `restricted`;
   - a ResourceQuota (no LoadBalancer or NodePort) and a LimitRange;
@@ -93,10 +115,15 @@ It also gives the order to set a tenant up in, and the gaps that remain.
   database until PUBLIC's CONNECT is revoked there.
 - **`tools/k3s/tenant-runners.sh <env> <tenant>`** runs CI runners for the tenant's GitHub
   organization:
-  - in `<tenant>-ci`, only on the tenant's nodes;
+  - in `<tenant>-ci`, only on the tenant's workers;
   - with env only from the Secrets listed in `TENANT_RUNNER_SECRETS` in that namespace;
   - with no service account token;
-  - with internet-only egress.
+  - with internet-only egress;
+  - without Docker by default: the runner pod is not privileged (Pod Security `baseline`).
+    `TENANT_RUNNER_DOCKER=true` adds Docker-in-Docker, which runs **privileged**. Anyone who
+    can push a workflow in the tenant's organization then gets root on the tenant worker
+    through it. Enable it only when the tenant needs `docker build`, and know that the
+    node-level primitives above are then all that stands between that root and your cluster.
 
 ## Order
 
@@ -106,12 +133,14 @@ It also gives the order to set a tenant up in, and the gaps that remain.
 3. Run `tenant.sh <env> <tenant>`.
 4. Run `postgres.sh <env> --provision-credentials <app> --tenant <tenant> --pooler`, and
    `--revoke-public-connect` if needed.
-5. Join the node: `join-worker.sh <env> <tenant>-1 --tenant <tenant>`.
+5. Confine `tag:tenant-<tenant>` in the tailnet policy, then create and join the tenant worker:
+   `provision-hetzner-cloud.sh` (or `join-worker.sh <env> <tenant>-1 --tenant <tenant>` for a
+   machine you made yourself).
 6. Set up CI: `tenant-runners.sh <env> <tenant>`.
-7. Check:
-   - from the tenant node, with its own credentials and `--dry-run=server`, try to remove its
-     taint or add a label (kubelet: `/var/lib/rancher/k3s/agent/kubelet.kubeconfig`), and to
-     patch another node's status (`client-k3s-controller.crt`). Each must be refused;
+7. Check, as ops on the tenant worker:
+   - with the node's own credentials and `--dry-run=server`, try to remove its taint or add a
+     label (kubelet: `/var/lib/rancher/k3s/agent/kubelet.kubeconfig`), and to patch another
+     node's status (`client-k3s-controller.crt`). Each must be refused;
    - `tenant-admission.sh <env> --plan` reports nothing.
 
 To roll back, run `tenant-admission.sh <env> --remove`, `network-policies.sh <env> --remove`
@@ -120,32 +149,37 @@ manual, because they hold its data.
 
 ## What remains
 
-- **Reads.** `system:k3s-controller` lists pods, namespaces and NetworkPolicies cluster-wide.
-  The tenant can therefore read every pod spec, including literal env values (never Secret
-  values referenced by `secretKeyRef`). Keep credentials out of literal env.
-- **Pod networking.** Flannel VXLAN does not authenticate sources. Root on the tenant node can
-  send packets with a forged source pod IP. Replies go to the real owner, so TCP sessions
-  cannot be set up this way, but one-way UDP can be forged. Rewriting another node's flannel
-  `backend-data` can disrupt traffic to that node's pods (denial of service, not interception:
-  `public-ip` is pinned).
+- **Reads after an escape.** `system:k3s-controller` lists pods, namespaces and
+  NetworkPolicies cluster-wide. A pod that escapes to a tenant worker can therefore read every
+  pod spec, including literal env values (never Secret values referenced by `secretKeyRef`).
+  Keep credentials out of literal env.
+- **Pod networking after an escape.** Flannel VXLAN does not authenticate sources. Root on a
+  tenant worker can send packets with a forged source pod IP. Replies go to the real owner, so
+  TCP sessions cannot be set up this way, but one-way UDP can be forged. Rewriting another
+  node's flannel `backend-data` can disrupt traffic to that node's pods (denial of service,
+  not interception: `public-ip` is pinned).
 - **Charts' own allow-all policies.** NetworkPolicies add up: a policy that admits ingress
   from anywhere overrides the default deny for its pods. The Argo CD chart's `argocd-server`
-  policy is `ingress: [{}]`, so a tenant node reaches argocd-server directly, past Pomerium
-  (found on test, 2026-11-21); Argo CD's own login still applies. `argocd.sh` no longer
-  creates that policy (teob-cc/infra-skills#36): re-run it on clusters with chart 10.x.
+  policy is `ingress: [{}]`, so a tenant worker reached argocd-server directly, past Pomerium
+  (found on test, 2026-11-21, INFRA-225); Argo CD's own login still applied. `argocd.sh` no
+  longer creates that policy (teob-cc/infra-skills#36): re-run it on clusters with chart 10.x.
   `network-policies.sh` names every such policy in its namespaces.
 - **The `postgres` database** stays open to every role. It holds no application data.
-- **Logs and metrics.** Promtail and node-exporter do not run on a tenant node. Promtail would
-  hand the tenant its Loki credentials. The tenant sees its own logs and metrics through a
-  tenant console that queries server-side.
-- **The tailnet.** Tag the tenant node `tag:tenant-<tenant>` (its Tailscale auth key carries
-  the tag). In your Tailscale ACL, allow the tag to reach only the server's k3s API (6443/tcp)
-  and flannel (8472/udp). The server may reach the tag on 8472/udp and 10250/tcp (kubelet: logs
-  and exec), and the operator on 22/tcp. The ACL lives outside infra-skills;
-  `provision-hetzner-cloud.sh` documents the snippet. A tailnet still on the default policy
-  (grant `*` → `*:*`, no `tagOwners`) confines nothing. A tag can be minted only once
-  `tagOwners` names it. Confine the tag before the tenant gets root. A node whose public :22 is
-  closed sets `SSH_VIA=tailscale` in its env.properties.
+- **Logs and metrics.** Promtail and node-exporter do not run on a tenant worker: their
+  DaemonSets do not tolerate the tenant taint, and the pod placement policy refuses pods
+  outside tenant namespaces that do. Promtail would put its Loki credentials on the node,
+  where an escaped pod could take them. The node-exporter alert treats a node without
+  node-exporter as down, so a tenant worker needs its exclusion (INFRA-227). The tenant sees
+  its own logs and metrics through a tenant console that queries server-side.
+- **The tailnet.** The tenant worker carries `tag:tenant-<tenant>` (its Tailscale auth key
+  carries the tag). The tailnet policy, segmented by tags (INFRA-219), lets the tag reach only
+  its cluster's server on 6443/tcp and 8472/udp. The server may reach the tag on 8472/udp and
+  10250/tcp (kubelet: logs and exec), and operators reach it as `autogroup:member`. The policy
+  lives outside infra-skills; `provision-hetzner-cloud.sh` checks it before it creates a
+  tenant worker. A tailnet still on the default policy (grant `*` → `*:*`, no `tagOwners`)
+  confines nothing, and a tag can be minted only once `tagOwners` names it. Confine the tag
+  before the node joins. A node whose public :22 is closed sets `SSH_VIA=tailscale` in its
+  env.properties.
 - **Host firewall.** Where ufw is installed, `join-worker.sh` persists its NAT rules with a
   oneshot unit (`infra-skills-worker-nat.service`) instead of installing iptables-persistent.
   On Ubuntu 24.04 ufw declares `Breaks` on iptables-persistent and netfilter-persistent, so

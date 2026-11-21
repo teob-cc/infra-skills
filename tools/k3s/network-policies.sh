@@ -32,11 +32,11 @@ set -euo pipefail
 #   * NETPOL_APP_NAMESPACES (opt-in): application namespaces get the same default-deny ingress
 #     and the same allows as a platform namespace (same namespace, Traefik, Pomerium, Prometheus).
 #
-# Tenant nodes (shared-root tenant workers, docs/TENANTS.md: label
+# Tenant workers (ops-owned nodes that run only a tenant's pods, docs/TENANTS.md: label
 # node-restriction.kubernetes.io/tenant, taint infra-skills/tenant, or a name <tenant>-* for a
 # tenant in TENANTS) are left out of platform-allow-from-nodes and of the public addresses
-# runners may reach: whoever is root there could otherwise reach every webhook and platform
-# pod from the host network. Runners stay denied every node address, tenant nodes included.
+# runners may reach: a pod that escapes to root there could otherwise reach every webhook and
+# platform pod from the host network. Runners stay denied every node address, tenant nodes included.
 #
 # How kube-router treats host-network sources: it ACCEPTs any packet whose source address
 # is local to the pod's node (iptables `-m addrtype --src-type LOCAL`), before the policy
