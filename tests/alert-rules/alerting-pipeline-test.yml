@@ -1,0 +1,87 @@
+# promtool unit tests for the alerting-pipeline group in tools/k3s/observability.sh
+# (docs/ALERTING.md, "Alerting pipeline" and "Slack"; INFRA-226). Render the rules first,
+# as in on-demand-nodes-test.yml:
+#   tools/k3s/observability.sh <env> --dry-run     # ends with "Rendered files kept in <dir>"
+#   cp <dir>/alerting_rules.new tests/alert-rules/rules.yml
+#   cd tests/alert-rules && promtool test rules alerting-pipeline-test.yml
+# Without a cluster, render with the stand-ins of tests/alertmanager-config (see run.sh
+# there): INFRA_ENVS_ROOT=tests/alertmanager-config/envs KUBECONFIG=/dev/null
+# PATH=tests/alertmanager-config/stubs:$PATH REAL_HELM=$(command -v helm)
+# STUB_SLACK_SECRET=absent STUB_DEADMAN_SECRET=absent tools/k3s/observability.sh fake --dry-run
+#
+# AlertmanagerNotificationsFailing names the causes of the integration that fails: Slack's
+# error codes for Slack, the Telegram causes for Telegram, only the log pointer for any
+# other. Email failures never reach it (they are AlertmanagerEmailNotificationsFailing, p3).
+rule_files:
+  - rules.yml
+evaluation_interval: 1m
+
+tests:
+  - name: notification failures name the causes of their own integration
+    interval: 1m
+    input_series:
+      # One failed notification a minute on each integration.
+      - series: alertmanager_notifications_failed_total{integration="slack",reason="clientError"}
+        values: 0+1x40
+      - series: alertmanager_notifications_failed_total{integration="telegram",reason="other"}
+        values: 0+1x40
+      - series: alertmanager_notifications_failed_total{integration="webhook",reason="serverError"}
+        values: 0+1x40
+      # Email fails too, but belongs to AlertmanagerEmailNotificationsFailing.
+      - series: alertmanager_notifications_failed_total{integration="email",reason="other"}
+        values: 0+1x40
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: AlertmanagerNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              app: infra
+              integration: slack
+              reason: clientError
+            exp_annotations:
+              summary: "Alertmanager slack notifications failing (clientError)"
+              description: |
+                Alertmanager gave up on 15 slack
+                notification(s) in 15 minutes after retries.
+                The alertmanager log names Slack's error. not_in_channel: the app is not a
+                member of the channel; /invite it there. invalid_auth or token_revoked: the bot
+                token in Secret alertmanager-slack is wrong or was revoked. channel_not_found:
+                the channel name is wrong, or the channel was archived or renamed.
+                msg_too_long: a message is over Slack's length limit.
+          - exp_labels:
+              severity: p1
+              app: infra
+              integration: telegram
+              reason: other
+            exp_annotations:
+              summary: "Alertmanager telegram notifications failing (other)"
+              description: |
+                Alertmanager gave up on 15 telegram
+                notification(s) in 15 minutes after retries.
+                For Telegram the usual causes are a revoked bot token, a changed chat id, or a
+                message Telegram rejects (over 4096 characters, or HTML parse_mode choking on a
+                '<' in an annotation). Check the alertmanager log for the API error.
+          - exp_labels:
+              severity: p1
+              app: infra
+              integration: webhook
+              reason: serverError
+            exp_annotations:
+              summary: "Alertmanager webhook notifications failing (serverError)"
+              description: |
+                Alertmanager gave up on 15 webhook
+                notification(s) in 15 minutes after retries.
+                Check the alertmanager log for the API error.
+
+  - name: no failures, no alert
+    interval: 1m
+    input_series:
+      - series: alertmanager_notifications_failed_total{integration="slack",reason="clientError"}
+        values: 0x40
+      - series: alertmanager_notifications_failed_total{integration="telegram",reason="other"}
+        values: 0x40
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: AlertmanagerNotificationsFailing
+        exp_alerts: []
