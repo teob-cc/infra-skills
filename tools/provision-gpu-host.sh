@@ -97,14 +97,18 @@ if [[ ! -f "$ENV_FILE" ]]; then
   err "Environment file not found: ${ENV_FILE}"
   exit 1
 fi
+# The tailnet tag comes from this file only, never from the operator's shell.
+unset TAILSCALE_TAG
+# shellcheck disable=SC1090
 source "$ENV_FILE"
 ENV_NAME="$ENV_ARG"
 export ENV_NAME
 
 # The device's tailnet tag (TAILSCALE_TAG in the worker's env.properties, e.g. tag:gpu-worker): the
 # auth key is minted with it and `tailscale up` advertises it. Unset: untagged, with a warning.
-TAILSCALE_TAG="${TAILSCALE_TAG:-}"
-if ! $SKIP_TAILSCALE; then
+if $SKIP_TAILSCALE; then
+  TAILSCALE_TAG=""
+else
   TAILSCALE_TAG=$(provision::tailscale_tag "$ENV_FILE") || exit 1
 fi
 
@@ -280,48 +284,54 @@ if ! $SKIP_TAILSCALE; then
       ok "Tailscale installed"
     fi
 
-    # Read Tailscale API token
-    TS_TOKEN_FILE="${ENV_ROOT}/shared/secrets.plain/tailscale-api-key.txt"
-    if [[ ! -f "$TS_TOKEN_FILE" ]]; then
-      err "Tailscale API key not found: ${TS_TOKEN_FILE}"
-      err "Cannot create auth key. Install Tailscale manually on the host."
-      exit 1
-    fi
-    TS_API_TOKEN=$(tr -d '\n\r' < "$TS_TOKEN_FILE" | xargs)
+    # The API key and the new auth key live only inside this function, which runs with xtrace
+    # off (bash -x would print both); curl gets the API key in a config on a file descriptor.
+    gpu_tailscale_join() {
+      # Read Tailscale API token
+      TS_TOKEN_FILE="${ENV_ROOT}/shared/secrets.plain/tailscale-api-key.txt"
+      if [[ ! -f "$TS_TOKEN_FILE" ]]; then
+        err "Tailscale API key not found: ${TS_TOKEN_FILE}"
+        err "Cannot create auth key. Install Tailscale manually on the host."
+        exit 1
+      fi
+      TS_API_TOKEN=$(tr -d '\n\r' < "$TS_TOKEN_FILE" | xargs)
 
-    # Clean up stale devices
-    TS_HOSTNAME="${HOSTNAME%%.*}"
-    info "Cleaning up stale Tailscale devices for ${TS_HOSTNAME}..."
-    STALE_IDS=$(curl -sS -u "${TS_API_TOKEN}:" \
-      "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null \
-      | jq -r ".devices[] | select(.hostname == \"${TS_HOSTNAME}\") | .id" 2>/dev/null || true)
-    if [[ -n "$STALE_IDS" ]]; then
-      while IFS= read -r did; do
-        [[ -n "$did" ]] && curl -sS -u "${TS_API_TOKEN}:" -X DELETE \
-          "https://api.tailscale.com/api/v2/device/${did}" >/dev/null 2>&1 && \
-          info "  Removed stale device ${did}" || true
-      done <<< "$STALE_IDS"
-    fi
+      # Clean up stale devices
+      TS_HOSTNAME="${HOSTNAME%%.*}"
+      info "Cleaning up stale Tailscale devices for ${TS_HOSTNAME}..."
+      STALE_IDS=$(curl -sS -K <(printf 'user = "%s:"\n' "$TS_API_TOKEN") \
+        "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null \
+        | jq -r ".devices[] | select(.hostname == \"${TS_HOSTNAME}\") | .id" 2>/dev/null || true)
+      if [[ -n "$STALE_IDS" ]]; then
+        while IFS= read -r did; do
+          [[ -n "$did" ]] && curl -sS -K <(printf 'user = "%s:"\n' "$TS_API_TOKEN") -X DELETE \
+            "https://api.tailscale.com/api/v2/device/${did}" >/dev/null 2>&1 && \
+            info "  Removed stale device ${did}" || true
+        done <<< "$STALE_IDS"
+      fi
 
-    # Create pre-authorized, non-ephemeral auth key, tagged with TAILSCALE_TAG when set
-    TS_AUTHKEY=$(curl -sS -u "${TS_API_TOKEN}:" -X POST \
-      -H 'Content-Type: application/json' \
-      "https://api.tailscale.com/api/v2/tailnet/-/keys" \
-      -d "$(provision::tailscale_authkey_body "$TS_HOSTNAME" false true "$TAILSCALE_TAG")" \
-      | jq -r '.key')
+      # Create pre-authorized, non-ephemeral auth key, tagged with TAILSCALE_TAG when set
+      TS_AUTHKEY=$(curl -sS -K <(printf 'user = "%s:"\n' "$TS_API_TOKEN") -X POST \
+        -H 'Content-Type: application/json' \
+        "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+        -d "$(provision::tailscale_authkey_body "$TS_HOSTNAME" false true "$TAILSCALE_TAG")" \
+        | jq -r '.key')
 
-    if [[ -z "$TS_AUTHKEY" || "$TS_AUTHKEY" == "null" ]]; then
-      err "Failed to create Tailscale auth key"
-      [[ -n "$TAILSCALE_TAG" ]] && err "A tagged key needs ${TAILSCALE_TAG} in tagOwners of the tailnet policy, owned by the API key's user (or an admin)"
-      exit 1
-    fi
-    ok "Created Tailscale auth key"
+      if [[ -z "$TS_AUTHKEY" || "$TS_AUTHKEY" == "null" ]]; then
+        err "Failed to create Tailscale auth key"
+        [[ -n "$TAILSCALE_TAG" ]] && err "A tagged key needs ${TAILSCALE_TAG} in tagOwners of the tailnet policy, owned by the API key's user (or an admin)"
+        exit 1
+      fi
+      ok "Created Tailscale auth key"
 
-    # Join tailnet
-    info "Joining Tailscale tailnet as ${TS_HOSTNAME}${TAILSCALE_TAG:+ (${TAILSCALE_TAG})}..."
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo tailscale up --authkey '${TS_AUTHKEY}' --ssh --hostname '${TS_HOSTNAME}'${TAILSCALE_TAG:+ --advertise-tags='${TAILSCALE_TAG}'}"
-    TS_IP=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tailscale ip -4 2>/dev/null")
-    ok "Tailscale connected (IP: ${TS_IP})"
+      # Join tailnet
+      info "Joining Tailscale tailnet as ${TS_HOSTNAME}${TAILSCALE_TAG:+ (${TAILSCALE_TAG})}..."
+      ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo tailscale up --authkey '${TS_AUTHKEY}' --ssh --hostname '${TS_HOSTNAME}'${TAILSCALE_TAG:+ --advertise-tags='${TAILSCALE_TAG}'}"
+      TS_IP=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tailscale ip -4 2>/dev/null")
+      ok "Tailscale connected (IP: ${TS_IP})"
+      unset TS_AUTHKEY TS_API_TOKEN
+    }
+    provision::without_xtrace gpu_tailscale_join
   fi
 
   # Update env.properties with actual Tailscale IP if placeholder

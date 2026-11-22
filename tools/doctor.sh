@@ -392,13 +392,14 @@ check_alerting() {
 # --- Check: Tailscale API key expiry ---------------------------------------
 # Only needed to (re)provision or join nodes, but an expired key turns the next rebuild
 # into a mystery. Tailscale caps API keys at 90 days. READ-ONLY GET of the key's own record.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
 check_tailscale_key() {
   local f key id exp exp_epoch now days
   f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
   [[ -f "$f" ]] || { record "tailscale-key" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check expiry)" ""; return; }
   key="$(head -1 "$f" | tr -d '[:space:]')"
   id="$(cut -d- -f3 <<<"$key")"
-  exp="$(curl -sS -m 10 -u "${key}:" "https://api.tailscale.com/api/v2/tailnet/-/keys/${id}" 2>/dev/null | jq -r '.expires // empty' 2>/dev/null)"
+  exp="$(curl -sS -m 10 -K <(printf 'user = "%s:"\n' "$key") "https://api.tailscale.com/api/v2/tailnet/-/keys/${id}" 2>/dev/null | jq -r '.expires // empty' 2>/dev/null)"
   [[ -n "$exp" ]] || { record "tailscale-key" "UNKN" "could not read the key's expiry from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"; return; }
   exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${exp%%.*}Z" +%s 2>/dev/null || date -u -d "$exp" +%s 2>/dev/null || echo 0)"
   now="$(date +%s)"; days=$(( (exp_epoch - now) / 86400 ))
@@ -420,6 +421,7 @@ check_tailscale_key() {
 # address), else by hostname (HOSTNAME, its first label, or the worker directory's name).
 # READ-ONLY GET of the device list.
 TS_CGNAT_RE='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
+# shellcheck disable=SC2329  # called by check_tailscale_tags
 ts_node_address() { # <env.properties> -> "<tailscale ipv4 or empty> <HOSTNAME>", read in a subshell
   # shellcheck disable=SC1090
   (
@@ -431,6 +433,7 @@ ts_node_address() { # <env.properties> -> "<tailscale ipv4 or empty> <HOSTNAME>"
     printf '%s %s\n' "$ip" "${HOSTNAME:-}"
   )
 }
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
 check_tailscale_tags() {
   local f key devices root props label node ip host short expected dev name tags
   local problems=() fine=()
@@ -438,7 +441,7 @@ check_tailscale_tags() {
   f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
   [[ -f "$f" ]] || { record "tailnet-tags" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check device tags)" ""; return; }
   key="$(head -1 "$f" | tr -d '[:space:]')"
-  devices="$(curl -sS -m 10 -u "${key}:" "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null)"
+  devices="$(curl -sS -m 10 -K <(printf 'user = "%s:"\n' "$key") "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null)"
   if ! jq -e '.devices | type == "array"' >/dev/null 2>&1 <<<"$devices"; then
     record "tailnet-tags" "UNKN" "could not read the device list from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"
     return
@@ -634,8 +637,9 @@ check_certs
 check_drift
 check_backups
 check_alerting
-check_tailscale_key
-check_tailscale_tags
+# Both hold the Tailscale API key: run them with xtrace off (bash -x would print it).
+provision::without_xtrace check_tailscale_key
+provision::without_xtrace check_tailscale_tags
 check_releases
 check_scanning
 check_floating_images

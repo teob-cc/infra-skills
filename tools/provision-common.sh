@@ -305,6 +305,8 @@ provision::load_env() {
   local env_file="${envs_root}/${first_arg}/env.properties"
   if [[ -f "$env_file" ]]; then
     ENV_NAME="$first_arg"
+    # A node's tailnet tag comes from its own file only, never from the operator's shell.
+    unset TAILSCALE_TAG
     # shellcheck disable=SC1090
     source "$env_file"
     export ENV_NAME
@@ -1403,11 +1405,25 @@ YAML
 # so a re-provision keeps the device's tag. The tag must be in tagOwners of the tailnet policy,
 # owned by the Tailscale API key's user (or that user must be an admin), or the key is refused.
 
-# Validates TAILSCALE_TAG and prints it. Unset: prints nothing and warns that the device joins
-# untagged (today's behaviour). Malformed: error, returns 1.
-# Usage: tag=$(provision::tailscale_tag <what, for messages, e.g. the env file>) || exit 1
+# Validates TAILSCALE_TAG, as read from the node's own env.properties, and prints it. The caller
+# must unset TAILSCALE_TAG before it sources that file, so a value exported in the operator's shell
+# never becomes a node's identity.
+#   Server or worker (no TENANT argument): unset prints nothing and warns that the device joins
+#   untagged (the old behaviour); a tenant tag (tag:tenant-*) is refused, since a server or a
+#   private worker must never take a tenant's identity.
+#   Tenant worker (TENANT argument): the only tag allowed is tag:tenant-<TENANT>, also the default.
+# Malformed or refused: error, returns 1, before any API call.
+# Usage: tag=$(provision::tailscale_tag <what, for messages, e.g. the env file> [TENANT]) || exit 1
 provision::tailscale_tag() {
-  local what="${1:-env.properties}" tag="${TAILSCALE_TAG:-}"
+  local what="${1:-env.properties}" tenant="${2:-}" tag="${TAILSCALE_TAG:-}"
+  if [[ -n "$tenant" ]]; then
+    if [[ -n "$tag" && "$tag" != "tag:tenant-${tenant}" ]]; then
+      provision::error "A worker of tenant ${tenant} must carry tag:tenant-${tenant}; TAILSCALE_TAG is '${tag}' (${what}). Remove it or set it to tag:tenant-${tenant}."
+      return 1
+    fi
+    printf 'tag:tenant-%s\n' "$tenant"
+    return 0
+  fi
   if [[ -z "$tag" ]]; then
     provision::warn "TAILSCALE_TAG is not set (${what}): the device joins the tailnet untagged, user-owned" \
       "(autogroup:member reach, key expiry on). Set TAILSCALE_TAG=tag:<name> (e.g. tag:env-<env>) in env.properties."
@@ -1417,7 +1433,45 @@ provision::tailscale_tag() {
     provision::error "TAILSCALE_TAG must be one tag of the form tag:<name> (letters, digits, dashes); got '${tag}' (${what})"
     return 1
   fi
+  if [[ "$tag" == tag:tenant-* ]]; then
+    provision::error "TAILSCALE_TAG '${tag}' is a tenant tag; a server or a cluster worker must not carry one (${what}). Tenant workers: provision-hetzner-cloud.sh --worker."
+    return 1
+  fi
   printf '%s\n' "$tag"
+}
+
+# Secrets and xtrace. `bash -x` prints every assignment and every command with its arguments, so a
+# key read into a variable, passed on a command line or returned by $(...) ends up in the trace.
+# Run the code that holds a Tailscale API key or auth key with xtrace off:
+#   provision::without_xtrace <command> [args...]   a function call; the arguments must not be secrets
+#   provision::xtrace_off ... provision::xtrace_restore   around a stretch of top-level code (not nested)
+provision::without_xtrace() {
+  local _xt=0
+  case $- in *x*) _xt=1 ;; esac
+  { set +x; } 2>/dev/null
+  "$@"
+  local _rc=$?
+  if [[ $_xt == 1 ]]; then set -x; fi
+  return $_rc
+}
+provision::xtrace_off() {
+  PROVISION_XTRACE_WAS=0
+  case $- in *x*) PROVISION_XTRACE_WAS=1 ;; esac
+  { set +x; } 2>/dev/null
+}
+provision::xtrace_restore() {
+  if [[ "${PROVISION_XTRACE_WAS:-0}" == 1 ]]; then PROVISION_XTRACE_WAS=0; set -x; fi
+  return 0
+}
+
+# The id of a Tailscale auth or API key (tskey-<kind>-<id>-<secret>), the handle the API takes to
+# read or revoke it. Prints nothing and returns 1 for anything else. The id is not a secret.
+# Usage: id=$(provision::tailscale_key_id "$key")
+provision::tailscale_key_id() {
+  local id
+  id=$(cut -d- -f3 <<<"${1:-}")
+  [[ "${1:-}" == tskey-* && "$id" =~ ^[A-Za-z0-9]+$ ]] || return 1
+  printf '%s\n' "$id"
 }
 
 # The JSON body of POST /api/v2/tailnet/-/keys: a one-off (single use, one hour) auth key, with
@@ -1437,12 +1491,24 @@ provision::tailscale_authkey_body() {
 }
 
 # Which tag a node's device should carry, read from its env.properties without sourcing it into
-# the caller: TAILSCALE_TAG, else tag:tenant-<TENANT> for a tenant worker (the default of
-# provision-hetzner-cloud.sh --worker), else nothing.
+# the caller: tag:tenant-<TENANT> for a tenant worker (the only tag provision-hetzner-cloud.sh
+# --worker allows), else TAILSCALE_TAG, else nothing.
 # Usage: provision::tailscale_expected_tag <env.properties>
 provision::tailscale_expected_tag() {
   # shellcheck disable=SC1090
   ( unset TAILSCALE_TAG TENANT; source "$1" >/dev/null 2>&1
-    if [[ -n "${TAILSCALE_TAG:-}" ]]; then printf '%s\n' "$TAILSCALE_TAG"
-    elif [[ -n "${TENANT:-}" ]]; then printf 'tag:tenant-%s\n' "$TENANT"; fi )
+    if [[ -n "${TENANT:-}" ]]; then printf 'tag:tenant-%s\n' "$TENANT"
+    elif [[ -n "${TAILSCALE_TAG:-}" ]]; then printf '%s\n' "$TAILSCALE_TAG"; fi )
 }
+
+# A Tailscale key-API response, safe for a log: the key's id, expiry and tags, or the API's error
+# message. Never the key itself (.key holds the secret of a new auth key).
+# Usage: dbg "response: $(provision::tailscale_key_response_summary "$body")"
+provision::tailscale_key_response_summary() {
+  local s
+  s=$(jq -c 'if type == "object" then
+      {id, expires, tags: .capabilities.devices.create.tags, message} | with_entries(select(.value != null))
+    else empty end' <<<"${1:-}" 2>/dev/null) || s=""
+  printf '%s\n' "${s:-(no JSON object, ${#1} bytes)}"
+}
+

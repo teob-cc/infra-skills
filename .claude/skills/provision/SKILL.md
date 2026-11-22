@@ -142,9 +142,13 @@ provisioner that runs `tailscale up` (bare-metal and Cloud servers and private w
 with it and passes `--advertise-tags` with it, so a re-provision brings the device back tagged.
 Tenant workers default to `tag:tenant-<tenant>`. A device without its tag is user-owned
 (`autogroup:member`: on a tailnet segmented by tags that usually reaches everything, and its node
-key expires). Unset keeps the old behaviour, untagged, with a warning; a malformed value stops the
-script before any call. The tag must be in `tagOwners` of the tailnet policy, owned by the
-Tailscale API key's user (or that user is an admin), or the tagged key is refused.
+key expires). The tag is read from the node's own env.properties only; a `TAILSCALE_TAG` exported
+in your shell is ignored. Unset keeps the old behaviour, untagged, with a warning. These stop the
+script before any API call: a malformed value, a tenant tag (`tag:tenant-*`) on a server or a cluster
+worker, and any tag but `tag:tenant-<tenant>` on a tenant worker. The tag must be in `tagOwners` of
+the tailnet policy, owned by the Tailscale API key's user (or that user is an admin). If the tagged
+key is refused, the run stops: there is no untagged fallback. The scripts keep the API key and the
+auth keys out of `bash -x` traces and `--debug` logs, and off curl's command line.
 `tools/doctor.sh` (check `tailnet-tags`) warns when the server's or a worker's device is untagged
 or carries another tag. A provisioner never retags a device that is already logged in (it warns
 instead): retag it in the admin console (Edit ACL tags). By hand, `tailscale up` needs every
