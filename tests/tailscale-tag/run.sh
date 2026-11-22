@@ -71,11 +71,17 @@ extract_fn() { # <file> <name> [heredoc terminator]
     on && term != "" && $0 == term { seen = 1; next }
     on && $0 == "}" && (term == "" || seen) { exit }' "$1"
 }
-fns() { # <file> <name>... : several functions
+fns() { # <file> <name>... : several functions; a name starting with ? may be missing (a helper
+  # older revisions of the script do not have, so the same test can run against them)
   local f="$1"; shift
-  local n
+  local n optional
   for n in "$@"; do
-    extract_fn "$f" "$n" | grep -q . || { echo "extract_fn: no function $n in $f" >&2; return 1; }
+    optional=false
+    if [[ "$n" == \?* ]]; then optional=true; n="${n#\?}"; fi
+    if ! extract_fn "$f" "$n" | grep -q .; then
+      $optional && continue
+      echo "extract_fn: no function $n in $f" >&2; return 1
+    fi
     extract_fn "$f" "$n"
   done
 }
@@ -333,23 +339,30 @@ STUB_LOG="$WORK/doctor.log" STUB_CONTEXT_ENV=fake STUB_DEVICES="$(dev server-unt
 # --- 9. tenant worker: the auth key is revoked after the create -----------------------------------
 echo "== 9. tenant worker auth key: revoked by id, enrolled or not"
 CLOUD="$REPO/tools/provision-hetzner-cloud.sh"
-tenant() { # <case: enrolled|absent|create-fails|later-fails> <xtrace: true|false> -> rc in $rc, output in $WORK/tenant.out
+tenant() { # <case: enrolled|absent|create-fails|later-fails> <xtrace: true|false> [revoke: ok|fail|flaky]
+  #   -> rc in $rc, output in $WORK/tenant.out. Runs the script's own tenant::preflight (reads the
+  #   API key, tests it, checks the policy) and tenant::create (cleanup_stale_devices, mint, create,
+  #   enrolment, revoke) against the curl stub; only Hetzner, ssh-keygen and sleep are stand-ins.
   local devices=/dev/null
   case "$1" in enrolled) devices="$HERE/devices/all-tagged.json" ;; esac
   rm -f "$WORK"/tenant.log* "$WORK/tenant.userdata"
   rc=0
-  STUB_LOG="$WORK/tenant.log" STUB_DEVICES="$devices" CASE="$1" WORK_DIR="$WORK" bash -c '
+  STUB_LOG="$WORK/tenant.log" STUB_DEVICES="$devices" STUB_REVOKE="${3:-ok}" CASE="$1" WORK_DIR="$WORK" bash -c '
     set -euo pipefail
     source "$1/tools/provision-common.sh"
     info(){ echo "info $*" >&2; }; ok(){ echo "ok $*" >&2; }; warn(){ echo "warn $*" >&2; }
     err(){ echo "err $*" >&2; }; dbg(){ :; }; plan(){ echo "plan $*" >&2; }; env_set(){ :; }; sleep(){ :; }
     DRY_RUN=false; DEBUG=false; TS_LAST_HTTP=""; TS_LAST_BODY=""; ENV_ROOT="$INFRA_ENVS_ROOT"; TS_API_TOKEN=""
-    NODE_NAME=acme-1; TAILSCALE_TAG=tag:tenant-acme; TS_DEVICE_TAG=tag:tenant-acme; TS_ENROLL_TRIES=2
+    NODE_NAME=acme-1; TENANT=acme; ENV_NAME=fake; ENV_FILE=/dev/null
+    TAILSCALE_TAG=tag:tenant-acme; TS_DEVICE_TAG=tag:tenant-acme; TS_ENROLL_TRIES=2
+    MASTER_HOSTNAME=fake.example.com; MASTER_VLAN_IP=100.100.0.1
+    CREATE_SERVER=true; DESTROY=false; NO_JOIN=true; TAILSCALE_POLICY_CHECK=warn
     HCLOUD_SERVER_NAME=acme-1; HCLOUD_SERVER_TYPE=cx33; HCLOUD_IMAGE=ubuntu-24.04; HCLOUD_LOCATION=hel1
-    HCLOUD_FIREWALL_NAME=acme-1; HCLOUD_SERVER_ID=""; HCLOUD_PUBLIC_IP=""
+    HCLOUD_FIREWALL_NAME=acme-1; HCLOUD_SERVER_ID=""; HCLOUD_PUBLIC_IP=""; HCLOUD_LABELS_TEXT=stub
     PROV_SSH_PUB=/dev/null; SSH_PUBKEY_CONTENT="ssh-ed25519 AAAAstub"
     ssh-keygen(){ echo "256 SHA256:stubfingerprint stub (ED25519)"; }
-    tailscale::get_tailnet(){ echo -; }; tailscale::cleanup_stale_devices(){ :; }
+    tailscale::get_tailnet(){ echo -; }
+    hcloud::token_file(){ echo stub; }; hcloud::read_token(){ HCLOUD_TOKEN=stub; }
     hcloud::get_server(){ :; }; hcloud::check_server_type(){ :; }; hcloud::create_ssh_key(){ echo 11; }
     hcloud::ensure_firewall(){ echo 22; }; hcloud::firewall_applied(){ :; }; hcloud::apply_firewall(){ :; }
     hcloud::create_server(){ printf "%s" "$6" > "$WORK_DIR/tenant.userdata"
@@ -357,13 +370,17 @@ tenant() { # <case: enrolled|absent|create-fails|later-fails> <xtrace: true|fals
     hcloud::wait_for_running(){ [[ $CASE != later-fails ]]; }
     eval "$(cat)"
     if $2; then set -x; fi
-    tailscale::read_api_token
+    tenant::preflight
     rc=0; tenant::create || rc=$?
+    set +x
     if [[ -s "$STUB_LOG.revoked" ]]; then echo "revoked-before-return"; fi
+    echo "attempts-before-return: $(cat "$STUB_LOG.revoke-attempts" 2>/dev/null | wc -l | tr -d " ")"
     exit "$rc"' _ "$REPO" "$2" \
     < <(fns "$CLOUD" tailscale::read_api_token__impl tailscale::read_api_token tailscale::api__impl tailscale::api \
           tailscale::create_authkey__impl tailscale::create_authkey tailscale::devices tailscale::get_device_ip \
-          tenant::create tenant::create_server_with_key tenant::revoke_key tenant::await_enrollment
+          tailscale::delete_device '?tailscale::cleanup_stale_devices__impl' tailscale::cleanup_stale_devices \
+          tailscale::policy_problems tailscale::policy_tests \
+          tenant::preflight tenant::create '?tenant::create_server_with_key' tenant::revoke_key '?tenant::await_enrollment'
         extract_fn "$CLOUD" gen_cloud_init_tenant CLOUDINIT_EOF) >"$WORK/tenant.out" 2>&1 || rc=$?
 }
 revoked_once() { [ "$(cat "$WORK/tenant.log.revoked" 2>/dev/null)" = "$AUTH_ID" ]; }
@@ -390,6 +407,29 @@ tenant enrolled true
 check "enrolled under set -x: runs (rc $rc)" [ "$rc" = 0 ]
 check "enrolled under set -x: the trace is on (sanity)" grep -q '^+' "$WORK/tenant.out"
 check "enrolled under set -x: no API key or auth key in the output" no_secret_in "$WORK/tenant.out"
+check "enrolled under set -x: the real tenant::preflight and cleanup_stale_devices ran in the trace (sanity)" \
+  bash -c 'grep -q "^+ tenant::preflight" "$1" && grep -q "cleanup_stale_devices" "$1" && grep -q "DELETE https://api.tailscale.com/api/v2/device/3" "$2"' _ "$WORK/tenant.out" "$WORK/tenant.log.writes"
+check "enrolled: 1 revoke attempt" grep -q "^attempts-before-return: 1$" "$WORK/tenant.out"
+tenant enrolled false flaky
+check "revoke fails once, then succeeds: revoked (rc $rc)" bash -c '[ "$2" = 0 ] && grep -q "^attempts-before-return: 2$" "$1"' _ "$WORK/tenant.out" "$rc"
+check "revoke fails once: key revoked, once" revoked_once
+tenant enrolled false fail
+check "revoke keeps failing, node enrolled: tenant::create succeeds (rc $rc)" [ "$rc" = 0 ]
+check "revoke keeps failing, enrolled: 3 attempts, then the EXIT trap tries again" \
+  bash -c 'grep -q "^attempts-before-return: 3$" "$1" && [ "$(wc -l < "$2" | tr -d " ")" = 6 ]' _ "$WORK/tenant.out" "$WORK/tenant.log.revoke-attempts"
+check "revoke keeps failing, enrolled: a warning with the key id" \
+  grep -q "^warn Could not revoke Tailscale auth key $AUTH_ID .*the one-off key is spent" "$WORK/tenant.out"
+check "revoke keeps failing, enrolled: no revoke error" bash -c '! grep -q "^err Could not revoke" "$1"' _ "$WORK/tenant.out"
+check "revoke keeps failing, enrolled: no key in the output" no_secret_in "$WORK/tenant.out"
+tenant absent false fail
+check "revoke keeps failing, node not enrolled: exits non-zero (rc $rc)" [ "$rc" != 0 ]
+check "revoke keeps failing, not enrolled: an error with the key id and the manual revoke" \
+  bash -c 'grep -q "^err Could not revoke Tailscale auth key $2 .*did not enrol" "$1" && grep -q "^err Revoke it now: .*key $2, Revoke" "$1"' _ "$WORK/tenant.out" "$AUTH_ID"
+check "revoke keeps failing, not enrolled: no key in the output" no_secret_in "$WORK/tenant.out"
+tenant absent true fail
+check "revoke keeps failing, not enrolled, set -x: exits non-zero, no key in the output (rc $rc)" \
+  bash -c '[ "$2" != 0 ] && grep -q "^+" "$1"' _ "$WORK/tenant.out" "$rc"
+check "revoke keeps failing, not enrolled, set -x: no key in the output" no_secret_in "$WORK/tenant.out"
 check "tenant path: the API key is never on curl's command line" no_secret_in "$WORK/tenant.log"
 check "tenant key request: single use, preauthorized, 1 h, tag:tenant-acme" \
   [ "$(jq -sc '.[0] | [.capabilities.devices.create | .reusable, .preauthorized, .tags[0]] + [.expirySeconds]' "$WORK/tenant.log.keybody")" = '[false,true,"tag:tenant-acme",3600]' ]
@@ -405,7 +445,7 @@ serverkey() { # <script> <tag> <mint: ok|deny> <xtrace: true|false> [notoken] ->
   local script="$1"
   rm -f "$WORK"/sk.log*
   rc=0
-  BLOCK="$(mainblock "$script")" STUB_LOG="$WORK/sk.log" STUB_MINT="$3" bash -c '
+  BLOCK="$(mainblock "$script")" STUB_LOG="$WORK/sk.log" STUB_MINT="$3" STUB_DEVICES="$HERE/devices/all-tagged.json" bash -c '
     set -euo pipefail
     source "$1/tools/provision-common.sh"
     info(){ echo "info $*" >&2; }; ok(){ echo "ok $*" >&2; }; warn(){ echo "warn $*" >&2; }
@@ -414,7 +454,7 @@ serverkey() { # <script> <tag> <mint: ok|deny> <xtrace: true|false> [notoken] ->
     ENV_ROOT="$INFRA_ENVS_ROOT"; [[ "$4" == notoken ]] && ENV_ROOT=/nonexistent
     TAILSCALE_TAG="$2"; HOSTNAME=fake.example.com; SKIP_TAILSCALE=false; remote_state=new; TAILSCALE_IP=""
     VLAN_IP=192.168.100.1/24; EXTERNAL_IP=192.0.2.10; WORKER_MODE=false; PRIVATE_IP_ADDR=10.0.0.2; NODE_ROLE=server
-    tailscale::get_tailnet(){ echo -; }; tailscale::cleanup_stale_devices(){ :; }
+    tailscale::get_tailnet(){ echo -; }
     POSTINSTALL_CONTENT="authkey=@TAILSCALE_AUTHKEY@ tag=@TAILSCALE_TAG@"
     eval "$(cat)"
     # bare metal reads the API key in its pre-flight; the cloud block reads it itself
@@ -424,9 +464,9 @@ serverkey() { # <script> <tag> <mint: ok|deny> <xtrace: true|false> [notoken] ->
     set +x
     echo "continued: ${POSTINSTALL_CONTENT//$STUB_AUTHKEY/<the-auth-key>}"' _ "$REPO" "$2" "$4" "${5:-}" \
     < <(fns "$REPO/tools/$script" tailscale::read_api_token__impl tailscale::read_api_token \
-          tailscale::create_authkey__impl tailscale::create_authkey tailscale::server_authkey
-        [[ "$script" == *cloud* ]] && fns "$REPO/tools/$script" tailscale::api__impl tailscale::api
-        true) >"$WORK/sk.out" 2>&1 || rc=$?
+          tailscale::create_authkey__impl tailscale::create_authkey tailscale::server_authkey \
+          tailscale::api__impl tailscale::api tailscale::delete_device tailscale::cleanup_stale_devices
+        if [[ "$script" == *cloud* ]]; then fns "$REPO/tools/$script" '?tailscale::cleanup_stale_devices__impl' tailscale::devices; fi) >"$WORK/sk.out" 2>&1 || rc=$?
 }
 for script in provision-hetzner-baremetal.sh provision-hetzner-cloud.sh; do
   check "$script: the block is found (sanity)" bash -c '[[ "$1" == *server_authkey* && "$1" == *xtrace_restore* ]]' _ "$(mainblock "$script")"
@@ -442,6 +482,7 @@ for script in provision-hetzner-baremetal.sh provision-hetzner-cloud.sh; do
   check "$script: tagged, minted: goes on with the key and the tag" grep -q "^continued: authkey=<the-auth-key> tag=tag:env-fake$" "$WORK/sk.out"
   serverkey "$script" tag:env-fake ok true
   check "$script: tagged, minted, set -x: the trace is on (sanity)" grep -q '^+' "$WORK/sk.out"
+  check "$script: tagged, minted, set -x: the real cleanup_stale_devices ran (sanity)" grep -q "DELETE https://api.tailscale.com/api/v2/device/1" "$WORK/sk.log.writes"
   check "$script: tagged, minted, set -x: no API key or auth key in the output" no_secret_in "$WORK/sk.out"
   check "$script: xtrace is back on after the block" grep -q '^+ set +x' "$WORK/sk.out"
 done

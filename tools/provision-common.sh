@@ -1463,6 +1463,11 @@ provision::xtrace_restore() {
   if [[ "${PROVISION_XTRACE_WAS:-0}" == 1 ]]; then PROVISION_XTRACE_WAS=0; set -x; fi
   return 0
 }
+# True when the named variable is non-empty, tested with xtrace off: `[[ -n "$TS_API_TOKEN" ]]`
+# under bash -x prints the key, inside a condition as anywhere else.
+# Usage: if provision::is_set TS_API_TOKEN; then ...
+provision::is_set() { provision::without_xtrace provision::_is_set "$1"; }
+provision::_is_set() { [[ -n "${!1:-}" ]]; }
 
 # The id of a Tailscale auth or API key (tskey-<kind>-<id>-<secret>), the handle the API takes to
 # read or revoke it. Prints nothing and returns 1 for anything else. The id is not a secret.
@@ -1511,4 +1516,3 @@ provision::tailscale_key_response_summary() {
     else empty end' <<<"${1:-}" 2>/dev/null) || s=""
   printf '%s\n' "${s:-(no JSON object, ${#1} bytes)}"
 }
-

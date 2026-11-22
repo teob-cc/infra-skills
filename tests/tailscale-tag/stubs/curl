@@ -5,7 +5,9 @@
 #   GET  .../keys/<id>      a far expiry
 #   POST .../keys           records the request body in $STUB_LOG.keybody and returns the fake auth
 #                           key $STUB_AUTHKEY; STUB_MINT=deny answers 403 (a refused tagged key)
-#   DELETE .../keys/<id>    records "<id>" in $STUB_LOG.revoked (a revoke)
+#   DELETE .../keys/<id>    records each attempt in $STUB_LOG.revoke-attempts and a successful revoke
+#                           ("<id>") in $STUB_LOG.revoked; STUB_REVOKE=fail answers 500 every time,
+#                           STUB_REVOKE=flaky answers 500 to the first attempt only
 #   DELETE anything else    recorded in $STUB_LOG.writes
 # Every other URL fails as if offline (exit 7). The arguments are logged to $STUB_LOG, so a test
 # can show that no key is ever on curl's command line.
@@ -37,7 +39,13 @@ case "$method $url" in
       out="{\"id\":\"kStub123CNTRL\",\"key\":\"${STUB_AUTHKEY:-tskey-auth-kStub123CNTRL-notrealsecret}\",\"expires\":\"2099-01-01T01:00:00Z\"}"
     fi ;;
   "DELETE https://api.tailscale.com/api/v2/tailnet/-/keys/"*)
-    printf '%s\n' "${url##*/}" >> "${STUB_LOG}.revoked" ;;
+    printf '%s\n' "${url##*/}" >> "${STUB_LOG}.revoke-attempts"
+    tries=$(wc -l < "${STUB_LOG}.revoke-attempts" | tr -d ' ')
+    if [[ "${STUB_REVOKE:-}" == fail || ( "${STUB_REVOKE:-}" == flaky && "$tries" == 1 ) ]]; then
+      out='{"message":"stub: internal error"}'; code=500
+    else
+      printf '%s\n' "${url##*/}" >> "${STUB_LOG}.revoked"
+    fi ;;
   "DELETE "*)
     echo "DELETE $url" >> "${STUB_LOG}.writes" ;;
   *)

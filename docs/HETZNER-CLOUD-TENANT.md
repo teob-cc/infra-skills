@@ -169,14 +169,19 @@ No platform credential beyond these is placed on the node: no server token, no p
 robot, no Hetzner token, no Tailscale API key. They stay on the provisioning machine.
 
 **Residual risk of the auth key in user data.** The key travels in the server's cloud-init user
-data, so it sits at rest in the Hetzner project and on the metadata service. Until the
-provisioner revokes it, anyone who can read the user data could join one device as
-`tag:tenant-<tenant>`. That is the hour of validity at most, usually the few minutes until the
-node enrols. The policy confines that tag to the cluster server's tcp:6443 and udp:8472. The
-revoke closes the window. It does not remove the device that already joined, and it cannot happen
-if the provisioning machine dies mid-run; the one-hour expiry is the backstop then. A node that
-did not enrol keeps a dead key: `--destroy` it and create it again. Delivering the key after boot
-over SSH, instead of in user data, is a separate change.
+data, so it sits at rest in the Hetzner project and on the metadata service. A one-off key is
+spent once the node joins with it (Tailscale revokes it on use), so the risk is a key nobody
+consumed. Until it is revoked or expires, anyone who can read the user data could join one device
+as `tag:tenant-<tenant>`, which the policy confines to the cluster server's tcp:6443 and udp:8472.
+The provisioner revokes the key by id once the node has enrolled or failed to. It tries three
+times, and the EXIT trap tries again on any exit. Revoking does not remove the device that joined.
+If the revoke still fails:
+- The node enrolled: the key is spent; a warning names its id.
+- The node did not enrol: the run exits non-zero and prints the key id and the manual revoke
+  (admin console, Settings, Keys).
+A dead machine mid-run cannot revoke at all; the one-hour expiry is the backstop. A node that did
+not enrol keeps a dead key: `--destroy` it and create it again. Delivering the key after boot over
+SSH, instead of in user data, is a separate change.
 
 ## Size for evse-ts (2026-11-20)
 

@@ -216,7 +216,7 @@ unset TAILSCALE_TAG TENANT
 source "${ENV_FILE}"
 
 if $TENANT_MODE; then
-  NODE_ROLE=tenant-worker
+  NODE_ROLE="tenant-worker"
   NODE_NAME="${WORKER_NAME//_/-}"
   if [[ -z "${TENANT:-}" ]]; then
     err "--worker is the tenant worker mode: set TENANT=<tenant> in ${ENV_FILE}"; exit 1
@@ -1085,9 +1085,9 @@ function tailscale::policy_tests(){
       + (if ($x | length) > 0 then [{src: $tag, deny: $x}] else [] end)'
 }
 
-function tailscale::cleanup_stale_devices(){
+function tailscale::cleanup_stale_devices__impl(){
   local hostname="$1"
-  if [[ -z "$TS_API_TOKEN" ]] && ! tailscale::read_api_token 2>/dev/null; then
+  if ! provision::is_set TS_API_TOKEN && ! tailscale::read_api_token 2>/dev/null; then
     return 0
   fi
   local device_ids
@@ -1098,6 +1098,8 @@ function tailscale::cleanup_stale_devices(){
     [[ -n "$did" ]] && tailscale::delete_device "$did" || true
   done <<< "$device_ids"
 }
+# Holds the Tailscale API key or an auth key: runs with xtrace off, so `bash -x` cannot print them.
+function tailscale::cleanup_stale_devices(){ provision::without_xtrace tailscale::cleanup_stale_devices__impl "$@"; }
 
 # ============================================================================
 # Cloudflare DNS functions (reuse from baremetal pattern)
@@ -2102,7 +2104,7 @@ function tenant::preflight(){
   fi
 
   # Only for creating a node: destroy and re-provision must work whatever the policy says.
-  if $CREATE_SERVER && ! $DESTROY && [[ -n "$TS_API_TOKEN" ]]; then
+  if $CREATE_SERVER && ! $DESTROY && provision::is_set TS_API_TOKEN; then
     local problems p
     if problems=$(tailscale::policy_problems "$TAILSCALE_TAG" "$MASTER_VLAN_IP"); then
       while IFS= read -r p; do [[ -n "$p" ]] && warn "Tailnet policy: ${p#WARN }"; done <<<"$problems"
@@ -2165,7 +2167,8 @@ function tenant::create(){
     tailscale::cleanup_stale_devices "${NODE_NAME}"
     # From here until the node has enrolled, an unrevoked auth key sits in the server's user data:
     # any exit revokes it (tenant::revoke_key does nothing once it has run).
-    trap 'tenant::revoke_key' EXIT
+    # The trap exits non-zero when the key is still live and the node never enrolled.
+    trap 'tenant::revoke_key || exit 1' EXIT
     provision::without_xtrace tenant::create_server_with_key "${ssh_key_id}" "${fw_id}" || return 1
     hcloud::wait_for_running "${HCLOUD_SERVER_ID}" 180 || return 1
     tenant::await_enrollment || return 1
@@ -2200,6 +2203,7 @@ function tenant::create_server_with_key(){
   local ssh_key_id="$1" fw_id="$2" ts_authkey user_data
   ts_authkey=$(tailscale::create_authkey "${NODE_NAME}" false true "${TAILSCALE_TAG}") || {
     err "No Tailscale auth key: the node would be unreachable (its public interface admits no SSH)"; return 1; }
+  TENANT_TS_ENROLLED=false
   if ! TENANT_TS_KEY_ID=$(provision::tailscale_key_id "$ts_authkey"); then
     if $DRY_RUN; then
       TENANT_TS_KEY_ID="<key-id>"
@@ -2221,18 +2225,32 @@ function tenant::create_server_with_key(){
 
 # Revokes the auth key minted for this node (DELETE /tailnet/-/keys/<id>). Hetzner's metadata
 # service keeps serving the user data, key included, for the server's whole life, to anything on
-# the node that asks; a revoked key is dead there. Revoking does not remove the device that joined
-# with the key. Runs once: it clears TENANT_TS_KEY_ID. A 404 (key already gone) counts as revoked.
+# the node that asks. A one-off key the node used is spent already (Tailscale revokes it on use);
+# the risk is a key nobody consumed, which stays valid until it expires (one hour). Revoking does
+# not remove the device that joined with the key.
+# Tries up to 3 times (2 s, then 4 s apart). TENANT_TS_KEY_ID is cleared only once the DELETE
+# succeeded (2xx, or 404: already gone), so the EXIT trap tries again after a failure.
+# When it still fails: the node enrolled (TENANT_TS_ENROLLED=true) -> a warning with the key id,
+# returns 0; the node did not enrol -> an error with the key id and the manual revoke, returns 1.
+# Never prints the key itself.
 function tenant::revoke_key(){
   [[ -n "${TENANT_TS_KEY_ID:-}" ]] || return 0
-  local id="$TENANT_TS_KEY_ID"
-  TENANT_TS_KEY_ID=""
-  if tailscale::api DELETE "/tailnet/$(tailscale::get_tailnet)/keys/${id}" >/dev/null || [[ "${TS_LAST_HTTP:-}" == 404 ]]; then
-    ok "Revoked the node's Tailscale auth key ${id}: the copy in the server's user data is dead"
-  else
-    warn "Could not revoke Tailscale auth key ${id} (HTTP ${TS_LAST_HTTP:-unknown}): revoke it in the Tailscale admin console (Settings, Keys); it expires within the hour anyway"
+  local id="$TENANT_TS_KEY_ID" attempt
+  for attempt in 1 2 3; do
+    if tailscale::api DELETE "/tailnet/$(tailscale::get_tailnet)/keys/${id}" >/dev/null || [[ "${TS_LAST_HTTP:-}" == 404 ]]; then
+      TENANT_TS_KEY_ID=""
+      ok "Revoked the node's Tailscale auth key ${id}: the copy in the server's user data is dead"
+      return 0
+    fi
+    if (( attempt < 3 )); then sleep $((attempt * 2)); fi
+  done
+  if [[ "${TENANT_TS_ENROLLED:-false}" == true ]]; then
+    warn "Could not revoke Tailscale auth key ${id} (HTTP ${TS_LAST_HTTP:-unknown}, 3 attempts). The node enrolled with it, so the one-off key is spent; revoke it in the Tailscale admin console (Settings, Keys, ${id}) to tidy up"
+    return 0
   fi
-  return 0
+  err "Could not revoke Tailscale auth key ${id} (HTTP ${TS_LAST_HTTP:-unknown}, 3 attempts), and ${NODE_NAME} did not enrol: the unused key in the server's user data stays valid until it expires, one hour after it was minted."
+  err "Revoke it now: Tailscale admin console, Settings, Keys, key ${id}, Revoke (or DELETE https://api.tailscale.com/api/v2/tailnet/-/keys/${id} with your API key). Then --destroy the node."
+  return 1
 }
 
 # Waits for the new node to enrol on the tailnet (cloud-init installs Tailscale and joins with the
@@ -2250,7 +2268,11 @@ function tenant::await_enrollment(){
     [[ -n "$ip" ]] && break
     sleep 5
   done
-  tenant::revoke_key
+  if [[ -n "$ip" ]]; then TENANT_TS_ENROLLED=true; fi
+  if ! tenant::revoke_key; then
+    err "${NODE_NAME} did not appear on the tailnet with ${TAILSCALE_TAG}, and its auth key could not be revoked (above)."
+    return 1
+  fi
   if [[ -z "$ip" ]]; then
     err "${NODE_NAME} did not appear on the tailnet with ${TAILSCALE_TAG}; its auth key is revoked, so a retry needs --destroy first."
     err "Look at the Hetzner console of server ${HCLOUD_SERVER_ID}: /var/log/cloud-init-output.log"
@@ -2659,15 +2681,16 @@ if $PROVISION_SERVER; then
 
     # Create Tailscale auth key. With TAILSCALE_TAG set, no key means stop: never an untagged fallback.
     TAILSCALE_AUTHKEY=""
+    # xtrace off from here: the cleanup and the mint use the API key, and the substitutions below print
+    # the whole postinstall, key included.
+    provision::xtrace_off
     if ! $SKIP_TAILSCALE && tailscale::read_api_token 2>/dev/null; then
       tailscale::cleanup_stale_devices "${HOSTNAME}"
     elif ! $SKIP_TAILSCALE && [[ -n "$TAILSCALE_TAG" ]]; then
       err "TAILSCALE_TAG is ${TAILSCALE_TAG} but no Tailscale API key is readable (envs/shared/secrets.plain/tailscale-api-key.txt): stopping, no tagged key can be minted"
       exit 1
     fi
-    # xtrace off from the key on: the substitutions below print the whole postinstall, key included.
-    provision::xtrace_off
-    if ! $SKIP_TAILSCALE && [[ -n "$TS_API_TOKEN" ]]; then
+    if ! $SKIP_TAILSCALE && provision::is_set TS_API_TOKEN; then
       TAILSCALE_AUTHKEY=$(tailscale::server_authkey "${HOSTNAME}") || exit 1
     fi
 
