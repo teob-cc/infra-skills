@@ -147,8 +147,8 @@ in your shell is ignored. Unset keeps the old behaviour, untagged, with a warnin
 script before any API call: a malformed value, a tenant tag (`tag:tenant-*`) on a server or a cluster
 worker, and any tag but `tag:tenant-<tenant>` on a tenant worker. The tag must be in `tagOwners` of
 the tailnet policy, owned by the Tailscale API key's user (or that user is an admin). If the tagged
-key is refused, the run stops: there is no untagged fallback. The scripts keep the API key and the
-auth keys out of `bash -x` traces and `--debug` logs, and off curl's command line.
+key is refused, the run stops: there is no untagged fallback. The provisioners and `doctor.sh` keep
+the API key and the auth keys out of `bash -x` traces and `--debug` logs, and off curl's command line.
 `tools/doctor.sh` (check `tailnet-tags`) warns when the server's or a worker's device is untagged
 or carries another tag. A provisioner never retags a device that is already logged in (it warns
 instead): retag it in the admin console (Edit ACL tags). By hand, `tailscale up` needs every
