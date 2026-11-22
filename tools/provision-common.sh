@@ -1390,3 +1390,59 @@ YAML
 YAML
   fi
 }
+
+# --- Tailscale tags ----------------------------------------------------------------------------
+# The tailnet is segmented by tags: each environment's servers carry one tag (e.g. tag:env-prod),
+# special workers their own (e.g. tag:gpu-worker), tenant workers tag:tenant-<tenant>. A tagged
+# device is owned by the tag, not by a user: it reaches only what the policy grants that tag, and
+# its node key does not expire. A device that joins with a user's auth key, or with no tag, is
+# user-owned instead: autogroup:member, which usually reaches everything, and key expiry is on.
+#
+# env.properties key TAILSCALE_TAG (one tag, e.g. TAILSCALE_TAG=tag:env-prod). Every provisioner
+# that runs `tailscale up` mints the auth key with this tag and passes --advertise-tags with it,
+# so a re-provision keeps the device's tag. The tag must be in tagOwners of the tailnet policy,
+# owned by the Tailscale API key's user (or that user must be an admin), or the key is refused.
+
+# Validates TAILSCALE_TAG and prints it. Unset: prints nothing and warns that the device joins
+# untagged (today's behaviour). Malformed: error, returns 1.
+# Usage: tag=$(provision::tailscale_tag <what, for messages, e.g. the env file>) || exit 1
+provision::tailscale_tag() {
+  local what="${1:-env.properties}" tag="${TAILSCALE_TAG:-}"
+  if [[ -z "$tag" ]]; then
+    provision::warn "TAILSCALE_TAG is not set (${what}): the device joins the tailnet untagged, user-owned" \
+      "(autogroup:member reach, key expiry on). Set TAILSCALE_TAG=tag:<name> (e.g. tag:env-<env>) in env.properties."
+    return 0
+  fi
+  if [[ ! "$tag" =~ ^tag:[A-Za-z0-9-]+$ ]]; then
+    provision::error "TAILSCALE_TAG must be one tag of the form tag:<name> (letters, digits, dashes); got '${tag}' (${what})"
+    return 1
+  fi
+  printf '%s\n' "$tag"
+}
+
+# The JSON body of POST /api/v2/tailnet/-/keys: a one-off (single use, one hour) auth key, with
+# TAG when given, so the device joins as that tag. The description is capped at 50 characters,
+# the API's limit.
+# Usage: provision::tailscale_authkey_body <hostname> [ephemeral=false] [preauthorized=true] [tag]
+provision::tailscale_authkey_body() {
+  local safe_hostname
+  safe_hostname=$(printf '%s' "$1" | tr '.' '-' | tr -cd 'A-Za-z0-9-_')
+  jq -cn --argjson eph "${2:-false}" --argjson pre "${3:-true}" --arg tag "${4:-}" \
+    --arg desc "Provisioning ${safe_hostname}" '{
+    capabilities: {devices: {create: {reusable: false, ephemeral: $eph, preauthorized: $pre,
+      tags: (if $tag != "" then [$tag] else [] end)}}},
+    expirySeconds: 3600,
+    description: ($desc | .[0:50])
+  }'
+}
+
+# Which tag a node's device should carry, read from its env.properties without sourcing it into
+# the caller: TAILSCALE_TAG, else tag:tenant-<TENANT> for a tenant worker (the default of
+# provision-hetzner-cloud.sh --worker), else nothing.
+# Usage: provision::tailscale_expected_tag <env.properties>
+provision::tailscale_expected_tag() {
+  # shellcheck disable=SC1090
+  ( unset TAILSCALE_TAG TENANT; source "$1" >/dev/null 2>&1
+    if [[ -n "${TAILSCALE_TAG:-}" ]]; then printf '%s\n' "$TAILSCALE_TAG"
+    elif [[ -n "${TENANT:-}" ]]; then printf 'tag:tenant-%s\n' "$TENANT"; fi )
+}

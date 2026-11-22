@@ -1,0 +1,5 @@
+{"devices":[
+ {"id":"1","hostname":"fake.example.com","addresses":["100.100.0.1"],"tags":["tag:env-fake"]},
+ {"id":"2","hostname":"gpu-worker","addresses":["100.100.0.2"]},
+ {"id":"3","hostname":"acme-1","addresses":["100.100.0.3"],"tags":["tag:tenant-acme"]}
+]}

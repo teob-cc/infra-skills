@@ -16,9 +16,10 @@ set -uo pipefail
 # It reports drift and risk — cluster health, certificate expiry, config drift,
 # backups & restore-test evidence, releases-behind, image scanning, hardening
 # defaults (ArgoCD/Harbor version pins, ArgoCD admin account, private Harbor
-# projects, pgweb NetworkPolicy) — and prints a remedy path. The remedies you
-# can act on yourself are free; the managed, orchestrated form of the same
-# remedies is the commercial control plane (see pragmasoft.nl).
+# projects, pgweb NetworkPolicy), tailnet tags of the env's nodes — and prints a
+# remedy path. The remedies you can act on yourself are free; the managed,
+# orchestrated form of the same remedies is the commercial control plane (see
+# pragmasoft.nl).
 #
 # Usage:
 #   tools/doctor.sh <env-name> [--json] [--strict]
@@ -409,6 +410,87 @@ check_tailscale_key() {
   fi
 }
 
+# --- Check: tailnet tags of this env's nodes --------------------------------
+# The tailnet is segmented by tags: TAILSCALE_TAG in env.properties (servers, e.g. tag:env-prod;
+# a worker directory's own file, e.g. tag:gpu-worker), tag:tenant-<TENANT> for a tenant worker.
+# A device without its tag is user-owned: autogroup:member reach and key expiry, which is what a
+# `tailscale up` without --advertise-tags or a user auth key gives a re-provisioned node. Checks
+# the server (envs/<env>/env.properties) and every worker directory (envs/<env>/*/env.properties).
+# A device is found by its Tailscale IPv4 (TAILSCALE_IP, or VLAN_IP when it is a 100.64.0.0/10
+# address), else by hostname (HOSTNAME, its first label, or the worker directory's name).
+# READ-ONLY GET of the device list.
+TS_CGNAT_RE='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
+ts_node_address() { # <env.properties> -> "<tailscale ipv4 or empty> <HOSTNAME>", read in a subshell
+  # shellcheck disable=SC1090
+  (
+    unset HOSTNAME TAILSCALE_IP VLAN_IP
+    source "$1" >/dev/null 2>&1
+    local ip="${TAILSCALE_IP:-}" v="${VLAN_IP:-}"
+    v="${v%%/*}"
+    if [[ -z "$ip" && "$v" =~ $TS_CGNAT_RE ]]; then ip="$v"; fi
+    printf '%s %s\n' "$ip" "${HOSTNAME:-}"
+  )
+}
+check_tailscale_tags() {
+  local f key devices root props label node ip host short expected dev name tags
+  local problems=() fine=()
+  command -v jq >/dev/null 2>&1 || { record "tailnet-tags" "SKIP" "jq not available" ""; return; }
+  f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
+  [[ -f "$f" ]] || { record "tailnet-tags" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check device tags)" ""; return; }
+  key="$(head -1 "$f" | tr -d '[:space:]')"
+  devices="$(curl -sS -m 10 -u "${key}:" "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null)"
+  if ! jq -e '.devices | type == "array"' >/dev/null 2>&1 <<<"$devices"; then
+    record "tailnet-tags" "UNKN" "could not read the device list from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"
+    return
+  fi
+  root="$(provision::envs_root)/${ENV_NAME}"
+  for props in "$root/env.properties" "$root"/*/env.properties; do
+    [[ -f "$props" ]] || continue
+    if [[ "$props" == "$root/env.properties" ]]; then label="server"; else label="$(basename "$(dirname "$props")")"; fi
+    node="$(ts_node_address "$props")"
+    ip="${node%% *}"; host="${node#* }"; short="${host%%.*}"
+    expected="$(provision::tailscale_expected_tag "$props")"
+    dev="$(jq -c --arg ip "$ip" --arg h "$host" --arg s "$short" --arg d "$label" '
+      [.devices[]] as $all
+      | ([$all[] | select($ip != "" and ((.addresses // []) | index($ip)))]
+         + [$all[] | select((.hostname // "") as $n | $n != "" and ($n == $h or $n == $s or $n == $d))])
+      | first // empty' <<<"$devices" 2>/dev/null)"
+    if [[ -z "$dev" ]]; then
+      if [[ "$label" == "server" ]]; then
+        problems+=("server: no device found on the tailnet (${ip:-no Tailscale IP in env.properties}, hostname ${host:-?})")
+      else
+        fine+=("${label}: not on the tailnet")
+      fi
+      continue
+    fi
+    name="$(jq -r '.hostname // .name // "?"' <<<"$dev")"
+    tags="$(jq -r '(.tags // []) | join(",")' <<<"$dev")"
+    if [[ -z "$expected" && -z "$tags" ]]; then
+      problems+=("${label} (${name}): untagged, user-owned; TAILSCALE_TAG is not set")
+    elif [[ -z "$expected" ]]; then
+      problems+=("${label} (${name}): carries ${tags} but TAILSCALE_TAG is not set (a re-provision brings it back untagged)")
+    elif [[ -z "$tags" ]]; then
+      problems+=("${label} (${name}): untagged, user-owned; expected ${expected}")
+    elif [[ "$tags" != "$expected" ]]; then
+      problems+=("${label} (${name}): carries ${tags}; expected ${expected}")
+    else
+      fine+=("${label}: ${tags}")
+    fi
+  done
+  if [[ ${#problems[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${problems[@]}")"
+    record "tailnet-tags" "WARN" "${joined%; }" \
+      "set TAILSCALE_TAG=tag:<name> in the node's env.properties; retag a running device in the Tailscale admin console (Edit ACL tags) or with POST /api/v2/device/<id>/tags; provisioners mint a tagged key and pass --advertise-tags"
+  elif [[ ${#fine[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${fine[@]}")"
+    record "tailnet-tags" "OK" "${joined%; }" ""
+  else
+    record "tailnet-tags" "SKIP" "no env.properties found under ${root}" ""
+  fi
+}
+
 # --- Check: hardening defaults ---------------------------------------------
 # What the provisioning scripts set up and a hand edit or an old install can lose: the ArgoCD
 # and Harbor version pins (read from the scripts), the ArgoCD admin account and pgweb's
@@ -553,6 +635,7 @@ check_drift
 check_backups
 check_alerting
 check_tailscale_key
+check_tailscale_tags
 check_releases
 check_scanning
 check_floating_images

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stand-in for ssh in tests/tailscale-tag/run.sh: no host is contacted. The last argument is the
+# remote command; it is logged to $STUB_LOG.remote and answered from $STUB_TS_* for Tailscale.
+set -uo pipefail
+EMPTY_JSON='{}'
+cmd="${*: -1}"
+printf '%s\n' "$cmd" >> "${STUB_LOG:?}.remote"
+case "$cmd" in
+  *BackendState*) printf '%s\n' "${STUB_TS_STATE:-}" ;;
+  *"tailscale status --peers=false --json"*) printf '%s\n' "${STUB_TS_SELF_JSON:-$EMPTY_JSON}" ;;
+  *"tailscale ip -4"*) echo 100.100.0.2 ;;
+esac
+exit 0

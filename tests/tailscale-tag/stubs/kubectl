@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/tailscale-tag/run.sh: the context matches the fake env, the API is
+# unreachable (doctor's cluster checks report UNKN), and any write fails the test.
+set -uo pipefail
+printf 'kubectl %s\n' "$*" >> "${STUB_LOG:?}"
+args=" $* "
+case "$args" in
+  *" apply "*|*" create "*|*" delete "*|*" patch "*|*" label "*|*" annotate "*|*" scale "*|*" exec "*|*" replace "*)
+    echo "WRITE kubectl $*" >> "${STUB_LOG}.writes"; exit 97 ;;
+  *" config current-context "*) echo "stub-${STUB_CONTEXT_ENV:-fake}"; exit 0 ;;
+  *" config view "*) echo "https://stub.invalid:6443"; exit 0 ;;
+esac
+exit 1

@@ -20,6 +20,8 @@
 # - UFW allows only 443/tcp from the Internet by default; management access (e.g., SSH) is intended via Tailscale when enabled.
 # - NIC for VLAN link is auto-detected on the remote as the default route's iface.
 # - You can override with REMOTE_IFACE via env.properties if desired.
+# - TAILSCALE_TAG in env.properties (e.g. tag:env-prod) is the device's tailnet tag: the auth key is
+#   minted with it and postinstall runs `tailscale up --advertise-tags`. Unset: untagged, with a warning.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
@@ -136,6 +138,10 @@ if [[ -n "${MASTER_VLAN_IP:-}" ]]; then
     echo -e "${RED}MASTER_VLAN_IP is set but MASTER_HOSTNAME is missing in ${ENV_FILE}${NC}"; exit 1
   fi
 fi
+
+# The device's tailnet tag (TAILSCALE_TAG, e.g. tag:env-prod): the auth key is minted with it and
+# postinstall passes --advertise-tags, so a re-provision keeps the tag. Unset: untagged, with a warning.
+TAILSCALE_TAG=$(provision::tailscale_tag "${ENV_FILE}") || exit 1
 
 SSH_PORT_RESCUE=22
 SSH_PORT_FINAL=22
@@ -530,14 +536,16 @@ function tailscale::get_tailnet(){
 }
 
 # Create an auth key via Tailscale API
-# Usage: tailscale::create_authkey <hostname> [ephemeral] [preauthorized] [tags]
+# Usage: tailscale::create_authkey <hostname> [ephemeral] [preauthorized] [tag]
+# With TAG (e.g. tag:env-prod) the device joins as that tag; the API key's user must own the tag
+# (tagOwners in the tailnet policy) or be an admin.
 function tailscale::create_authkey(){
   local hostname="$1"
   local ephemeral="${2:-true}"
   local preauthorized="${3:-true}"
-  local tags="${4:-}"
+  local tag="${4:-}"
   
-  info "Creating Tailscale auth key for ${hostname}..."
+  info "Creating Tailscale auth key for ${hostname}${tag:+ (${tag})}..."
   
   local tailnet
   tailnet=$(tailscale::get_tailnet)
@@ -546,36 +554,8 @@ function tailscale::create_authkey(){
     tailnet="-"
   fi
   
-  # Sanitize description: remove dots and special characters that Tailscale API rejects
-  local safe_hostname
-  safe_hostname=$(printf '%s' "$hostname" | tr '.' '-' | tr -cd 'A-Za-z0-9-_')
-  
-  # Build tags array - only include if tags are provided and non-empty
-  local tags_json
-  if [[ -n "${tags}" ]]; then
-    tags_json="[${tags}]"
-  else
-    tags_json="[]"
-  fi
-  
   local json_data
-  json_data=$(cat <<JSON
-{
-  "capabilities": {
-    "devices": {
-      "create": {
-        "reusable": false,
-        "ephemeral": ${ephemeral},
-        "preauthorized": ${preauthorized},
-        "tags": ${tags_json}
-      }
-    }
-  },
-  "expirySeconds": 3600,
-  "description": "Provisioning for ${safe_hostname}"
-}
-JSON
-)
+  json_data=$(provision::tailscale_authkey_body "$hostname" "$ephemeral" "$preauthorized" "$tag") || return 1
   
   dbg "Creating auth key with JSON: ${json_data}"
   
@@ -613,6 +593,7 @@ JSON
   fi
   
   warn "Failed to create Tailscale auth key via API (HTTP: ${http:-unknown})"
+  [[ -n "$tag" ]] && warn "A tagged key needs ${tag} in tagOwners of the tailnet policy, owned by the API key's user (or an admin)"
   if $DEBUG; then
     dbg "Response: ${body:-no response}"
   fi
@@ -1488,23 +1469,31 @@ if skip_if_done "11-tailscale-up" "Tailscale authentication"; then
 else
   echo "[postinstall] Bringing up Tailscale with provided auth key..."
   TS_CONFIGURED=false
+  # TAILSCALE_TAG of env.properties: the auth key is minted with it, and --advertise-tags keeps it,
+  # so the device stays owned by the tag. Empty: the device joins untagged (user-owned).
+  TS_TAG="@TAILSCALE_TAG@"
+  TS_TAG_ARGS=()
+  [[ -n "$TS_TAG" ]] && TS_TAG_ARGS=(--advertise-tags="$TS_TAG")
   if ! tailscale status --peers=false >/dev/null 2>&1; then
     TS_AUTHKEY="@TAILSCALE_AUTHKEY@"
-    
+
     if [[ -n "$TS_AUTHKEY" ]]; then
-      if tailscale up --authkey "$TS_AUTHKEY" --ssh --hostname "@PUBLIC_HOSTNAME@" --accept-routes; then
-        echo "[postinstall] Tailscale brought up successfully."
+      if tailscale up --authkey "$TS_AUTHKEY" --ssh --hostname "@PUBLIC_HOSTNAME@" --accept-routes ${TS_TAG_ARGS[@]+"${TS_TAG_ARGS[@]}"}; then
+        echo "[postinstall] Tailscale brought up successfully${TS_TAG:+ as ${TS_TAG}}."
         TS_CONFIGURED=true
       else
         echo "[postinstall] WARNING: Tailscale up command failed. Error code: $?"
-        echo "[postinstall] This may indicate an invalid or expired auth key."
+        echo "[postinstall] This may indicate an invalid or expired auth key${TS_TAG:+, or a key not tagged ${TS_TAG}}."
       fi
     else
       echo "[postinstall] No Tailscale auth key provided; skipping automatic login."
-      echo "[postinstall] Run 'tailscale up' manually to complete Tailscale setup."
+      echo "[postinstall] Run 'tailscale up --ssh --hostname @PUBLIC_HOSTNAME@ --accept-routes${TS_TAG:+ --advertise-tags=${TS_TAG}}' manually to complete Tailscale setup."
     fi
   else
     echo "[postinstall] Tailscale is already logged in."
+    if [[ -n "$TS_TAG" ]] && ! tailscale status --peers=false --json 2>/dev/null | grep -q "\"${TS_TAG}\""; then
+      echo "[postinstall] WARNING: this device does not carry ${TS_TAG}; tag it in the admin console (Edit ACL tags), or tools/doctor.sh keeps warning."
+    fi
     TS_CONFIGURED=true
   fi
   mark_step "11-tailscale-up"
@@ -2806,13 +2795,13 @@ if $RUN_FOLLOWUP; then
 
       info "Using Tailscale API to create single-use auth key for ${HOSTNAME}..."
       # Create non-ephemeral, preauthorized key (servers are permanent infrastructure)
-      TAILSCALE_AUTHKEY=$(tailscale::create_authkey "${HOSTNAME}" "false" "true" "" || true)
+      TAILSCALE_AUTHKEY=$(tailscale::create_authkey "${HOSTNAME}" "false" "true" "${TAILSCALE_TAG}" || true)
       if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
         ok "Created Tailscale single-use auth key via API"
       else
         warn "Failed to create Tailscale auth key via API"
         warn "Postinstall will proceed without automatic Tailscale authentication"
-        warn "You will need to manually run 'tailscale up' on the host after provisioning"
+        warn "You will need to manually run 'tailscale up${TAILSCALE_TAG:+ --advertise-tags=${TAILSCALE_TAG}}' on the host after provisioning"
         TAILSCALE_AUTHKEY=""
       fi
     fi
@@ -2824,6 +2813,7 @@ if $RUN_FOLLOWUP; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@WORKER_MODE@/${WORKER_MODE}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@K3S_VERSION@/${K3S_VERSION:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_TAG@/${TAILSCALE_TAG}}
     TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TRAEFIK_CONFIG_YAML@/${TRAEFIK_CONFIG_YAML}}
 

@@ -52,6 +52,12 @@ HOSTNAME=<base-domain>
 EXTERNAL_IP=<server-public-ip>
 VLAN_IP=192.168.100.1
 ACME_EMAIL=<acme-email>
+# Recommended — the server's tailnet tag. The provisioner mints its Tailscale auth key with this tag
+# and runs `tailscale up --advertise-tags`, so the device is owned by the tag (reaches only what the
+# tailnet policy grants it, no key expiry) and keeps it across re-provisions. The tag must be in
+# tagOwners of the tailnet policy, owned by the Tailscale API key's user. Unset: the device joins
+# untagged, user-owned (a warning says so). A worker directory sets its own (e.g. tag:gpu-worker).
+# TAILSCALE_TAG=tag:env-<env>
 # Optional — only if the envs repo is not https://github.com/<github-org>/infra-envs.git:
 # GITOPS_REPO_URL=<git-url-of-your-envs-repo>
 # Optional — Let's Encrypt staging (untrusted certs, no rate limits) for throwaway envs that

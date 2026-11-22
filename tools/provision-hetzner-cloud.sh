@@ -39,6 +39,8 @@
 #   HCLOUD_IMAGE=ubuntu-24.04        # OS image
 #   HCLOUD_NETWORK_ZONE=eu-central   # For private network
 #   PRIVATE_IP=10.0.0.2/16           # Private network IP
+#   TAILSCALE_TAG=tag:env-<env>      # the device's tailnet tag (auth key + --advertise-tags);
+#                                    #   unset: the device joins untagged (user-owned), with a warning
 #   # Optional: private worker mode
 #   # MASTER_PRIVATE_IP=10.0.0.1
 #   # MASTER_HOSTNAME=master.example.domain.tld
@@ -245,6 +247,9 @@ if $TENANT_MODE; then
   if [[ ! "$TAILSCALE_TAG" =~ ^tag:[A-Za-z0-9-]+$ ]]; then
     err "TAILSCALE_TAG must look like tag:<name> (got ${TAILSCALE_TAG})"; exit 1
   fi
+  # Device lookups match the tag too, so a same-named device of someone else on a shared tailnet is
+  # never matched (or deleted).
+  TS_DEVICE_TAG="${TAILSCALE_TAG}"
   PRIVATE_IP_ADDR=""
   WORKER_MODE=true
 else
@@ -253,7 +258,12 @@ else
   HCLOUD_LOCATION="${HCLOUD_LOCATION:-hel1}"
   HCLOUD_IMAGE="${HCLOUD_IMAGE:-ubuntu-24.04}"
   HCLOUD_NETWORK_ZONE="${HCLOUD_NETWORK_ZONE:-eu-central}"
-  TAILSCALE_TAG=""
+  # The server's tailnet tag (TAILSCALE_TAG, e.g. tag:env-prod): its auth key is minted with it and
+  # postinstall passes --advertise-tags, so a re-provision keeps the tag. Unset: untagged, with a
+  # warning. Devices are matched by hostname alone, so a re-provision also removes the old device of
+  # the same name, tagged or not.
+  if $SKIP_TAILSCALE; then TAILSCALE_TAG=""; else TAILSCALE_TAG=$(provision::tailscale_tag "${ENV_FILE}") || exit 1; fi
+  TS_DEVICE_TAG=""
 
   # Validate required properties
   REQUIRED=(HOSTNAME PRIVATE_IP)
@@ -885,14 +895,8 @@ function tailscale::create_authkey(){
 
   info "Creating Tailscale auth key for ${hostname}${tag:+ (${tag})}..."
 
-  local safe_hostname json_data out key
-  safe_hostname=$(printf '%s' "$hostname" | tr '.' '-' | tr -cd 'A-Za-z0-9-_')
-  json_data=$(jq -cn --argjson eph "$ephemeral" --argjson pre "$preauthorized" --arg tag "$tag" --arg desc "Provisioning ${safe_hostname}" '{
-    capabilities: {devices: {create: {reusable: false, ephemeral: $eph, preauthorized: $pre,
-      tags: (if $tag != "" then [$tag] else [] end)}}},
-    expirySeconds: 3600,
-    description: ($desc | .[0:50])
-  }')
+  local json_data out key
+  json_data=$(provision::tailscale_authkey_body "$hostname" "$ephemeral" "$preauthorized" "$tag") || return 1
 
   if out=$(tailscale::api POST "/tailnet/$(tailscale::get_tailnet)/keys" "$json_data"); then
     key=$(printf '%s' "$out" | jq -r '.key // empty' 2>/dev/null)
@@ -913,7 +917,7 @@ function tailscale::create_authkey(){
 function tailscale::devices(){
   local hostname="$1" out
   out=$(tailscale::api GET "/tailnet/$(tailscale::get_tailnet)/devices" 2>/dev/null) || return 0
-  printf '%s' "$out" | jq -c --arg h "$hostname" --arg tag "${TAILSCALE_TAG:-}" \
+  printf '%s' "$out" | jq -c --arg h "$hostname" --arg tag "${TS_DEVICE_TAG:-}" \
     '.devices[]? | select(.hostname == $h) | select($tag == "" or ((.tags // []) | index($tag)))' 2>/dev/null || true
 }
 
@@ -1063,7 +1067,7 @@ function tailscale::cleanup_stale_devices(){
   local device_ids
   device_ids=$(tailscale::devices "$hostname" | jq -r '.id')
   [[ -z "$device_ids" ]] && return 0
-  info "Cleaning up stale Tailscale devices for ${hostname}${TAILSCALE_TAG:+ (${TAILSCALE_TAG})}..."
+  info "Cleaning up stale Tailscale devices for ${hostname}${TS_DEVICE_TAG:+ (${TS_DEVICE_TAG})}..."
   while IFS= read -r did; do
     [[ -n "$did" ]] && tailscale::delete_device "$did" || true
   done <<< "$device_ids"
@@ -1269,7 +1273,7 @@ CLOUDINIT_EOF
 # single-use: once the node has joined, the copy Hetzner's metadata service keeps serving is spent.
 # Root logs in with no key; admin (passwordless sudo) carries the operator's key.
 function gen_cloud_init_tenant(){
-  local ssh_pubkey="$1" ts_authkey="$2" node="$3"
+  local ssh_pubkey="$1" ts_authkey="$2" node="$3" tag="$4"
   cat <<CLOUDINIT_EOF
 #cloud-config
 hostname: ${node}
@@ -1308,7 +1312,7 @@ write_files:
       apt-get -o DPkg::Lock::Timeout=600 update -q
       DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q tailscale
       systemctl enable --now tailscaled
-      tailscale up --auth-key=file:/run/infra-skills/ts-authkey --hostname=${node}
+      tailscale up --auth-key=file:/run/infra-skills/ts-authkey --hostname=${node} --advertise-tags=${tag}
       echo "[infra-skills] tailscale up: \$(tailscale ip -4 | head -1)"
 runcmd:
   - [/usr/local/sbin/infra-skills-tailscale-up]
@@ -1650,20 +1654,29 @@ if skip_if_done "11-tailscale-up" "Tailscale authentication"; then
 else
   echo "[postinstall] Bringing up Tailscale with provided auth key..."
   TS_CONFIGURED=false
+  # TAILSCALE_TAG of env.properties (or the tenant tag): the auth key is minted with it, and
+  # --advertise-tags keeps it, so the device stays owned by the tag. Empty: untagged (user-owned).
+  TS_TAG="@TAILSCALE_TAG@"
+  TS_TAG_ARGS=()
+  [[ -n "$TS_TAG" ]] && TS_TAG_ARGS=(--advertise-tags="$TS_TAG")
   if ! tailscale status --peers=false >/dev/null 2>&1; then
     TS_AUTHKEY="@TAILSCALE_AUTHKEY@"
     if [[ -n "$TS_AUTHKEY" ]]; then
-      if tailscale up --authkey "$TS_AUTHKEY" --ssh --hostname "@PUBLIC_HOSTNAME@" --accept-routes; then
-        echo "[postinstall] Tailscale brought up successfully."
+      if tailscale up --authkey "$TS_AUTHKEY" --ssh --hostname "@PUBLIC_HOSTNAME@" --accept-routes ${TS_TAG_ARGS[@]+"${TS_TAG_ARGS[@]}"}; then
+        echo "[postinstall] Tailscale brought up successfully${TS_TAG:+ as ${TS_TAG}}."
         TS_CONFIGURED=true
       else
-        echo "[postinstall] WARNING: Tailscale up command failed."
+        echo "[postinstall] WARNING: Tailscale up command failed${TS_TAG:+ (is the auth key tagged ${TS_TAG}?)}."
       fi
     else
       echo "[postinstall] No Tailscale auth key provided; skipping automatic login."
+      echo "[postinstall] Run 'tailscale up --ssh --hostname @PUBLIC_HOSTNAME@ --accept-routes${TS_TAG:+ --advertise-tags=${TS_TAG}}' manually to complete Tailscale setup."
     fi
   else
     echo "[postinstall] Tailscale is already logged in."
+    if [[ -n "$TS_TAG" ]] && ! tailscale status --peers=false --json 2>/dev/null | grep -q "\"${TS_TAG}\""; then
+      echo "[postinstall] WARNING: this device does not carry ${TS_TAG}; tag it in the admin console (Edit ACL tags), or tools/doctor.sh keeps warning."
+    fi
     TS_CONFIGURED=true
   fi
   mark_step "11-tailscale-up"
@@ -2127,7 +2140,7 @@ function tenant::create(){
     ts_authkey=$(tailscale::create_authkey "${NODE_NAME}" false true "${TAILSCALE_TAG}") || {
       err "No Tailscale auth key: the node would be unreachable (its public interface admits no SSH)"; return 1; }
 
-    user_data=$(gen_cloud_init_tenant "${SSH_PUBKEY_CONTENT}" "${ts_authkey}" "${NODE_NAME}")
+    user_data=$(gen_cloud_init_tenant "${SSH_PUBKEY_CONTENT}" "${ts_authkey}" "${NODE_NAME}" "${TAILSCALE_TAG}")
     unset ts_authkey
     hcloud::create_server "${HCLOUD_SERVER_NAME}" "${HCLOUD_SERVER_TYPE}" "${HCLOUD_IMAGE}" \
       "${HCLOUD_LOCATION}" "${ssh_key_id}" "${user_data}" "${fw_id}" || return 1
@@ -2216,6 +2229,7 @@ function tenant::provision(){
     content=${content//@WORKER_MODE@/true}
     content=${content//@K3S_VERSION@/}
     content=${content//@TAILSCALE_AUTHKEY@/}
+    content=${content//@TAILSCALE_TAG@/${TAILSCALE_TAG}}
     content=${content//@TRAEFIK_CONFIG_YAML@/}
     info "Running postinstall on ${NODE_NAME} (reboots at the end)..."
     if $DRY_RUN; then
@@ -2557,7 +2571,7 @@ if $PROVISION_SERVER; then
     TAILSCALE_AUTHKEY=""
     if ! $SKIP_TAILSCALE && tailscale::read_api_token 2>/dev/null; then
       tailscale::cleanup_stale_devices "${HOSTNAME}"
-      TAILSCALE_AUTHKEY=$(tailscale::create_authkey "${HOSTNAME}" "false" "true" || true)
+      TAILSCALE_AUTHKEY=$(tailscale::create_authkey "${HOSTNAME}" "false" "true" "${TAILSCALE_TAG}" || true)
       if [[ -n "$TAILSCALE_AUTHKEY" ]]; then
         ok "Created Tailscale auth key"
       else
@@ -2574,6 +2588,7 @@ if $PROVISION_SERVER; then
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@NODE_ROLE@/${NODE_ROLE}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@K3S_VERSION@/${K3S_VERSION:-}}
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_AUTHKEY@/${TAILSCALE_AUTHKEY}}
+    POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TAILSCALE_TAG@/${TAILSCALE_TAG}}
     TRAEFIK_CONFIG_YAML=$(provision::k3s_traefik_config) || exit 1
     POSTINSTALL_CONTENT=${POSTINSTALL_CONTENT//@TRAEFIK_CONFIG_YAML@/${TRAEFIK_CONFIG_YAML}}
 

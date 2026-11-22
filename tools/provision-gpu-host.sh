@@ -101,6 +101,13 @@ source "$ENV_FILE"
 ENV_NAME="$ENV_ARG"
 export ENV_NAME
 
+# The device's tailnet tag (TAILSCALE_TAG in the worker's env.properties, e.g. tag:gpu-worker): the
+# auth key is minted with it and `tailscale up` advertises it. Unset: untagged, with a warning.
+TAILSCALE_TAG="${TAILSCALE_TAG:-}"
+if ! $SKIP_TAILSCALE; then
+  TAILSCALE_TAG=$(provision::tailscale_tag "$ENV_FILE") || exit 1
+fi
+
 info "Provisioning GPU host for ${ENV_NAME}/${WORKER_ARG}"
 info "  Host: ${HOSTNAME} (${EXTERNAL_IP})"
 
@@ -262,6 +269,9 @@ if ! $SKIP_TAILSCALE; then
   if [[ "$TS_STATUS" == "Running" ]]; then
     TS_IP=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tailscale ip -4 2>/dev/null")
     ok "Tailscale already running (IP: ${TS_IP})"
+    if [[ -n "$TAILSCALE_TAG" ]] && ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tailscale status --peers=false --json 2>/dev/null" | grep -q "\"${TAILSCALE_TAG}\""; then
+      warn "This device does not carry ${TAILSCALE_TAG}: tag it in the Tailscale admin console (Edit ACL tags); tools/doctor.sh warns until then"
+    fi
   else
     # Install if needed
     if ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "command -v tailscale >/dev/null 2>&1"; then
@@ -293,23 +303,23 @@ if ! $SKIP_TAILSCALE; then
       done <<< "$STALE_IDS"
     fi
 
-    # Create pre-authorized, non-ephemeral auth key
-    SAFE_HOSTNAME=$(printf '%s' "$TS_HOSTNAME" | tr '.' '-' | tr -cd 'A-Za-z0-9-_')
+    # Create pre-authorized, non-ephemeral auth key, tagged with TAILSCALE_TAG when set
     TS_AUTHKEY=$(curl -sS -u "${TS_API_TOKEN}:" -X POST \
       -H 'Content-Type: application/json' \
       "https://api.tailscale.com/api/v2/tailnet/-/keys" \
-      -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":false,\"preauthorized\":true,\"tags\":[]}}},\"expirySeconds\":3600,\"description\":\"Provisioning for ${SAFE_HOSTNAME}\"}" \
+      -d "$(provision::tailscale_authkey_body "$TS_HOSTNAME" false true "$TAILSCALE_TAG")" \
       | jq -r '.key')
 
     if [[ -z "$TS_AUTHKEY" || "$TS_AUTHKEY" == "null" ]]; then
       err "Failed to create Tailscale auth key"
+      [[ -n "$TAILSCALE_TAG" ]] && err "A tagged key needs ${TAILSCALE_TAG} in tagOwners of the tailnet policy, owned by the API key's user (or an admin)"
       exit 1
     fi
     ok "Created Tailscale auth key"
 
     # Join tailnet
-    info "Joining Tailscale tailnet as ${TS_HOSTNAME}..."
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo tailscale up --authkey '${TS_AUTHKEY}' --ssh --hostname '${TS_HOSTNAME}'"
+    info "Joining Tailscale tailnet as ${TS_HOSTNAME}${TAILSCALE_TAG:+ (${TAILSCALE_TAG})}..."
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "sudo tailscale up --authkey '${TS_AUTHKEY}' --ssh --hostname '${TS_HOSTNAME}'${TAILSCALE_TAG:+ --advertise-tags='${TAILSCALE_TAG}'}"
     TS_IP=$(ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "tailscale ip -4 2>/dev/null")
     ok "Tailscale connected (IP: ${TS_IP})"
   fi

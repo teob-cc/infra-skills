@@ -85,7 +85,7 @@ Optional keys:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `HCLOUD_TOKEN_FILE` | `shared/secrets.plain/hetzner-cloud-token.txt` | Your ops project's token file, relative to `envs/`, when this env's cloud nodes live in another of your projects. The sops copy under `secrets.sops/` is used when the plain file is missing. `HCLOUD_TOKEN` from the environment is never used |
-| `TAILSCALE_TAG` | `tag:tenant-<tenant>` | The node's tailnet identity |
+| `TAILSCALE_TAG` | `tag:tenant-<tenant>` | The node's tailnet identity: the auth key is minted with it and the first-boot `tailscale up` passes `--advertise-tags` with it. The same key names a server's or worker's tag elsewhere (provision skill, "Tailnet tag"); `tools/doctor.sh` warns when the device does not carry it |
 | `HCLOUD_FIREWALL_NAME` | `<tenant>-<n>` | The node's Hetzner firewall |
 | `HCLOUD_FIREWALL_SSH_CIDRS` | empty | Your sources allowed to SSH to the public IP: a break-glass for when Tailscale on the node is down. The Hetzner console of your project is the other way in |
 | `TAILSCALE_DENY_TESTS` | empty | Extra `host:port` destinations the tag must not reach, tested with Tailscale's evaluator (below): subnet routes such as a home LAN, which the device list does not show |

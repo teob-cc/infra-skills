@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for helm in tests/tailscale-tag/run.sh: no cluster, so every call fails.
+printf 'helm %s\n' "$*" >> "${STUB_LOG:?}"
+exit 1

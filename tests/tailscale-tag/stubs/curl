@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Stand-in for curl in tests/tailscale-tag/run.sh: nothing leaves the machine.
+# Tailscale API: GET .../devices serves $STUB_DEVICES (a fixture file; "fail" = an API error),
+# GET .../keys/<id> a far expiry, POST .../keys records the request body in $STUB_LOG.keybody
+# and returns a fake key. Every other URL fails as if offline (exit 7).
+set -uo pipefail
+printf 'curl %s\n' "$*" >> "${STUB_LOG:?}"
+url="" method=GET body="" wcode=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    -d|--data) body="$2"; shift 2 ;;
+    -w) wcode=true; shift 2 ;;
+    -u|-H|-m|-o|-K) shift 2 ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+case "$method $url" in
+  "GET https://api.tailscale.com/api/v2/tailnet/-/devices"*)
+    [[ "${STUB_DEVICES:-}" == fail ]] && { echo '{"message":"stub: unauthorized"}'; exit 0; }
+    cat "${STUB_DEVICES:-/dev/null}" 2>/dev/null || echo '{"devices":[]}' ;;
+  "GET https://api.tailscale.com/api/v2/tailnet/-/keys/"*)
+    echo '{"expires":"2099-01-01T00:00:00Z"}' ;;
+  "POST https://api.tailscale.com/api/v2/tailnet/"*"/keys")
+    printf '%s\n' "$body" >> "${STUB_LOG}.keybody"
+    printf '%s' '{"key":"tskey-auth-stub-notreal"}'
+    $wcode && printf '\n200'
+    echo ;;
+  "DELETE "*)
+    echo "DELETE $url" >> "${STUB_LOG}.writes" ;;
+  *)
+    echo "stub curl: no network in this test ($method $url)" >&2
+    exit 7 ;;
+esac
