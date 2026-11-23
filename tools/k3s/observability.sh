@@ -1940,6 +1940,14 @@ alertmanager:
     enabled: true
   ingress:
     enabled: false   # routed via Pomerium, see envs/<env>/apps/observability/alertmanager-ingress.yaml
+  # One replica, so no HA peers. Without this, Alertmanager's default --cluster.listen-address
+  # (0.0.0.0:9094) still starts gossip: every notification-log entry queues a broadcast that no
+  # peer takes, and past 4096 queued it logs "dropping messages because too many are queued"
+  # every 15 min (test: 4.6k messages pruned in the 15 days to 2026-11-23, INFRA-189). An empty
+  # address turns clustering off; the notification log and silences still persist in
+  # storage.path. Remove this when replicaCount goes above 1.
+  extraArgs:
+    cluster.listen-address: ""
   extraSecretMounts:
     - name: resend-key
       mountPath: /etc/alertmanager/resend-key

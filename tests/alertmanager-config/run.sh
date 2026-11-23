@@ -14,7 +14,8 @@
 #   4. `amtool config routes test`: which receivers a p1, p2, p3, Watchdog and an
 #      unlabelled alert reach, with and without Slack;
 #   5. with the Secret, Alertmanager mounts it and reads the token from the file, and
-#      the token is in no rendered file and no line the script prints.
+#      the token is in no rendered file and no line the script prints;
+#   6. the single Alertmanager replica runs with HA gossip off (--cluster.listen-address=).
 #
 # Usage:
 #   tests/alertmanager-config/run.sh            # run the checks
@@ -158,6 +159,20 @@ for v in slack slack-deadman; do
     fail "$v: the token is in a rendered file or in the script's output"
   else
     ok "$v: token not in the config, the manifest, the Helm values or the output"
+  fi
+done
+
+# 6. One replica runs without HA gossip (INFRA-189): the StatefulSet passes an empty
+#    --cluster.listen-address, which Alertmanager reads as "clustering off".
+sts_args() { # <variant> -> the alertmanager container's args, one per line
+  yq 'select(.kind == "StatefulSet" and .metadata.name == "prometheus-alertmanager")
+      | .spec.template.spec.containers[] | select(.name == "alertmanager") | .args[]' "$WORK/$1/manifest.yaml"
+}
+for v in plain slack-deadman; do
+  if [[ "$(sts_args "$v" | grep -c '^--cluster\.')" == 1 ]] && sts_args "$v" | grep -qx -- '--cluster.listen-address='; then
+    ok "$v: Alertmanager clustering off (--cluster.listen-address= and no other --cluster flag)"
+  else
+    fail "$v: Alertmanager cluster flags are: $(sts_args "$v" | grep '^--cluster\.' | tr '\n' ' ')"
   fi
 done
 
