@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for helm in tests/postgres-credentials/run.sh: postgres.sh only checks that it exists.
+printf 'helm %s\n' "$*" >> "${STUB_LOG:?}"
+exit 1

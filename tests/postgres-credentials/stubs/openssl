@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stand-in for openssl in tests/postgres-credentials/run.sh: `openssl rand -base64 24` prints a
+# fake password, a different one per call (STUB_PW_PREFIX + a counter), so the test can look for it.
+printf 'openssl %s\n' "$*" >> "${STUB_LOG:?}"
+[[ "$*" == "rand -base64 24" ]] || { echo "openssl stub: unexpected call: $*" >&2; exit 1; }
+n=$(( $(cat "${STUB_LOG}.pwcount" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "${STUB_LOG}.pwcount"
+printf '%s%02dAbCdEfGhIjKlMn+/=\n' "${STUB_PW_PREFIX:-Pw0Stub}" "$n"

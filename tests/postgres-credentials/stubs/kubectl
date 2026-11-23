@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/postgres-credentials/run.sh. The context matches the fake env and
+# postgres-cluster is healthy with primary postgres-cluster-1. Every call's argv goes to STUB_LOG;
+# the SQL a `kubectl exec -i ... psql` sends on stdin goes to STUB_LOG.sql; `apply -f <file>` keeps a
+# copy of the file under STUB_LOG.applied/ (`apply -f -` keeps stdin).
+#   psql answers, stub mode: the cnpg_pooler_pgbouncer probe prints 1; a script tagged
+#     `-- infra-skills:db-owners` prints STUB_DB_OWNERS (rows db|owner|super|other-dbs|tablespaces);
+#     the tenant CONNECT check prints STUB_OPEN_DBS; anything else prints nothing.
+#   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
+#     (unix socket directory), as `psql -h ... -p ... <the same arguments>`.
+#   STUB_NO_NS=1: `get ns` finds no namespace.
+set -uo pipefail
+log="${STUB_LOG:?}"
+printf 'kubectl %s\n' "$*" >> "$log"
+args=" $* "
+case "$args" in
+  *" config current-context "*) echo "stub-${STUB_CONTEXT_ENV:-fake}"; exit 0 ;;
+  *" get cluster postgres-cluster -o jsonpath="*) echo "Cluster in healthy state"; exit 0 ;;
+  *" get cluster postgres-cluster "*) exit 0 ;;
+  *" get pods "*) echo "postgres-cluster-1"; exit 0 ;;
+  *" get ns "*) [[ "${STUB_NO_NS:-}" == 1 ]] && exit 1; exit 0 ;;
+  *" create ns "*) exit 0 ;;
+  *" apply -f - "*)
+    mkdir -p "$log.applied"; n=$(find "$log.applied" -type f | wc -l | tr -d " ")
+    cat > "$log.applied/stdin-$n.json"; exit 0 ;;
+  *" apply -f "*)
+    f=""; prev=""; for a in "$@"; do [[ "$prev" == -f ]] && f="$a"; prev="$a"; done
+    mkdir -p "$log.applied"; cp "$f" "$log.applied/$(basename "$f")"; exit 0 ;;
+  *" exec "*)
+    psql_args=(); seen=false; stdin=false
+    for a in "$@"; do
+      if $seen; then psql_args+=("$a"); continue; fi
+      [[ "$a" == -- ]] && seen=true
+      [[ "$a" == -i ]] && stdin=true
+    done
+    sql=""
+    if $stdin; then sql="$(cat)"; printf -- '-- ### psql %s\n%s\n' "${psql_args[*]:1}" "$sql" >> "$log.sql"; fi
+    if [[ -n "${STUB_PGHOST:-}" ]]; then
+      if $stdin; then
+        printf '%s\n' "$sql" | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+      else
+        psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}" </dev/null
+      fi
+      exit $?
+    fi
+    case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then echo 1; exit 0; fi ;; esac
+    case "$sql" in
+      *"-- infra-skills:db-owners"*) printf '%s' "${STUB_DB_OWNERS:-}"; [[ -n "${STUB_DB_OWNERS:-}" ]] && echo ;;
+      *"has_database_privilege("*) printf '%s\n' "${STUB_OPEN_DBS:-}" ;;
+    esac
+    exit 0 ;;
+esac
+echo "kubectl stub: unexpected call: $*" >&2
+exit 1

@@ -116,7 +116,8 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
   - a CNPG Pooler labelled for the tenant, which the Secret points at.
 
   `--revoke-public-connect [--apply]` closes the other databases. Every role may connect to a
-  database until PUBLIC's CONNECT is revoked there.
+  database until PUBLIC's CONNECT is revoked there. For an app whose data already exists, or
+  that runs its migrations under a role of their own, see "A tenant's databases" below.
 - **`tools/k3s/tenant-runners.sh <env> <tenant>`** runs CI runners for the tenant's GitHub
   organization:
   - in `<tenant>-ci`, only on the tenant's workers;
@@ -128,6 +129,93 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     can push a workflow in the tenant's organization then gets root on the tenant worker
     through it. Enable it only when the tenant needs `docker build`, and know that the
     node-level primitives above are then all that stands between that root and your cluster.
+
+## A tenant's databases
+
+Without more flags, `postgres.sh --provision-credentials <app> --tenant <tenant>` creates an
+empty database named `<app>`, owned by a new role `<app>`, and writes `POSTGRES_*` keys into the
+Secret `<app>-db`. An app that brings its own data, reads several databases, or keeps its
+migrations off the runtime role needs the flags below. For example, an event-sourced app with a
+journal database and a read-model database, a manifest database that does not exist yet, and
+migrations that must not hit the 60 s timeout:
+
+```bash
+tools/k3s/postgres.sh <env> --provision-credentials evse-ts --tenant symbioen --pooler \
+  --database evse:JOURNAL_DB --database evse_ts:STATE_DB \
+  --database evse_archive:MANIFEST_DB --create-missing \
+  --migration-role --connection-limit 32
+```
+
+This gives the role `evse-ts` rights on the three databases and writes, into the Secret
+`evse-ts-db` in namespace `symbioen`, `JOURNAL_DB_HOST/PORT/DATABASE/USERNAME/PASSWORD`, the same
+five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. The role
+`evse-ts_migrate` gets the Secret `evse-ts-db-migrate` with the same keys, for a migrate Job.
+
+| Flag | What it does |
+| --- | --- |
+| `--database <name>[:<PREFIX>]` | Repeatable. Use these databases instead of creating `<app>`. With a prefix, the Secret gets `<PREFIX>_HOST`, `_PORT`, `_DATABASE`, `_USERNAME` and `_PASSWORD` for that database; without one, `POSTGRES_*` (at most one database can go without). A database that does not exist is an error. |
+| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. |
+| `--take-ownership` | Move each named database to the migration role (or the app role): `REASSIGN OWNED BY` its old owner in it, then `ALTER DATABASE ... OWNER`. Off by default. |
+| `--migration-role [name]` | A second login role, `<app>_migrate` unless named, with its own Secret `<app>-db-migrate`. |
+| `--migration-connection-limit N` | That role's connection limit (default 2, or `PG_MIGRATION_CONNECTION_LIMIT`). |
+| `--connection-limit N` | The app role's connection limit (tenant default 20). |
+| `--keep-password` | Reuse the passwords in `secrets.plain/<app>-db.secret.yaml` and `<app>-db-migrate.secret.yaml` instead of setting new ones. |
+
+**Grant mode** is the default for `--database`. Each database keeps its owner, and the app role
+gets:
+
+- CONNECT and TEMPORARY on the database. The owner, the pooler role and (not for a tenant)
+  `PG_READONLY_ROLE` get CONNECT explicitly, then PUBLIC's CONNECT and TEMPORARY are revoked.
+  Any other role that reached the database through PUBLIC needs a `GRANT CONNECT` of its own.
+- In every schema except `pg_*` and `information_schema`: USAGE and CREATE on the schema;
+  SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES and TRIGGER on all tables; USAGE, SELECT
+  and UPDATE on all sequences.
+- Default privileges for the database owner and each schema owner (superusers aside), so the
+  tables and sequences they create later are the app role's too.
+
+Grant mode never changes the existing tables' owner, so DDL on those tables (ALTER, an index,
+DROP) still needs their owner. When the migrations must change existing tables, use
+`--take-ownership`.
+
+**`--take-ownership`** moves ownership instead. `REASSIGN OWNED BY` moves *every* database and
+tablespace the old owner has, in the whole cluster, not only the one it runs in. The script
+therefore refuses the move when the old owner is a superuser or a `pg_*` role, owns a database
+not named with `--database`, or owns a tablespace. Objects in the database owned by other roles
+keep their owner.
+
+**The migration role** has:
+
+- no `statement_timeout` and no `idle_in_transaction_session_timeout`, while the app role keeps
+  60s and 5min;
+- its own small connection limit, on top of the app role's;
+- membership in the app role. It inherits the app role's rights, and it may alter whatever the
+  app role owns (in the default path the app role owns its database and its tables).
+
+Whatever the migration role creates is its own. Default privileges
+(`ALTER DEFAULT PRIVILEGES FOR ROLE <app>_migrate ... TO <app>` in each database: DML on tables;
+USAGE, SELECT and UPDATE on sequences; USAGE on schemas) give the app role its rights on those
+objects the moment they exist, so a migrate Job needs no grants of its own. The app role cannot
+alter or drop them. Default privileges cover only objects the migration role creates itself;
+after a `SET ROLE` to another role, objects belong to that role.
+
+The app must then stop migrating on its runtime pool: run migrations from the migrate Job with
+the `-db-migrate` Secret.
+
+**The connection limit counts per role**, across all its databases and through the Pooler. In
+session mode every client connection holds a server connection. Add up the pool sizes of every
+process that uses the role (one pool per database, plus LISTEN connections and leases) and set
+`--connection-limit` above that total. The Pooler's `default_pool_size` follows the limit.
+
+**Re-runs** are safe: every statement is guarded or idempotent, and nothing that exists is
+dropped. A re-run sets new passwords and rewrites the Secrets, so the app's pods need a restart
+afterwards. With `--keep-password` the passwords in `secrets.plain/` stay, and the run stops if a
+file has none (decrypt it from `secrets.sops` first). The passwords go to `psql` on stdin, with
+`log_statement` off for the password statement. They are never on a command line, and with
+`bash -x` they are not in the trace either.
+
+What the script does not do: it doesn't change the app's chart or settings. Key names the chart
+reads beyond these five per database (for example a second journal database's name) belong in
+the app's own configuration.
 
 ## Order
 

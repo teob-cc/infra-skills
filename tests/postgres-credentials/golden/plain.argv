@@ -1,0 +1,11 @@
+kubectl config current-context
+kubectl -n postgres get cluster postgres-cluster
+kubectl -n postgres get cluster postgres-cluster -o jsonpath={.status.phase}
+kubectl -n postgres get pods -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary -o jsonpath={.items[0].metadata.name}
+kubectl -n postgres exec -i postgres-cluster-1 -c postgres -- psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q
+kubectl -n postgres exec postgres-cluster-1 -c postgres -- psql -U postgres -d my-app -qc CREATE EXTENSION IF NOT EXISTS vector;
+kubectl -n postgres exec postgres-cluster-1 -c postgres -- psql -U postgres -d my-app -qc CREATE EXTENSION IF NOT EXISTS pg_trgm;
+kubectl -n postgres exec postgres-cluster-1 -c postgres -- psql -U postgres -d my-app -qc CREATE EXTENSION IF NOT EXISTS btree_gin;
+kubectl -n postgres exec postgres-cluster-1 -c postgres -- psql -U postgres -d my-app -qc CREATE EXTENSION IF NOT EXISTS btree_gist;
+kubectl get ns default
+kubectl apply -f <WORK>/fake/secrets.plain/my-app-db.secret.yaml

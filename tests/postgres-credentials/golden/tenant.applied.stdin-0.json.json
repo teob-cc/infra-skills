@@ -1,0 +1,37 @@
+{
+  "apiVersion": "postgresql.cnpg.io/v1",
+  "kind": "Pooler",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/part-of": "evse-ts",
+      "infra-skills/tenant": "symbioen"
+    },
+    "name": "pooler-evse-ts",
+    "namespace": "postgres"
+  },
+  "spec": {
+    "cluster": {
+      "name": "postgres-cluster"
+    },
+    "instances": 1,
+    "pgbouncer": {
+      "parameters": {
+        "default_pool_size": "30",
+        "max_client_conn": "200"
+      },
+      "poolMode": "session"
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/part-of": "evse-ts",
+          "infra-skills/tenant": "symbioen"
+        }
+      },
+      "spec": {
+        "containers": []
+      }
+    },
+    "type": "rw"
+  }
+}
