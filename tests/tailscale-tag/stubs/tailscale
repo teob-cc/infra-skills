@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Stand-in for the tailscale CLI on a node, for the postinstall step run by tests/tailscale-tag/run.sh.
+# `status` succeeds only when STUB_TS_LOGGED_IN=true (and prints STUB_TS_SELF_JSON for --json);
+# `up` records its arguments in $STUB_LOG.up.
+set -uo pipefail
+EMPTY_JSON='{}'
+printf 'tailscale %s\n' "$*" >> "${STUB_LOG:?}"
+case "${1:-}" in
+  status)
+    [[ "${STUB_TS_LOGGED_IN:-false}" == true ]] || exit 1
+    [[ " $* " == *" --json "* ]] && printf '%s\n' "${STUB_TS_SELF_JSON:-$EMPTY_JSON}"
+    exit 0 ;;
+  up) printf '%s\n' "$*" >> "${STUB_LOG}.up"; exit 0 ;;
+  *) exit 0 ;;
+esac

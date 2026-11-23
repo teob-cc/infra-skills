@@ -85,7 +85,7 @@ Optional keys:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `HCLOUD_TOKEN_FILE` | `shared/secrets.plain/hetzner-cloud-token.txt` | Your ops project's token file, relative to `envs/`, when this env's cloud nodes live in another of your projects. The sops copy under `secrets.sops/` is used when the plain file is missing. `HCLOUD_TOKEN` from the environment is never used |
-| `TAILSCALE_TAG` | `tag:tenant-<tenant>` | The node's tailnet identity |
+| `TAILSCALE_TAG` | `tag:tenant-<tenant>` | The node's tailnet identity, and the only value allowed: any other tag stops the script before an API call. The auth key is minted with it and the first-boot `tailscale up` passes `--advertise-tags` with it. The same key names a server's or worker's tag elsewhere (provision skill, "Tailnet tag"); `tools/doctor.sh` warns when the device does not carry it |
 | `HCLOUD_FIREWALL_NAME` | `<tenant>-<n>` | The node's Hetzner firewall |
 | `HCLOUD_FIREWALL_SSH_CIDRS` | empty | Your sources allowed to SSH to the public IP: a break-glass for when Tailscale on the node is down. The Hetzner console of your project is the other way in |
 | `TAILSCALE_DENY_TESTS` | empty | Extra `host:port` destinations the tag must not reach, tested with Tailscale's evaluator (below): subnet routes such as a home LAN, which the device list does not show |
@@ -159,7 +159,7 @@ All of it is the operating org's; the tenant receives none of it.
 | On the node | What | Lifetime |
 | --- | --- | --- |
 | Your provisioning SSH **public** key, for user `admin` (and root's, which cloud-init disables) | the only key on the node | until destroy |
-| A Tailscale auth key, in user data and in `/run/infra-skills/ts-authkey` | single use, one hour | spent at first boot; the file and cloud-init's copy are deleted. The metadata service (169.254.169.254) keeps serving the spent key to anything on the node |
+| A Tailscale auth key, in user data and in `/run/infra-skills/ts-authkey` | single use, preauthorized, one hour, `tag:tenant-<tenant>` only | spent at first boot; the file and cloud-init's copy are deleted. The provisioner then revokes it by id (`DELETE /api/v2/tailnet/-/keys/<id>`), whether the node enrolled or not, and on any earlier exit. The metadata service (169.254.169.254) keeps serving the key to anything on the node for the server's life, but revoked |
 | The node's own Tailscale node key, tagged `tag:tenant-<tenant>` | the node's tailnet identity | until the device is deleted |
 | A k3s bootstrap token, in `/etc/systemd/system/k3s-agent.service.env` | agent-only | deleted on the server when join-worker.sh ends |
 | `/etc/rancher/k3s/registries.yaml` | the tenant's pull robot | until destroy |
@@ -167,6 +167,21 @@ All of it is the operating org's; the tenant receives none of it.
 
 No platform credential beyond these is placed on the node: no server token, no platform registry
 robot, no Hetzner token, no Tailscale API key. They stay on the provisioning machine.
+
+**Residual risk of the auth key in user data.** The key travels in the server's cloud-init user
+data, so it sits at rest in the Hetzner project and on the metadata service. A one-off key is
+spent once the node joins with it (Tailscale revokes it on use), so the risk is a key nobody
+consumed. Until it is revoked or expires, anyone who can read the user data could join one device
+as `tag:tenant-<tenant>`, which the policy confines to the cluster server's tcp:6443 and udp:8472.
+The provisioner revokes the key by id once the node has enrolled or failed to. It tries three
+times, and the EXIT trap tries again on any exit. Revoking does not remove the device that joined.
+If the revoke still fails:
+- The node enrolled: the key is spent; a warning names its id.
+- The node did not enrol: the run exits non-zero and prints the key id and the manual revoke
+  (admin console, Settings, Keys).
+A dead machine mid-run cannot revoke at all; the one-hour expiry is the backstop. A node that did
+not enrol keeps a dead key: `--destroy` it and create it again. Delivering the key after boot over
+SSH, instead of in user data, is a separate change.
 
 ## Size for evse-ts (2026-11-20)
 

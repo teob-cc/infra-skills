@@ -135,6 +135,26 @@ Both options write these on a new server before k3s first starts; `tools/doctor.
   ```
   Set the same value in env.properties, so a reprovision keeps it.
 
+#### Tailnet tag
+`TAILSCALE_TAG` in env.properties (one tag, e.g. `tag:env-prod`) is the device's tailnet tag. Every
+provisioner that runs `tailscale up` (bare-metal and Cloud servers and private workers,
+`provision-gpu-host.sh` from the worker directory's own file, tenant workers) mints the auth key
+with it and passes `--advertise-tags` with it, so a re-provision brings the device back tagged.
+Tenant workers default to `tag:tenant-<tenant>`. A device without its tag is user-owned
+(`autogroup:member`: on a tailnet segmented by tags that usually reaches everything, and its node
+key expires). The tag is read from the node's own env.properties only; a `TAILSCALE_TAG` exported
+in your shell is ignored. Unset keeps the old behaviour, untagged, with a warning. These stop the
+script before any API call: a malformed value, a tenant tag (`tag:tenant-*`) on a server or a cluster
+worker, and any tag but `tag:tenant-<tenant>` on a tenant worker. The tag must be in `tagOwners` of
+the tailnet policy, owned by the Tailscale API key's user (or that user is an admin). If the tagged
+key is refused, the run stops: there is no untagged fallback. The provisioners and `doctor.sh` keep
+the API key and the auth keys out of `bash -x` traces and `--debug` logs, and off curl's command line.
+`tools/doctor.sh` (check `tailnet-tags`) warns when the server's or a worker's device is untagged
+or carries another tag. A provisioner never retags a device that is already logged in (it warns
+instead): retag it in the admin console (Edit ACL tags). By hand, `tailscale up` needs every
+non-default flag again, `--advertise-tags=<tag>` included. Test without a tailnet:
+`tests/tailscale-tag/run.sh` (stubs for curl, ssh and the Tailscale CLI).
+
 Both options write `envs/<env>/kubeconfig.yaml` with the Tailscale IP as the API server address,
 and save an encrypted copy to `envs/<env>/secrets.sops/kubeconfig` (commit it). The plaintext
 file is gitignored; in a fresh clone run `tools/sops/kubeconfig.sh restore <env>`.
@@ -142,7 +162,7 @@ file is gitignored; in a fresh clone run `tools/sops/kubeconfig.sh restore <env>
 #### Worker nodes (optional)
 An environment may have worker directories `envs/<env>/<worker>/env.properties` with
 `MASTER_VLAN_IP` / `MASTER_HOSTNAME` (and `NODE_LABELS`, `NODE_TAINTS`, `REGISTRY_HOSTS` for
-special nodes such as a GPU box). A node that is powered on only when needed gets
+special nodes such as a GPU box, and its own `TAILSCALE_TAG`). A node that is powered on only when needed gets
 `infra-skills/on-demand=true` in `NODE_LABELS`, so the alert rules treat it as parked rather
 than failed while it is off (docs/ALERTING.md, "On-demand nodes"). Join them after the master
 is up — and again after any reprovision, since the cluster CA and node token are new:

@@ -16,9 +16,10 @@ set -uo pipefail
 # It reports drift and risk — cluster health, certificate expiry, config drift,
 # backups & restore-test evidence, releases-behind, image scanning, hardening
 # defaults (ArgoCD/Harbor version pins, ArgoCD admin account, private Harbor
-# projects, pgweb NetworkPolicy) — and prints a remedy path. The remedies you
-# can act on yourself are free; the managed, orchestrated form of the same
-# remedies is the commercial control plane (see pragmasoft.nl).
+# projects, pgweb NetworkPolicy), tailnet tags of the env's nodes — and prints a
+# remedy path. The remedies you can act on yourself are free; the managed,
+# orchestrated form of the same remedies is the commercial control plane (see
+# pragmasoft.nl).
 #
 # Usage:
 #   tools/doctor.sh <env-name> [--json] [--strict]
@@ -391,13 +392,14 @@ check_alerting() {
 # --- Check: Tailscale API key expiry ---------------------------------------
 # Only needed to (re)provision or join nodes, but an expired key turns the next rebuild
 # into a mystery. Tailscale caps API keys at 90 days. READ-ONLY GET of the key's own record.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
 check_tailscale_key() {
   local f key id exp exp_epoch now days
   f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
   [[ -f "$f" ]] || { record "tailscale-key" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check expiry)" ""; return; }
   key="$(head -1 "$f" | tr -d '[:space:]')"
   id="$(cut -d- -f3 <<<"$key")"
-  exp="$(curl -sS -m 10 -u "${key}:" "https://api.tailscale.com/api/v2/tailnet/-/keys/${id}" 2>/dev/null | jq -r '.expires // empty' 2>/dev/null)"
+  exp="$(curl -sS -m 10 -K <(printf 'user = "%s:"\n' "$key") "https://api.tailscale.com/api/v2/tailnet/-/keys/${id}" 2>/dev/null | jq -r '.expires // empty' 2>/dev/null)"
   [[ -n "$exp" ]] || { record "tailscale-key" "UNKN" "could not read the key's expiry from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"; return; }
   exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "${exp%%.*}Z" +%s 2>/dev/null || date -u -d "$exp" +%s 2>/dev/null || echo 0)"
   now="$(date +%s)"; days=$(( (exp_epoch - now) / 86400 ))
@@ -406,6 +408,89 @@ check_tailscale_key() {
       "mint a new API key in the Tailscale admin console, update envs/shared/secrets.plain/tailscale-api-key.txt, re-encrypt"
   else
     record "tailscale-key" "OK" "Tailscale API key valid for ${days} more day(s)" ""
+  fi
+}
+
+# --- Check: tailnet tags of this env's nodes --------------------------------
+# The tailnet is segmented by tags: TAILSCALE_TAG in env.properties (servers, e.g. tag:env-prod;
+# a worker directory's own file, e.g. tag:gpu-worker), tag:tenant-<TENANT> for a tenant worker.
+# A device without its tag is user-owned: autogroup:member reach and key expiry, which is what a
+# `tailscale up` without --advertise-tags or a user auth key gives a re-provisioned node. Checks
+# the server (envs/<env>/env.properties) and every worker directory (envs/<env>/*/env.properties).
+# A device is found by its Tailscale IPv4 (TAILSCALE_IP, or VLAN_IP when it is a 100.64.0.0/10
+# address), else by hostname (HOSTNAME, its first label, or the worker directory's name).
+# READ-ONLY GET of the device list.
+TS_CGNAT_RE='^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.'
+# shellcheck disable=SC2329  # called by check_tailscale_tags
+ts_node_address() { # <env.properties> -> "<tailscale ipv4 or empty> <HOSTNAME>", read in a subshell
+  # shellcheck disable=SC1090
+  (
+    unset HOSTNAME TAILSCALE_IP VLAN_IP
+    source "$1" >/dev/null 2>&1
+    local ip="${TAILSCALE_IP:-}" v="${VLAN_IP:-}"
+    v="${v%%/*}"
+    if [[ -z "$ip" && "$v" =~ $TS_CGNAT_RE ]]; then ip="$v"; fi
+    printf '%s %s\n' "$ip" "${HOSTNAME:-}"
+  )
+}
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+check_tailscale_tags() {
+  local f key devices root props label node ip host short expected dev name tags
+  local problems=() fine=()
+  command -v jq >/dev/null 2>&1 || { record "tailnet-tags" "SKIP" "jq not available" ""; return; }
+  f="$(provision::envs_root)/shared/secrets.plain/tailscale-api-key.txt"
+  [[ -f "$f" ]] || { record "tailnet-tags" "SKIP" "no plaintext tailscale-api-key.txt (decrypt to check device tags)" ""; return; }
+  key="$(head -1 "$f" | tr -d '[:space:]')"
+  devices="$(curl -sS -m 10 -K <(printf 'user = "%s:"\n' "$key") "https://api.tailscale.com/api/v2/tailnet/-/devices" 2>/dev/null)"
+  if ! jq -e '.devices | type == "array"' >/dev/null 2>&1 <<<"$devices"; then
+    record "tailnet-tags" "UNKN" "could not read the device list from the Tailscale API" "check the key is valid: tools/validate-keys.sh ${ENV_NAME}"
+    return
+  fi
+  root="$(provision::envs_root)/${ENV_NAME}"
+  for props in "$root/env.properties" "$root"/*/env.properties; do
+    [[ -f "$props" ]] || continue
+    if [[ "$props" == "$root/env.properties" ]]; then label="server"; else label="$(basename "$(dirname "$props")")"; fi
+    node="$(ts_node_address "$props")"
+    ip="${node%% *}"; host="${node#* }"; short="${host%%.*}"
+    expected="$(provision::tailscale_expected_tag "$props")"
+    dev="$(jq -c --arg ip "$ip" --arg h "$host" --arg s "$short" --arg d "$label" '
+      [.devices[]] as $all
+      | ([$all[] | select($ip != "" and ((.addresses // []) | index($ip)))]
+         + [$all[] | select((.hostname // "") as $n | $n != "" and ($n == $h or $n == $s or $n == $d))])
+      | first // empty' <<<"$devices" 2>/dev/null)"
+    if [[ -z "$dev" ]]; then
+      if [[ "$label" == "server" ]]; then
+        problems+=("server: no device found on the tailnet (${ip:-no Tailscale IP in env.properties}, hostname ${host:-?})")
+      else
+        fine+=("${label}: not on the tailnet")
+      fi
+      continue
+    fi
+    name="$(jq -r '.hostname // .name // "?"' <<<"$dev")"
+    tags="$(jq -r '(.tags // []) | join(",")' <<<"$dev")"
+    if [[ -z "$expected" && -z "$tags" ]]; then
+      problems+=("${label} (${name}): untagged, user-owned; TAILSCALE_TAG is not set")
+    elif [[ -z "$expected" ]]; then
+      problems+=("${label} (${name}): carries ${tags} but TAILSCALE_TAG is not set (a re-provision brings it back untagged)")
+    elif [[ -z "$tags" ]]; then
+      problems+=("${label} (${name}): untagged, user-owned; expected ${expected}")
+    elif [[ "$tags" != "$expected" ]]; then
+      problems+=("${label} (${name}): carries ${tags}; expected ${expected}")
+    else
+      fine+=("${label}: ${tags}")
+    fi
+  done
+  if [[ ${#problems[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${problems[@]}")"
+    record "tailnet-tags" "WARN" "${joined%; }" \
+      "set TAILSCALE_TAG=tag:<name> in the node's env.properties; retag a running device in the Tailscale admin console (Edit ACL tags) or with POST /api/v2/device/<id>/tags; provisioners mint a tagged key and pass --advertise-tags"
+  elif [[ ${#fine[@]} -gt 0 ]]; then
+    local joined
+    joined="$(printf "%s; " "${fine[@]}")"
+    record "tailnet-tags" "OK" "${joined%; }" ""
+  else
+    record "tailnet-tags" "SKIP" "no env.properties found under ${root}" ""
   fi
 }
 
@@ -552,7 +637,9 @@ check_certs
 check_drift
 check_backups
 check_alerting
-check_tailscale_key
+# Both hold the Tailscale API key: run them with xtrace off (bash -x would print it).
+provision::without_xtrace check_tailscale_key
+provision::without_xtrace check_tailscale_tags
 check_releases
 check_scanning
 check_floating_images

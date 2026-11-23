@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Stand-in for curl in tests/tailscale-tag/run.sh: nothing leaves the machine.
+# Tailscale API:
+#   GET  .../devices        serves $STUB_DEVICES (a fixture file; "fail" = an API error)
+#   GET  .../keys/<id>      a far expiry
+#   POST .../keys           records the request body in $STUB_LOG.keybody and returns the fake auth
+#                           key $STUB_AUTHKEY; STUB_MINT=deny answers 403 (a refused tagged key)
+#   DELETE .../keys/<id>    records each attempt in $STUB_LOG.revoke-attempts and a successful revoke
+#                           ("<id>") in $STUB_LOG.revoked; STUB_REVOKE=fail answers 500 every time,
+#                           STUB_REVOKE=flaky answers 500 to the first attempt only
+#   DELETE anything else    recorded in $STUB_LOG.writes
+# Every other URL fails as if offline (exit 7). The arguments are logged to $STUB_LOG, so a test
+# can show that no key is ever on curl's command line.
+set -uo pipefail
+printf 'curl %s\n' "$*" >> "${STUB_LOG:?}"
+url="" method=GET body="" wcode=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    -d|--data|--data-binary) body="$2"; method="${method/GET/POST}"; shift 2 ;;
+    -w) wcode=true; shift 2 ;;
+    -u|-H|-m|-o|-K) shift 2 ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+code=200 out=""
+case "$method $url" in
+  "GET https://api.tailscale.com/api/v2/tailnet/-/devices"*)
+    if [[ "${STUB_DEVICES:-}" == fail ]]; then out='{"message":"stub: unauthorized"}'; code=401
+    else out="$(cat "${STUB_DEVICES:-/dev/null}" 2>/dev/null)"; [[ -n "$out" ]] || out='{"devices":[]}'; fi ;;
+  "GET https://api.tailscale.com/api/v2/tailnet/-/keys/"*)
+    out='{"expires":"2099-01-01T00:00:00Z"}' ;;
+  "POST https://api.tailscale.com/api/v2/tailnet/"*"/keys")
+    printf '%s\n' "$body" >> "${STUB_LOG}.keybody"
+    if [[ "${STUB_MINT:-}" == deny ]]; then
+      out='{"message":"stub: requested tags [tag:x] are invalid or not permitted"}'; code=403
+    else
+      out="{\"id\":\"kStub123CNTRL\",\"key\":\"${STUB_AUTHKEY:-tskey-auth-kStub123CNTRL-notrealsecret}\",\"expires\":\"2099-01-01T01:00:00Z\"}"
+    fi ;;
+  "DELETE https://api.tailscale.com/api/v2/tailnet/-/keys/"*)
+    printf '%s\n' "${url##*/}" >> "${STUB_LOG}.revoke-attempts"
+    tries=$(wc -l < "${STUB_LOG}.revoke-attempts" | tr -d ' ')
+    if [[ "${STUB_REVOKE:-}" == fail || ( "${STUB_REVOKE:-}" == flaky && "$tries" == 1 ) ]]; then
+      out='{"message":"stub: internal error"}'; code=500
+    else
+      printf '%s\n' "${url##*/}" >> "${STUB_LOG}.revoked"
+    fi ;;
+  "DELETE "*)
+    echo "DELETE $url" >> "${STUB_LOG}.writes" ;;
+  *)
+    echo "stub curl: no network in this test ($method $url)" >&2
+    exit 7 ;;
+esac
+printf '%s' "$out"
+if $wcode; then printf '\n%s' "$code"; fi
+echo
