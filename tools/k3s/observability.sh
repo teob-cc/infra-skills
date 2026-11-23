@@ -2388,10 +2388,20 @@ serverFiles:
               summary: "Alertmanager {{ \$labels.integration }} notifications failing ({{ \$labels.reason }})"
               description: |
                 Alertmanager gave up on {{ \$value | printf "%.0f" }} {{ \$labels.integration }}
-                notification(s) in 15 minutes after retries. For Telegram the usual causes are a
-                revoked bot token, a changed chat id, or a message Telegram rejects (over 4096
-                characters, or HTML parse_mode choking on a '<' in an annotation). Check the
-                alertmanager log for the API error.
+                notification(s) in 15 minutes after retries.
+                {{ if eq \$labels.integration "slack" -}}
+                The alertmanager log names Slack's error. not_in_channel: the app is not a
+                member of the channel; /invite it there. invalid_auth or token_revoked: the bot
+                token in Secret alertmanager-slack is wrong or was revoked. channel_not_found:
+                the channel name is wrong, or the channel was archived or renamed.
+                msg_too_long: a message is over Slack's length limit.
+                {{- else if eq \$labels.integration "telegram" -}}
+                For Telegram the usual causes are a revoked bot token, a changed chat id, or a
+                message Telegram rejects (over 4096 characters, or HTML parse_mode choking on a
+                '<' in an annotation). Check the alertmanager log for the API error.
+                {{- else -}}
+                Check the alertmanager log for the API error.
+                {{- end }}
           # Email is a second channel next to Telegram; its failures are a defect to fix,
           # not an outage, so they get the low tier (daily Telegram reminder).
           - alert: AlertmanagerEmailNotificationsFailing

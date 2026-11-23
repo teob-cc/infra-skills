@@ -201,7 +201,8 @@ so only the external dead-man heartbeat covers those. Set it up per env:
 2. Store its URL as the `url` key of Secret `observability/alertmanager-deadman`.
 3. Re-run with `--rules-only`.
 
-AlertmanagerNotificationsFailing (p1) means Telegram rejects or cannot receive alerts.
+AlertmanagerNotificationsFailing (p1) means Slack, Telegram or another receiver rejects or
+cannot receive alerts; its description names the usual causes for that integration.
 AlertmanagerEmailNotificationsFailing (p3) means the SMTP relay key is not authorised
 for the sender domain.
 
