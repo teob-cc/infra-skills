@@ -103,8 +103,16 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     policy overrides the default deny for its pods;
   - it leaves out of its namespace-wide allows every pod that another policy already fences
     for ingress (an app chart's own policy), so it never widens that fence; `--plan` lists
-    them. A cluster read that fails, other than an absent CRD, stops the run before it changes
-    anything.
+    them. The allows select exactly the pods that no fence selects, by labels, so a pod created
+    later is either fenced or allowed. A fence with two labels doubles the allow policies in its
+    namespace (`<name>`, `<name>-2`, ...); `NETPOL_MAX_ALLOW_SELECTORS` (16) caps them;
+  - every cluster read stops the run before it changes anything when the API returns an error
+    (Forbidden, a timeout, a failed discovery). NotFound reads as absent for three reads only,
+    each by name: the CNPG Cluster CRD (then CNPG clusters are found from their pods), the
+    ServiceCIDR `kubernetes` (then `--service-cidr` in the k3s node-args, else 10.43.0.0/16)
+    and the Service `kube-system/traefik` (then Traefik ports 8000/8443);
+  - `--remove` reads only the policies it manages and deletes them; no other read or check
+    can block the rollback.
 - **`tools/k3s/tenant.sh <env> <tenant>`** builds the namespace scaffold:
   - Pod Security `restricted`;
   - a ResourceQuota (no LoadBalancer or NodePort) and a LimitRange;

@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Stand-in for kubectl in tests/network-policies/run.sh: answers the read calls network-policies.sh
-# makes in --print mode from the fixture directory STUB_DIR:
+# makes from the fixture directory STUB_DIR:
 #   nodes.json       `get nodes -o json`
 #   namespaces.txt   `get ns -o jsonpath=...` (one line, names separated by spaces)
 #   cnpg-clusters.json, cnpg-pods.json   CNPG Cluster objects / pods labelled cnpg.io/cluster
-#                    (missing file: an empty list). STUB_NO_CNPG_CRD=1: the Cluster CRD is absent.
+#                    (missing file: an empty list)
 #   netpols.json     `get networkpolicies -A -o json` (missing file: an empty list)
 #   pods-<ns>.json   `-n <ns> get pods -o json` (missing file: an empty list)
-# The managed policies (`get networkpolicy -A -l ...`) are none; diff, apply and delete succeed and
-# are only logged, so a run without --print goes through and the log shows whether it applied.
-# STUB_FAIL=<text>: a call whose argv holds <text> fails with Forbidden, as an RBAC refusal would.
+#   managed.json     the managed policies (`get networkpolicy -A -l ...`; missing file: none)
+# diff, apply and delete succeed and are only logged, so a run without --print goes through and the
+# log shows whether it applied or deleted.
+# Faults and absences:
+#   STUB_FAIL=<text>          a call whose argv holds <text> fails with Forbidden, as an RBAC refusal would
+#   STUB_NO_CNPG_CRD=1        the Cluster CRD is absent: NotFound on its raw path, and listing Clusters
+#                             fails with "the server doesn't have a resource type"
+#   STUB_CNPG_DISCOVERY_TIMEOUT=1  the CRD is there, but listing Clusters fails on a discovery timeout
+#                             followed by "the server doesn't have a resource type" (partial discovery)
+#   STUB_NO_SERVICECIDR=1     NotFound on the ServiceCIDR kubernetes
+#   STUB_NO_TRAEFIK_SVC=1     NotFound on the Service kube-system/traefik
 # Every call's argv goes to STUB_LOG. Anything not listed fails, so a new call shows up.
 set -uo pipefail
 dir="${STUB_DIR:?}"
@@ -19,21 +27,35 @@ args=" $* "
 if [[ -n "${STUB_FAIL:-}" && "$args" == *"$STUB_FAIL"* ]]; then
   echo "Error from server (Forbidden): stub refuses: $*" >&2; exit 1
 fi
+no_type() { echo 'error: the server doesn'"'"'t have a resource type "clusters"' >&2; exit 1; }
 case "$args" in
   *" config current-context "*) echo "stub-fake"; exit 0 ;;
   *" get nodes -o json "*) cat "$dir/nodes.json"; exit 0 ;;
-  *" get servicecidrs.networking.k8s.io kubernetes -o json "*) echo '{"spec":{"cidrs":["10.43.0.0/16"]}}'; exit 0 ;;
+  *" get --raw /apis/networking.k8s.io/v1/servicecidrs/kubernetes "*)
+    [[ "${STUB_NO_SERVICECIDR:-}" == 1 ]] && { echo 'Error from server (NotFound): servicecidrs.networking.k8s.io "kubernetes" not found' >&2; exit 1; }
+    echo '{"kind":"ServiceCIDR","spec":{"cidrs":["10.43.0.0/16"]}}'; exit 0 ;;
+  *" get servicecidrs.networking.k8s.io kubernetes -o json "*)   # the read before INFRA-216 round 4
+    [[ "${STUB_NO_SERVICECIDR:-}" == 1 ]] && { echo 'Error from server (NotFound): servicecidrs.networking.k8s.io "kubernetes" not found' >&2; exit 1; }
+    echo '{"spec":{"cidrs":["10.43.0.0/16"]}}'; exit 0 ;;
   *" -n default get svc kubernetes "*) echo "10.43.0.1"; exit 0 ;;
   *" -n kube-system get svc traefik -o json "*)
+    [[ "${STUB_NO_TRAEFIK_SVC:-}" == 1 ]] && { echo 'Error from server (NotFound): services "traefik" not found' >&2; exit 1; }
     echo '{"spec":{"ports":[{"name":"web","port":80,"targetPort":"web"},{"name":"websecure","port":443,"targetPort":"websecure"}]}}'; exit 0 ;;
   *" -n kube-system get pods -l app.kubernetes.io/name=traefik -o json "*)
     echo '{"items":[{"spec":{"containers":[{"ports":[{"name":"web","containerPort":8000},{"name":"websecure","containerPort":8443}]}]}}]}'; exit 0 ;;
   *" get ns -o jsonpath="*) cat "$dir/namespaces.txt"; exit 0 ;;
+  *" get --raw /apis/apiextensions.k8s.io/v1/customresourcedefinitions/clusters.postgresql.cnpg.io "*)
+    [[ "${STUB_NO_CNPG_CRD:-}" == 1 ]] && { echo 'Error from server (NotFound): customresourcedefinitions.apiextensions.k8s.io "clusters.postgresql.cnpg.io" not found' >&2; exit 1; }
+    echo '{"kind":"CustomResourceDefinition","metadata":{"name":"clusters.postgresql.cnpg.io"}}'; exit 0 ;;
   *" get clusters.postgresql.cnpg.io -A -o json "*)
-    [[ "${STUB_NO_CNPG_CRD:-}" == 1 ]] && { echo 'error: the server doesn'"'"'t have a resource type "clusters"' >&2; exit 1; }
+    [[ "${STUB_NO_CNPG_CRD:-}" == 1 ]] && no_type
+    if [[ "${STUB_CNPG_DISCOVERY_TIMEOUT:-}" == 1 ]]; then
+      echo 'E1124 20:00:00.000000   1 memcache.go:265] "Unhandled Error" err="couldn'"'"'t get current server API group list: the server was unable to return a response in the time allotted, but may still be processing the request (get postgresql.cnpg.io/v1)"' >&2
+      no_type
+    fi
     cat "$dir/cnpg-clusters.json" 2>/dev/null || echo "$empty"; exit 0 ;;
   *" get pods -A -l cnpg.io/cluster -o json "*) cat "$dir/cnpg-pods.json" 2>/dev/null || echo "$empty"; exit 0 ;;
-  *" get networkpolicy -A -l "*) echo "$empty"; exit 0 ;;   # the managed policies (stale check): none
+  *" get networkpolicy -A -l "*) cat "$dir/managed.json" 2>/dev/null || echo "$empty"; exit 0 ;;   # the managed policies
   *" diff "*) exit 0 ;;
   *" apply "*|*" delete "*) exit 0 ;;                       # only logged; the tests look for them
   *" get networkpolicies -A -o json "*) cat "$dir/netpols.json" 2>/dev/null || echo "$empty"; exit 0 ;;
