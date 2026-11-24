@@ -8,6 +8,8 @@
 #   1. the default path is unchanged: SQL, kubectl calls, Secret and Pooler equal the golden files
 #      recorded from origin/main 1850e9c (golden/), as parsed objects and byte for byte, for a
 #      plain app, a tenant with a Pooler and a hyphenated app id, and an app with PG_READONLY_ROLE;
+#      the goldens differ from origin/main only by the read-only preflight session (and its kubectl
+#      exec), the COMMENT ON ROLE marker and the password line (a SCRAM verifier);
 #   2. --database <name>[:<PREFIX>] (grant mode): no database is created, the role gets CONNECT,
 #      schema, table and sequence rights and default privileges on each, PUBLIC keeps its CONNECT
 #      (a warning names who relies on it), the Secret holds <PREFIX>_HOST/PORT/DATABASE/USERNAME/
@@ -21,6 +23,8 @@
 #      refuses a file whose *_PASSWORD values disagree, and a stored password that does not match
 #      the role's live verifier (the Secret then stays as it is);
 #   6. a failing or short openssl stops the run before any SQL;
+#   6b. with the secret names exported by the caller and SHELLOPTS=allexport, no password or
+#      verifier reaches the environment of kubectl, openssl or perl (checked on every run);
 #   7. under bash -x no password reaches stdout or stderr, and none is ever on kubectl's argv;
 #   8. (--real-postgres) the same against a real server, with log_statement = all,
 #      log_min_duration_statement = 0 and sampled logging on (no plaintext password ever reaches
@@ -51,6 +55,7 @@ US=$'\x1f'
 
 RUN_SEQ=0   # each run gets its own password prefix (Pw0Stub<run>), so passwords never repeat across runs
 PLAINTEXT_RUNS=""   # runs whose SQL held a plaintext password (P1-1)
+ENV_RUNS=""         # runs that put a secret into a child's environment (P2-1)
 failures=0
 ok() { echo "ok    $*"; }
 fail() { echo "FAIL  $*"; failures=$((failures + 1)); }
@@ -71,14 +76,16 @@ before() { # <file> <first fixed string> <second fixed string>: the first occurs
 run() {
   local name="$1"; shift
   D="${PRE_RUN:-$WORK/$name}"
-  if [[ -z "${PRE_RUN:-}" ]]; then mkdir -p "$D"; cp -R "$HERE/envs/." "$D/"; fi
-  : > "$D/log"; rm -rf "$D/log.sql" "$D/log.applied"
+  if [[ -z "${PRE_RUN:-}" ]]; then rm -rf "$D"; mkdir -p "$D"; cp -R "$HERE/envs/." "$D/"; fi
+  : > "$D/log"; rm -rf "$D/log.sql" "$D/log.applied" "$D/log.env"
   RC=0
   RUN_SEQ=$((RUN_SEQ + 1))
   STUB_PW_PREFIX="Pw0Stub$(printf '%03d' "$RUN_SEQ")" STUB_LOG="$D/log" INFRA_ENVS_ROOT="$D" ${TRACE:-} "$SCRIPT" fake --provision-credentials "$@" >"$D/out" 2>&1 || RC=$?
   touch "$D/log.sql"
   # P1-1: no plaintext password ever goes to psql, on any path
   if grep -qE "$PW_RE" "$D/log.sql"; then PLAINTEXT_RUNS+=" $name"; fi
+  # P2-1 (round 4): no password or verifier in the environment of kubectl, openssl or perl
+  if [[ -f "$D/log.env" ]] && grep -qE "$PW_RE|SCRAM-SHA-256" "$D/log.env"; then ENV_RUNS+=" $name"; fi
 }
 SCRAM_RE='SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+'
 norm() { sed -E -e "s#$D#<WORK>#g" -e "s#$PW_RE#<PW>#g" -e "s#$SCRAM_RE#<SCRAM>#g"; }
@@ -218,6 +225,9 @@ check "--revoke-public: read-only and pooler roles get CONNECT before the revoke
 check "--revoke-public: revoked once" [ "$(grep -c 'REVOKE CONNECT, TEMPORARY ON DATABASE :"db" FROM PUBLIC' "$D/log.sql")" = 1 ]
 check "--revoke-public: warns who loses CONNECT" grep -q "lose CONNECT now: stranger" "$D/out"
 check "--revoke-public: and who is connected now" grep -q "connected now: stranger" "$D/out"
+check "--revoke-public without --take-ownership: the preflight does not read the ledger (round 4 P2-2)" \
+  bash -c '! awk "/^-- ### /{getline t; pre = (t == \"-- infra-skills:preflight\")} pre" "$1" | grep -q "JOIN infra_skills.ownership_transfer"' _ "$D/log.sql"
+check "--revoke-public: the ledger's trust is checked in the preflight" grep -q "AS l_cols_ok" "$D/log.sql"
 
 # --take-ownership (P2-a, P1-b)
 export STUB_DB_OWNERS; STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow evse_ts scala_owner)"
@@ -247,6 +257,10 @@ run own-ledger-late evse-ts --database evse:JOURNAL_DB --take-ownership
 check "--take-ownership: the preflight writes nothing (no ledger DDL in it)" bash -c '! awk "/^-- ### /{getline t; pre = (t == \"-- infra-skills:preflight\")} pre" "$1" | grep -qE "CREATE (SCHEMA|TABLE)"' _ "$D/log.sql"
 check "--take-ownership: the ledger is made after the preflight" grep -q "CREATE TABLE IF NOT EXISTS infra_skills.ownership_transfer" "$D/log.sql"
 check "--take-ownership: pending rows are keyed by the database oid" grep -q "ON CONFLICT (datoid) DO UPDATE" "$D/log.sql"
+check "--take-ownership: the ledger is read only after its trust check (round 4 P2-2)" before "$D/log.sql" "AS l_cols_ok" "LEFT JOIN infra_skills.ownership_transfer l"
+check "--take-ownership: and only behind \\if :use_ledger" before "$D/log.sql" "\\if :use_ledger" "LEFT JOIN infra_skills.ownership_transfer l"
+check "--take-ownership: REASSIGN runs under a lock on pg_database, after a re-check (round 4 P1-2)" \
+  bash -c 'grep -q "LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE" "$1" && awk "/LOCK TABLE pg_catalog.pg_database/{l=NR} /now also owns/{c=NR} /REASSIGN OWNED BY %I/{r=NR} END{exit !(l && c > l && r > c)}" "$1"' _ "$D/log.sql"
 STUB_DB_OWNERS="$(dbrow evse postgres f f postgres t)" bad "--take-ownership from a superuser" "a superuser or system role" x --database evse --take-ownership
 STUB_DB_OWNERS="$(dbrow evse scala_owner f f scala_owner f other_db)" bad "--take-ownership, owner has another database" "also owns: other_db" x --database evse --take-ownership
 STUB_DB_OWNERS="$(dbrow evse scala_owner f f scala_owner f '' 1)" bad "--take-ownership, owner has a tablespace" "owns a tablespace" x --database evse --take-ownership
@@ -285,7 +299,7 @@ check "migration: both Secrets applied" bash -c '[ -f "$1/evse-ts-db.secret.yaml
 run mig-named my-app --migration-role my_app_ddl --migration-connection-limit 3 --migration-schema my-app.flyway
 check "migration, default path: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
 check "migration, default path: the app session is unchanged (second session = golden)" \
-  diff <(awk '/^-- ### /{n++} n==2' "$D/log.sql" | norm) "$HERE/golden/plain.sql"
+  diff <(awk '/^-- ### /{n++} n==2' "$D/log.sql" | norm) <(awk '/^-- ### /{n++} n==2' "$HERE/golden/plain.sql")
 check "migration, default path: named role, limit 3" contains "$(cat "$D/log.sql")" "\\set mrole 'my_app_ddl'"
 check "migration, default path: limit 3" grep -q "CONNECTION LIMIT 3;" "$D/log.sql"
 check "migration, default path: its schema flyway" grep -qF "\\set mschemas 'flyway'" "$D/log.sql"
@@ -328,6 +342,13 @@ check "an app role made by the default path: says so" grep -q "adopting it as th
 check "an app role made by the default path: gets the marker" grep -qF "COMMENT ON ROLE %I IS %L', :'role', :'amarker'" "$D/log.sql"
 STUB_ROLES="$(rolerow app x; rolerow migrate x_mig)" STUB_DB_OWNERS="$(dbrow evse scala_owner)" run marked x --database evse --migration-role x_mig
 check "marked roles: reused" [ "$RC" = 0 ]
+STUB_ROLES="$(rolerow app x t f)" bad "plain default path, an unrelated unmarked role (round 4 P1-1)" "Role x exists but was not made by this script for x" x
+STUB_ROLES="$(rolerow app x t f '' '' pg_read_all_data t)" bad "plain default path, a legacy role in pg_read_all_data" "belongs to pg_read_all_data" x
+STUB_ROLES="$(rolerow app x t f '' '' '' t)" run plain-legacy x
+check "plain default path, the default path's own legacy role (owns database x): adopted" [ "$RC" = 0 ]
+check "plain default path: says so" grep -q "adopting it as this app's role" "$D/out"
+check "plain default path: the role gets the marker" grep -qF "COMMENT ON ROLE %I IS %L', :'role', 'infra-skills:app:x'" "$D/log.sql"
+check "plain default path: the preflight runs before any change" before "$D/log.sql" "-- infra-skills:preflight" "CREATE ROLE %I LOGIN"
 STUB_ROLES="$(rolerow app x t f)" bad "default path + --migration-role, an unrelated unmarked app role (P1-2)" "Role x exists but was not made by this script for x" x --migration-role
 STUB_ROLES="$(rolerow app x t f '' SUPERUSER)" bad "default path + --keep-password, a superuser app role (P1-2)" "exists with SUPERUSER" x --keep-password
 STUB_ROLES="$(rolerow app x t f '' '' '' t)" run legacy-mig x --migration-role
@@ -417,6 +438,18 @@ STUB_OPENSSL_SHORT=1 bad "openssl prints a short password, default path" "Could 
 STUB_OPENSSL_FAIL=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" bad "openssl fails, --database" "Could not make a password" x --database evse
 STUB_OPENSSL_SHORT=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" bad "openssl short, migration role" "Could not make a password" x --database evse --migration-role
 
+# --- 6b. no secret in a child's environment (round 4 P2-1) ------------------------------
+echo "== 6b. exported names and SHELLOPTS=allexport"
+LEAK_ENV="env SHELLOPTS=allexport app_password=placeholder mig_password=placeholder app_verifier=placeholder mig_verifier=placeholder _pw=placeholder _v=placeholder _live=placeholder _pws=placeholder"
+for args in "my-app" "evse-ts --tenant symbioen --pooler --database evse:JOURNAL_DB --migration-role"; do
+  # shellcheck disable=SC2086  # word splitting of the argument list is meant
+  STUB_DB_OWNERS="$(dbrow evse scala_owner)" TRACE="$LEAK_ENV" run envleak $args
+  check "exported names ($args): exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  check "exported names ($args): perl ran (sanity)" grep -q "^### perl .*pg-scram.pl make" "$D/log.env"
+  check "exported names ($args): the caller's exported names reach the children (sanity)" grep -q "^app_password=placeholder$" "$D/log.env"
+  check "exported names ($args): no password or verifier in any child's environment" bash -c '! grep -qE "$2|SCRAM-SHA-256" "$1"' _ "$D/log.env" "$PW_RE"
+done
+
 # --- 7. no secret under bash -x -----------------------------------------------------------
 echo "== 7. bash -x"
 xtrace() { # <name> <args...>
@@ -460,17 +493,27 @@ if $REAL; then
   not() { ! "$@"; }
   owner_of_db() { q postgres postgres "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='$1'"; }
   # hold <db> <sql>: run <sql> in an open transaction in the background (a lock holder) until
-  # release; waits until the backend waits in pg_sleep.
+  # release; returns once this holder's own backend (application_name holder-<n>) sleeps.
+  HOLD_N=0
   hold() {
-    printf 'BEGIN;\n%s\nSELECT pg_sleep(60);\n' "$2" | psql -h "$PGDIR" -p "$STUB_PGPORT" -U postgres -d "$1" -Xq >/dev/null 2>&1 &
+    HOLD_N=$((HOLD_N + 1))
+    printf 'BEGIN;\n%s\nSELECT pg_sleep(60);\n' "$2" \
+      | PGAPPNAME="holder-$HOLD_N" psql -h "$PGDIR" -p "$STUB_PGPORT" -U postgres -d "$1" -Xq >/dev/null 2>&1 &
     HOLDERS+=($!)
     local _; for _ in $(seq 1 50); do
-      [[ "$(q postgres postgres "SELECT count(*) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(60)%' AND state = 'active'")" -ge 1 ]] && return 0
+      [[ "$(q postgres postgres "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'holder-$HOLD_N' AND query LIKE 'SELECT pg_sleep(60)%' AND state = 'active'")" -ge 1 ]] && return 0
       /bin/sleep 0.1
     done
     return 1
   }
-  release() { q postgres postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep(60)%'" >/dev/null; }
+  # release: end every holder and wait until their backends are gone.
+  release() {
+    q postgres postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name LIKE 'holder-%'" >/dev/null
+    local _; for _ in $(seq 1 50); do
+      [[ "$(q postgres postgres "SELECT count(*) FROM pg_stat_activity WHERE application_name LIKE 'holder-%'")" == 0 ]] && return 0
+      /bin/sleep 0.1
+    done
+  }
   # The passwords a run sent on the paths this change protects: every \set pw / \set mpw except the
   # default path's own app statement (\set db before it, \set ro after it; unchanged from origin/main).
   protected_pws() {
@@ -500,6 +543,11 @@ COMMENT ON ROLE other_app_migrate IS 'infra-skills:migrate:other-app';
 CREATE ROLE lonely LOGIN PASSWORD 'lonely-original-password-0123';
 CREATE DATABASE shared2 OWNER other_reader;
 CREATE DATABASE scramcheck;
+CREATE ROLE legacyapp LOGIN;
+CREATE DATABASE legacyapp OWNER legacyapp;
+CREATE ROLE race_src LOGIN;
+CREATE DATABASE race_a OWNER race_src;
+CREATE DATABASE race_b;
 CREATE ROLE "O'Brien | ops ""x""" LOGIN;
 CREATE DATABASE evse OWNER evse_ts;
 CREATE DATABASE evse_ts OWNER evse_ts;
@@ -598,17 +646,37 @@ SQL
   check "real P1-2: its password is untouched" [ "$lonely_pw_before" = "$(q postgres postgres "SELECT rolpassword FROM pg_authid WHERE rolname='lonely'")" ]
   check "real P1-2: no Secret written" bash -c '[ ! -e "$1/fake/secrets.plain" ] || [ -z "$(ls "$1/fake/secrets.plain")" ]' _ "$D"
   check "real P1-2: no migration role made" [ "$(q postgres postgres "SELECT count(*) FROM pg_roles WHERE rolname='lonely_migrate'")" = 0 ]
+  # Round 4 P1-1: the plain default path (no new flags) runs the same preflight.
+  run real-plain-lonely lonely
+  check "real plain default path, unrelated unmarked role: refused (round 4 P1-1)" grep -q "Role lonely exists but was not made by this script" "$D/out"
+  check "real plain default path: its password is untouched" [ "$lonely_pw_before" = "$(q postgres postgres "SELECT rolpassword FROM pg_authid WHERE rolname='lonely'")" ]
+  check "real plain default path: no Secret written, none applied" bash -c '{ [ ! -e "$1/fake/secrets.plain" ] || [ -z "$(ls "$1/fake/secrets.plain")" ]; } && [ ! -e "$1/log.applied" ]' _ "$D"
+  check "real plain default path: no database lonely made" [ -z "$(owner_of_db lonely)" ]
+  run real-legacy legacyapp
+  check "real plain default path, a legacy role that owns its database: adopted" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  check "real plain default path: the legacy role gets the marker" [ "$(q postgres postgres "SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname='legacyapp'")" = infra-skills:app:legacyapp ]
+  check "real plain default path: SCRAM login with its new Secret" scram_login legacyapp "$(key "$D/fake/secrets.plain/legacyapp-db.secret.yaml" POSTGRES_PASSWORD)"
 
   # -- --revoke-public (P1-d)
   run real-revoke-missing evse-ts --tenant symbioen --database evse:JOURNAL_DB --revoke-public --keep-connect nobody_here
   check "real --revoke-public, kept role missing: refused" grep -q "role nobody_here does not exist" "$D/out"
   check "real --revoke-public, kept role missing: PUBLIC untouched" can stranger evse "SELECT 1"
   check "real: a refused preflight leaves no ledger behind" [ -z "$(q postgres postgres "SELECT to_regclass('infra_skills.ownership_transfer')")" ]
+  # Round 4 P2-2: a foreign ledger whose relation runs code when read (a view over a function that
+  # writes to public.pwned) must not be read by the preflight at all.
   q postgres postgres "DROP SCHEMA IF EXISTS infra_skills CASCADE; CREATE SCHEMA infra_skills AUTHORIZATION stranger" >/dev/null \
     || fail "real: fixture: a foreign infra_skills schema"
+  psql -h "$PGDIR" -p "$STUB_PGPORT" -U stranger -d postgres -Xq -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<'SQL' || fail "real: fixture: the trap view"
+CREATE TABLE public.pwned (at timestamptz);
+CREATE FUNCTION infra_skills.trap() RETURNS TABLE (datoid oid, datname name, from_role oid, to_role oid, started_at timestamptz, done_at timestamptz)
+  LANGUAGE plpgsql AS $$ BEGIN INSERT INTO public.pwned VALUES (now()); RETURN; END $$;
+CREATE VIEW infra_skills.ownership_transfer AS SELECT * FROM infra_skills.trap();
+SQL
   run real-ledger-hijack evse-ts --database evse:JOURNAL_DB --database evse_ts:STATE_DB --take-ownership
   check "real: a ledger schema owned by another role is refused" grep -q "is not the one this script makes" "$D/out"
   check "real: and nothing moved" [ "$(owner_of_db evse)" = evse_ts ]
+  check "real: the foreign ledger was never read (round 4 P2-2)" [ "$(q postgres postgres "SELECT count(*) FROM public.pwned")" = 0 ]
+  q postgres postgres "DROP TABLE IF EXISTS public.pwned" >/dev/null || true
   q postgres postgres "DROP SCHEMA IF EXISTS infra_skills CASCADE" >/dev/null || fail "real: fixture: drop the foreign schema"
   PG_READONLY_ROLE=claude_ro run real-revoke my-app --database evse --pooler --revoke-public --keep-connect other_reader
   check "real --revoke-public: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
@@ -663,6 +731,36 @@ SQL
   q postgres postgres "ALTER ROLE postgres RESET lock_timeout" >/dev/null
   run real-own-super evse-ts --database other --take-ownership
   check "real ownership: refused for a superuser-owned database" grep -q "a superuser or system role" "$D/out"
+
+  # Round 4 P1-2: SHARE ROW EXCLUSIVE on pg_database holds off ALTER DATABASE OWNER (PG14)...
+  hold postgres "LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;" || fail "real P1-2: lock holder did not start"
+  blocked_alter() { # the ALTER fails with a lock timeout (psql exits non-zero, hence no pipe)
+    local out
+    out=$(psql -h "$PGDIR" -p "$STUB_PGPORT" -U postgres -d postgres -XtAq \
+            -c "SET lock_timeout = '500ms'; ALTER DATABASE race_b OWNER TO postgres" 2>&1 || true)
+    [[ "$out" == *"canceling statement due to lock timeout"* ]]
+  }
+  check "real P1-2: SHARE ROW EXCLUSIVE on pg_database blocks a concurrent ALTER DATABASE OWNER" blocked_alter
+  release
+  # ... and the race: after the preflight, another session gives race_b to the source role.
+  hold postgres "INSERT INTO infra_skills.ownership_transfer VALUES ((SELECT oid FROM pg_database WHERE datname='race_a'), 'race_a', (SELECT oid FROM pg_roles WHERE rolname='race_src'), (SELECT oid FROM pg_roles WHERE rolname='race_src'), now(), NULL);" \
+    || fail "real P1-2: ledger holder did not start"
+  ( run real-race race-app --database race_a --take-ownership; echo "$RC" > "$WORK/race.rc" ) &
+  racer=$!
+  waited=0
+  for _ in $(seq 1 100); do
+    [[ "$(q postgres postgres "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO infra_skills.ownership_transfer%'")" -ge 1 ]] && { waited=1; break; }
+    /bin/sleep 0.1
+  done
+  check "real P1-2: the run is past its preflight, waiting (sanity)" [ "$waited" = 1 ]
+  q postgres postgres "ALTER DATABASE race_b OWNER TO race_src" >/dev/null || fail "real P1-2: the other session's ALTER DATABASE"
+  release
+  wait "$racer" || true
+  D="$WORK/real-race"
+  check "real P1-2: the takeover fails" [ "$(cat "$WORK/race.rc")" != 0 ]
+  check "real P1-2: and says why" grep -q "race_src now also owns race_b" "$D/out"
+  check "real P1-2: the unlisted database keeps its owner" [ "$(owner_of_db race_b)" = race_src ]
+  check "real P1-2: the named database is rolled back" [ "$(owner_of_db race_a)" = race_src ]
 
   # -- an owner named O'Brien | ops "x" (P1-b)
   run real-odd legacy-app --database legacy
@@ -751,6 +849,7 @@ SQL
 fi
 
 check "no plaintext password reached psql in any run (P1-1)${PLAINTEXT_RUNS:+:$PLAINTEXT_RUNS}" [ -z "$PLAINTEXT_RUNS" ]
+check "no secret in any child process's environment, in any run (P2-1)${ENV_RUNS:+:$ENV_RUNS}" [ -z "$ENV_RUNS" ]
 
 echo
 if (( failures > 0 )); then

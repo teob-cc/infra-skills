@@ -167,13 +167,12 @@ five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. Th
 **Which roles the script uses.** It reuses an existing role only when it made that role for
 this app: `COMMENT ON ROLE` holds the marker `infra-skills:app:<app>` or
 `infra-skills:migrate:<app>`. An unmarked app role that owns the database `<app>` (made by
-the default path) is adopted and marked. These checks run on every path except the plain
-default one (no `--database`, `--migration-role` or `--keep-password`), which behaves as before
-INFRA-243 and checks only the reserved names. The script refuses:
+the default path) and has no elevated attributes or memberships is adopted and marked. These
+checks run on every path, the plain default one (no new flags) included. The script refuses:
 
 - reserved names: `postgres`, `app` (CNPG's owner), `streaming_replica`,
   `cnpg_pooler_pgbouncer`, `PG_READONLY_ROLE`, `public`, `none` and every `pg_*` name. This also
-  applies to the app id on the default path;
+  applies to the app id;
 - an existing role that is a superuser, has CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS, or
   belongs to a role that does or to a `pg_*` role;
 - an existing role without this app's marker. If it really is the app's role, mark it by hand
@@ -215,15 +214,21 @@ therefore refuses the move when the old owner is a superuser or a `pg_*` role, o
 not named with `--database`, or owns a tablespace. Once the preflight has passed, and before
 anything moves, the run records each database's oid, its original owner and the destination
 role in `infra_skills.ownership_transfer`. That table lives in the `postgres` database, PUBLIC
-cannot read it, and the script makes it on first use. Before using an existing ledger, the
-preflight checks that the schema and the table belong to the superuser the script runs as. Then,
-per database:
+cannot read it, and the script makes it on first use. The preflight first checks, from the
+catalogs alone, that the schema and the table belong to the superuser the script runs as, that it
+is a plain table and has the expected columns; only `--take-ownership` then reads it. Then, per
+database, in one transaction inside that database:
 
-1. `ALTER DATABASE ... OWNER`;
-2. `REASSIGN OWNED BY` the recorded owner, inside that database;
-3. a check that no object in the database still belongs to the old owner (default privileges
+1. `LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE`. Until the move commits, no
+   other session can run `ALTER DATABASE ... OWNER` or `CREATE DATABASE` (they need ROW
+   EXCLUSIVE on `pg_database`; checked on PG14);
+2. a check, under that lock, that the old owner owns no database outside this run and no
+   tablespace (another session may have given it one since the preflight), otherwise the
+   transaction rolls back and the run fails;
+3. `ALTER DATABASE ... OWNER`, then `REASSIGN OWNED BY` the recorded owner;
+4. a check that no object in the database still belongs to the old owner (default privileges
    aside), otherwise the run fails;
-4. the ledger row is marked done.
+5. commit, CONNECT for the app role again, and the ledger row is marked done.
 
 If a run stops halfway, the next run with the same destination reads the recorded owner and
 completes the move, even when the database already shows the new owner. A run with another
@@ -282,7 +287,9 @@ or the runner image's) and sends `ALTER ROLE ... PASSWORD 'SCRAM-SHA-256$4096:..
 Postgres stores as it is. So no log setting (`log_statement`, `log_min_duration_statement`,
 sampled logging, error statements) can show a password; at most a verifier. The plaintext goes
 only into the Secret file. It never appears on a command line, and with `bash -x` it is not in the
-trace either. The password statement still runs with `log_statement` off. Connection limits and
+trace either. Secrets are never exported: the script turns allexport off, and its secret
+variables are declared `+x` (bash locals otherwise inherit an export from the caller's
+environment), so no child process (kubectl, openssl, perl, yq) sees one in its environment. The password statement still runs with `log_statement` off. Connection limits and
 timeouts are range-checked before any SQL, and the limit keeps the spelling it was given.
 
 What the script does not do: it doesn't change the app's chart or settings. Key names the chart

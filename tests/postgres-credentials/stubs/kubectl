@@ -15,6 +15,7 @@
 set -uo pipefail
 log="${STUB_LOG:?}"
 printf 'kubectl %s\n' "$*" >> "$log"
+{ echo "### kubectl"; env; } >> "$log.env"   # each call's environment (no secret may be in it)
 args=" $* "
 case "$args" in
   *" config current-context "*) echo "stub-${STUB_CONTEXT_ENV:-fake}"; exit 0 ;;

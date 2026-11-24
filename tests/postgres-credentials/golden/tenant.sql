@@ -1,9 +1,36 @@
+-- ### psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q -tA -F 
+-- infra-skills:preflight
+\set app_role 'evse-ts'
+\set mig_role ''
+\set app_marker 'infra-skills:app:evse-ts'
+\set mig_marker 'infra-skills:migrate:evse-ts'
+\set targets 'evse-ts'
+\set owner 'evse-ts'
+\set excluded ',cnpg_pooler_pgbouncer'
+\set need ''
+SET client_min_messages = warning;
+SELECT 'role', k.kind, k.name, (r.oid IS NOT NULL),
+       coalesce(shobj_description(r.oid, 'pg_authid') = k.marker, false),
+       coalesce(regexp_replace(shobj_description(r.oid, 'pg_authid'), '[[:cntrl:]]', '?', 'g'), ''),
+       coalesce(concat_ws(',', CASE WHEN r.rolsuper THEN 'SUPERUSER' END, CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
+                CASE WHEN r.rolcreatedb THEN 'CREATEDB' END, CASE WHEN r.rolreplication THEN 'REPLICATION' END,
+                CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END), ''),
+       coalesce((SELECT string_agg(regexp_replace(g.rolname, '[[:cntrl:]]', '?', 'g'), ',' ORDER BY g.rolname)
+                   FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')
+                    AND (g.rolname ~ '^pg_' OR g.rolsuper OR g.rolcreaterole OR g.rolcreatedb OR g.rolreplication OR g.rolbypassrls)), ''),
+       coalesce(k.kind = 'app' AND EXISTS (SELECT FROM pg_database d WHERE d.datname = k.name AND d.datdba = r.oid), false)
+  FROM (VALUES (1, 'app', :'app_role', :'app_marker'), (2, 'migrate', :'mig_role', :'mig_marker')) k(ord, kind, name, marker)
+  LEFT JOIN pg_roles r ON r.rolname = k.name
+ WHERE k.name <> ''
+ ORDER BY k.ord;
+SELECT 'need', k, EXISTS (SELECT FROM pg_roles WHERE rolname = k) FROM unnest(string_to_array(:'need', ',')) k WHERE k <> '';
 -- ### psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q
 \set role 'evse-ts'
 \set db 'evse-ts'
 \set pw '<SCRAM>'
 \set ro ''
 SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') \gexec
+SELECT format('COMMENT ON ROLE %I IS %L', :'role', 'infra-skills:app:evse-ts') WHERE shobj_description((SELECT oid FROM pg_roles WHERE rolname = :'role'), 'pg_authid') IS DISTINCT FROM 'infra-skills:app:evse-ts' \gexec
 BEGIN;
 SET LOCAL log_statement = 'none';
 ALTER ROLE :"role" WITH LOGIN PASSWORD :'pw' CONNECTION LIMIT 30;
