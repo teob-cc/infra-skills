@@ -5,12 +5,20 @@
 #   namespaces.txt   `get ns -o jsonpath=...` (one line, names separated by spaces)
 #   cnpg-clusters.json, cnpg-pods.json   CNPG Cluster objects / pods labelled cnpg.io/cluster
 #                    (missing file: an empty list). STUB_NO_CNPG_CRD=1: the Cluster CRD is absent.
+#   netpols.json     `get networkpolicies -A -o json` (missing file: an empty list)
+#   pods-<ns>.json   `-n <ns> get pods -o json` (missing file: an empty list)
+# The managed policies (`get networkpolicy -A -l ...`) are none; diff, apply and delete succeed and
+# are only logged, so a run without --print goes through and the log shows whether it applied.
+# STUB_FAIL=<text>: a call whose argv holds <text> fails with Forbidden, as an RBAC refusal would.
 # Every call's argv goes to STUB_LOG. Anything not listed fails, so a new call shows up.
 set -uo pipefail
 dir="${STUB_DIR:?}"
 printf 'kubectl %s\n' "$*" >> "${STUB_LOG:?}"
 empty='{"apiVersion":"v1","kind":"List","items":[]}'
 args=" $* "
+if [[ -n "${STUB_FAIL:-}" && "$args" == *"$STUB_FAIL"* ]]; then
+  echo "Error from server (Forbidden): stub refuses: $*" >&2; exit 1
+fi
 case "$args" in
   *" config current-context "*) echo "stub-fake"; exit 0 ;;
   *" get nodes -o json "*) cat "$dir/nodes.json"; exit 0 ;;
@@ -25,6 +33,13 @@ case "$args" in
     [[ "${STUB_NO_CNPG_CRD:-}" == 1 ]] && { echo 'error: the server doesn'"'"'t have a resource type "clusters"' >&2; exit 1; }
     cat "$dir/cnpg-clusters.json" 2>/dev/null || echo "$empty"; exit 0 ;;
   *" get pods -A -l cnpg.io/cluster -o json "*) cat "$dir/cnpg-pods.json" 2>/dev/null || echo "$empty"; exit 0 ;;
+  *" get networkpolicy -A -l "*) echo "$empty"; exit 0 ;;   # the managed policies (stale check): none
+  *" diff "*) exit 0 ;;
+  *" apply "*|*" delete "*) exit 0 ;;                       # only logged; the tests look for them
+  *" get networkpolicies -A -o json "*) cat "$dir/netpols.json" 2>/dev/null || echo "$empty"; exit 0 ;;
+  *" get pods -o json "*)
+    ns=""; prev=""; for a in "$@"; do [[ "$prev" == -n ]] && ns="$a"; prev="$a"; done
+    cat "$dir/pods-$ns.json" 2>/dev/null || echo "$empty"; exit 0 ;;
 esac
 echo "kubectl stub: unexpected call: $*" >&2
 exit 1

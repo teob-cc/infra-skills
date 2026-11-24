@@ -16,6 +16,17 @@
 #      namespace (the operator is already admitted there) and an unfenced namespace ("other-db") get
 #      none. The cluster is found from its pods alone when the Cluster CRD is absent, and from its
 #      Cluster object alone when no pod runs yet.
+#   4. pods with their own fence (INFRA-216 round 3): in fixtures/fences, the namespace-wide allows
+#      of "web" and "memory" leave out every pod that a policy not managed here selects for
+#      ingress (matchLabels, In and Exists selectors, two policies on one selector), and keep the
+#      others; those pods stay under the default deny. Egress-only and managed policies, policies
+#      outside the fenced namespaces and a namespace-wide policy (nexus) leave nothing out. --print
+#      logs each exclusion and the pods it leaves out;
+#   5. the run stops before anything is applied or deleted (a run without --print, so the stub
+#      sees every apply) when: a fence's podSelector uses NotIn; a multi-label fence would leave out
+#      a pod that no policy of its own selects; the API refuses the NetworkPolicy list, the CNPG
+#      Cluster list (refused, not absent), the CNPG pod list or a fenced namespace's pod list. The
+#      same run without a fault does apply.
 #
 # Usage: tests/network-policies/run.sh   (needs bash and jq). NP_SCRIPT=<path> runs another
 #        network-policies.sh (for example origin/main's, in a checkout of that commit) against the
@@ -115,6 +126,75 @@ render clusters-only lan-worker STUB_DIR="$WORK/clusters-only" || fail "render w
 check "CNPG: with no pod yet, the cluster is found from its Cluster object" op_ok clusters-only memory
 check "CNPG: the plain cluster has no operator policy anywhere" \
   bash -c '[[ -z "$(jq -r ".items[] | select(.metadata.name == \"platform-allow-cnpg-operator\") | .metadata.namespace" "$1")" ]]' _ "$WORK/plain.json"
+
+# --- 4. pods with their own fence -----------------------------------------------------------
+GENERIC="platform-allow-same-namespace platform-allow-from-prometheus platform-allow-from-ingress-controller platform-allow-from-pomerium"
+WEB_SEL='{"matchExpressions":[{"key":"app.kubernetes.io/instance","operator":"NotIn","values":["evse","portal"]},{"key":"app.kubernetes.io/name","operator":"NotIn","values":["evse","gw","portal"]},{"key":"tier","operator":"NotIn","values":["db"]}]}'
+MEM_SEL='{"matchExpressions":[{"key":"fenced","operator":"DoesNotExist"}]}'
+OBS_SEL='{"matchExpressions":[{"key":"app","operator":"NotIn","values":["mcp-grafana"]}]}'
+all_generic() { # <render> <ns> <selector json>: every namespace-wide allow of <ns> has exactly this podSelector
+  local p
+  for p in $GENERIC; do
+    pol "$1" "$2" "$p" | jq -e --argjson s "$3" '.spec.podSelector == $s' >/dev/null || return 1
+  done
+}
+# shellcheck disable=SC2016  # a jq function
+MATCH='def matches($sel): (.metadata.labels // {}) as $l
+  | all(($sel.matchLabels // {}) | to_entries[]; $l[.key] == .value)
+  and all(($sel.matchExpressions // [])[]; . as $e | ($l[$e.key]) as $v
+    | if $e.operator == "In" then $v != null and any($e.values[]; . == $v)
+      elif $e.operator == "NotIn" then $v == null or all($e.values[]; . != $v)
+      elif $e.operator == "Exists" then $v != null else $v == null end);'
+selected_pods() { # <render> <ns> <policy> <pods file>: the names of the pods that policy selects
+  jq -r --argjson sel "$(pol "$1" "$2" "$3" | jq -c '.spec.podSelector')" "$MATCH"' [.items[] | select(matches($sel)) | .metadata.name] | join(" ")' "$4"
+}
+render fences fences || fail "fences render ran"
+check "fences: every namespace-wide allow of 'web' leaves out the fenced pods (evse x2, portal, gw, tier In db)" all_generic fences web "$WEB_SEL"
+check "fences: every namespace-wide allow of 'memory' leaves out the pods of an Exists fence" all_generic fences memory "$MEM_SEL"
+check "fences: observability keeps its mcp-grafana exclusion, merged with its live policy" all_generic fences observability "$OBS_SEL"
+check "fences: nexus (a namespace-wide extra allow) leaves nothing out" all_generic fences nexus '{}'
+check "fences: in 'web' the allows select exactly storeback-1 and cron-1 (egress-only and managed policies leave nothing out)" \
+  bash -c '[[ "$1" == "storeback-1 cron-1" ]]' _ "$(selected_pods fences web platform-allow-same-namespace "$HERE/fixtures/fences/pods-web.json")"
+check "fences: in 'web' the default deny still selects every pod" \
+  bash -c '[[ "$1" == "evse-1 portal-1 gw-1 db-0 storeback-1 cron-1" ]]' _ "$(selected_pods fences web platform-default-deny-ingress "$HERE/fixtures/fences/pods-web.json")"
+check "fences: the log names the pods 'web' leaves out" grep -qF "web: pods left out of the allows: evse-1 portal-1 gw-1 db-0" "$WORK/fences.err"
+check "fences: the log names each fence of 'web'" bash -c 'for p in evse-from-pomerium-only evse-from-comparator portal gw-ingress db-fence; do grep -qF "web: allows leave out the pods of $p (" "$1" || exit 1; done' _ "$WORK/fences.err"
+check "fences: the log names nexus/vpn-allow as left alone" grep -qF "nexus/vpn-allow selects every pod of its namespace" "$WORK/fences.err"
+
+# --- 5. the run stops before it applies -----------------------------------------------------
+run_apply() { # run_apply <name> <fixture dir> [VAR=value ...]: a run without --print; rc in $WORK/<name>.rc
+  local name=$1 fixture=$2 rc=0; shift 2
+  env STUB_DIR="$HERE/fixtures/$fixture" STUB_LOG="$WORK/$name.log" "$@" \
+    bash "$SCRIPT" fake >"$WORK/$name.out" 2>"$WORK/$name.err" || rc=$?
+  echo "$rc" >"$WORK/$name.rc"
+}
+stopped() { # <name> <text>: non-zero exit, <text> in stderr, no apply or delete reached kubectl
+  [[ "$(cat "$WORK/$1.rc")" != 0 ]] && grep -qF -- "$2" "$WORK/$1.err" && ! grep -qE '^kubectl (apply|delete|-n [^ ]+ delete) ' "$WORK/$1.log"
+}
+run_apply apply-ok fences
+check "stop: the fences run without a fault applies (so the checks below can see an apply)" \
+  bash -c '[[ "$(cat "$1.rc")" == 0 ]] && grep -qE "^kubectl apply " "$1.log"' _ "$WORK/apply-ok"
+mkdir -p "$WORK/notin" "$WORK/orphan"
+cp "$HERE/fixtures/fences/"* "$WORK/notin/"; cp "$HERE/fixtures/fences/"* "$WORK/orphan/"
+jq '.items += [{metadata: {namespace: "web", name: "notin-fence", labels: {}},
+  spec: {podSelector: {matchExpressions: [{key: "tier", operator: "NotIn", values: ["web"]}]}, policyTypes: ["Ingress"], ingress: [{}]}}]' \
+  "$HERE/fixtures/fences/netpols.json" >"$WORK/notin/netpols.json"
+jq '.items += [{metadata: {name: "evse-tool-1", labels: {"app.kubernetes.io/instance": "tools", "app.kubernetes.io/name": "evse"}}}]' \
+  "$HERE/fixtures/fences/pods-web.json" >"$WORK/orphan/pods-web.json"
+run_apply notin fences STUB_DIR="$WORK/notin"
+check "stop: a fence selector with NotIn stops the run, nothing applied" stopped notin "web/notin-fence: its podSelector uses NotIn or DoesNotExist"
+run_apply orphan fences STUB_DIR="$WORK/orphan"
+check "stop: a pod left out by a multi-label fence that no policy selects stops the run, nothing applied" stopped orphan "web: pods evse-tool-1 would lose"
+run_apply forbid-np fences STUB_FAIL="get networkpolicies -A"
+check "stop: a refused NetworkPolicy list stops the run, nothing applied" stopped forbid-np "could not read NetworkPolicies"
+run_apply forbid-cluster lan-worker STUB_FAIL="clusters.postgresql.cnpg.io"
+check "stop: a refused CNPG Cluster list (not an absent CRD) stops the run, nothing applied" stopped forbid-cluster "could not read CNPG Cluster objects"
+run_apply forbid-cnpg-pods lan-worker STUB_FAIL="-l cnpg.io/cluster"
+check "stop: a refused CNPG pod list stops the run, nothing applied" stopped forbid-cnpg-pods "could not read pods labelled cnpg.io/cluster"
+run_apply forbid-pods fences STUB_FAIL="-n web get pods"
+check "stop: a refused pod list of a fenced namespace stops the run, nothing applied" stopped forbid-pods "could not read pods in web"
+run_apply no-crd-apply lan-worker STUB_NO_CNPG_CRD=1
+check "stop: an absent CNPG CRD does not stop the run" bash -c '[[ "$(cat "$1")" == 0 ]]' _ "$WORK/no-crd-apply.rc"
 
 echo
 if (( failures > 0 )); then

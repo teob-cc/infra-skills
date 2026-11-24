@@ -100,7 +100,11 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     that runs its own CNPG cluster gets an allow for the CNPG operator on 8000 and 5432, so it
     can be fenced too (re-run the script after creating such a cluster);
   - it names every other policy in its namespaces that admits ingress from anywhere: such a
-    policy overrides the default deny for its pods.
+    policy overrides the default deny for its pods;
+  - it leaves out of its namespace-wide allows every pod that another policy already fences
+    for ingress (an app chart's own policy), so it never widens that fence; `--plan` lists
+    them. A cluster read that fails, other than an absent CRD, stops the run before it changes
+    anything.
 - **`tools/k3s/tenant.sh <env> <tenant>`** builds the namespace scaffold:
   - Pod Security `restricted`;
   - a ResourceQuota (no LoadBalancer or NodePort) and a LimitRange;

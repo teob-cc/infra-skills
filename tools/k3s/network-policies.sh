@@ -52,9 +52,15 @@ set -euo pipefail
 # kube-router evaluates egress after DNAT, so a ClusterIP is checked as the backend pod
 # IP: denying the pod CIDR is what keeps runners off cluster Services.
 #
-# Pods that already carry their own narrower ingress fence (pgweb-from-pomerium-only,
-# mcp-grafana-from-pomerium-only) are left out of the allow policies here, because
-# NetworkPolicies add up and a namespace-wide allow would widen theirs.
+# Pods that already carry their own ingress fence, i.e. pods that a policy not managed here selects
+# for ingress (pgweb-from-pomerium-only, mcp-grafana-from-pomerium-only, an app chart's policy),
+# are left out of the allow policies here, because NetworkPolicies add up and a namespace-wide
+# allow would widen theirs. They stay under the default deny; --plan logs each one. A fence whose
+# podSelector uses NotIn or DoesNotExist, or one that would leave out a pod no policy of its own
+# selects, stops the run. A policy with an empty podSelector is an extra allow, not a fence.
+#
+# Every cluster read the render depends on stops the run on an API error (Forbidden, a timeout),
+# before anything is applied or deleted; only a CRD that is not installed reads as empty.
 #
 # Everything is derived from the cluster and env.properties: node addresses and podCIDRs,
 # the service CIDR (ServiceCIDR object, else --service-cidr in k3s node-args, else the k3s
@@ -132,6 +138,36 @@ command -v jq >/dev/null 2>&1 || { provision::error "jq not found"; exit 1; }
 provision::validate_kubectl_context
 
 log() { echo "[netpol] $*" >&2; }
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/netpol.XXXXXX")
+trap 'rm -rf "$TMPD"' EXIT
+# kget <what> <kubectl args...>: the read's stdout. Any API error (Forbidden, a timeout, ...) stops the
+# run, before anything is applied or deleted: a read that silently came back empty would render
+# policies for a cluster that is not there.
+kget() {
+  local what=$1; shift
+  if ! kubectl "$@" >"$TMPD/kget.out" 2>"$TMPD/kget.err"; then
+    provision::error "could not read ${what}: $(tr '\n' ' ' <"$TMPD/kget.err")"
+    provision::error "stopping before anything is applied or deleted"
+    exit 1
+  fi
+  cat "$TMPD/kget.out"
+}
+# kget_optional <what> <kubectl args...>: like kget, but a resource type the server does not know (a CRD
+# that is not installed) reads as an empty list.
+kget_optional() {
+  local what=$1; shift
+  if ! kubectl "$@" >"$TMPD/kget.out" 2>"$TMPD/kget.err"; then
+    if grep -qiE "the server doesn't have a resource type|no matches for kind" "$TMPD/kget.err"; then
+      echo '{"items":[]}'
+      return 0
+    fi
+    provision::error "could not read ${what}: $(tr '\n' ' ' <"$TMPD/kget.err")"
+    provision::error "stopping before anything is applied or deleted"
+    exit 1
+  fi
+  cat "$TMPD/kget.out"
+}
 
 MANAGER="infra-skills-network-policies"
 SELECTOR="app.kubernetes.io/managed-by=${MANAGER}"
@@ -283,11 +319,89 @@ for ns in "${ALL_NS[@]}"; do
 done
 # Namespaces that run a CNPG cluster: a Cluster object (the CRD may be absent) or pods labelled
 # cnpg.io/cluster (instances, poolers, bootstrap and backup jobs).
-CNPG_NS=$({ kubectl get clusters.postgresql.cnpg.io -A -o json 2>/dev/null || echo '{"items":[]}'
-            kubectl get pods -A -l cnpg.io/cluster -o json 2>/dev/null || echo '{"items":[]}'; } \
-  | jq -rs '[.[].items[]?.metadata.namespace] | unique | join(" ")')
+CNPG_CLUSTERS_JSON=$(kget_optional "CNPG Cluster objects" get clusters.postgresql.cnpg.io -A -o json)
+CNPG_PODS_JSON=$(kget "pods labelled cnpg.io/cluster" get pods -A -l cnpg.io/cluster -o json)
+CNPG_NS=$(jq -rs '[.[].items[]?.metadata.namespace] | unique | join(" ")' <<<"$CNPG_CLUSTERS_JSON$CNPG_PODS_JSON")
 for ns in ${TARGET_NS[@]+"${TARGET_NS[@]}"}; do
   [[ "$ns" != "$NS_POSTGRES" ]] && in_list "$ns" "$CNPG_NS" && log "${ns} runs a CNPG cluster: the operator may reach its pods on 8000 and 5432"
+done
+
+# --- Pods with their own fence ------------------------------------------------
+# NetworkPolicies add up: a namespace-wide allow (same namespace, Traefik, Pomerium, Prometheus)
+# would widen a narrower ingress policy that a chart or an operator put on some pods (evse's
+# evse-from-pomerium-only, pgweb-from-pomerium-only, ...). The allows therefore leave out every pod
+# that a policy not managed here selects for ingress; those pods stay under the default deny and
+# get only what their own policy admits. Each requirement of such a podSelector becomes its
+# complement (matchLabels k=v and In -> NotIn, Exists -> DoesNotExist). A podSelector with NotIn or
+# DoesNotExist has no such complement: the run stops. A policy with an empty podSelector covers the
+# whole namespace (an extra allow, such as nexus/vpn-allow-vpn-gateway); it is no per-pod fence and
+# is left alone. pgweb and mcp-grafana are left out even before their own policies exist.
+NETPOLS_JSON=$(kget "NetworkPolicies" get networkpolicies -A -o json)
+TARGET_NS_J=$(printf '%s\n' ${TARGET_NS[@]+"${TARGET_NS[@]}"} | sed '/^$/d' | jq -R . | jq -sc .)
+FENCES_J=$(jq -c --arg m "$MANAGER" --argjson ns "$TARGET_NS_J" '[.items[]
+  | select(.metadata.namespace as $n | $ns | index($n))
+  | select((.metadata.labels["app.kubernetes.io/managed-by"] // "") != $m)
+  | select((.spec.policyTypes // ["Ingress"]) | index("Ingress"))
+  | {ns: .metadata.namespace, name: .metadata.name, sel: (.spec.podSelector // {})}]' <<<"$NETPOLS_JSON")
+sel_text() { jq -r '[(.matchLabels // {} | to_entries[] | "\(.key)=\(.value)"),
+  ((.matchExpressions // [])[] | "\(.key) \(.operator)" + (if .values then " " + (.values | join("|")) else "" end))] | join(",")'; }
+# shellcheck disable=SC2016  # a jq filter
+WHOLE_NS='((.sel.matchLabels // {}) | length) == 0 and ((.sel.matchExpressions // []) | length) == 0'
+for p in $(jq -r ".[] | select($WHOLE_NS) | \"\(.ns)/\(.name)\"" <<<"$FENCES_J"); do
+  log "${p} selects every pod of its namespace: an extra allow, not a per-pod fence; left alone"
+done
+FENCES_J=$(jq -c "[.[] | select($WHOLE_NS | not)]" <<<"$FENCES_J")
+UNSUPPORTED=$(jq -r '.[] | select(any(.sel.matchExpressions[]?; .operator != "In" and .operator != "Exists"))
+  | "\(.ns)/\(.name)"' <<<"$FENCES_J")
+if [[ -n "$UNSUPPORTED" ]]; then
+  while read -r p; do
+    provision::error "${p}: its podSelector uses NotIn or DoesNotExist, which has no exclusion the namespace-wide allows could use"
+  done <<<"$UNSUPPORTED"
+  provision::error "narrow that selector to matchLabels, In or Exists, or leave its namespace out (--skip); nothing was changed"
+  exit 1
+fi
+# Per namespace: the matchExpressions every allow policy carries.
+EXCL_J=$(jq -c --arg obs "$NS_OBS" --arg pg "$NS_POSTGRES" '
+  ([.[] | {ns, reqs: ([.sel.matchLabels // {} | to_entries[] | {key, operator: "NotIn", values: [.value]}]
+        + [.sel.matchExpressions[]? | if .operator == "In" then {key, operator: "NotIn", values}
+                                      else {key, operator: "DoesNotExist"} end])}]
+   + [{ns: $obs, reqs: [{key: "app", operator: "NotIn", values: ["mcp-grafana"]}]},
+      {ns: $pg, reqs: [{key: "app", operator: "NotIn", values: ["pgweb"]}]}])
+  | group_by(.ns) | map({key: .[0].ns, value: ([.[].reqs[]] | group_by([.key, .operator])
+      | map(if .[0].operator == "NotIn" then {key: .[0].key, operator: "NotIn", values: ([.[].values[]] | unique)}
+            else {key: .[0].key, operator: .[0].operator} end))}) | from_entries' <<<"$FENCES_J")
+# A podSelector with more than one requirement can only be left out as a superset (any of its
+# labels). Check that every live pod the allows leave out is selected by a policy of its own, or is
+# pgweb / mcp-grafana; otherwise a pod would lose its allows with nothing to admit its traffic.
+# shellcheck disable=SC2016  # a jq function
+SEL_MATCH='def matches($sel): (.metadata.labels // {}) as $l
+  | all(($sel.matchLabels // {}) | to_entries[]; $l[.key] == .value)
+  and all(($sel.matchExpressions // [])[]; . as $e | ($l[$e.key]) as $v
+    | if $e.operator == "In" then $v != null and any($e.values[]; . == $v)
+      elif $e.operator == "NotIn" then $v == null or all($e.values[]; . != $v)
+      elif $e.operator == "Exists" then $v != null
+      else $v == null end);'
+for ns in $(jq -r '[.[].ns] | unique | .[]' <<<"$FENCES_J"); do
+  PODS_JSON=$(kget "pods in ${ns}" -n "$ns" get pods -o json)
+  sel=$(jq -c --arg ns "$ns" '{matchExpressions: .[$ns]}' <<<"$EXCL_J")
+  fences=$(jq -c --arg ns "$ns" '[.[] | select(.ns == $ns) | .sel]' <<<"$FENCES_J")
+  for p in $(jq -r --arg ns "$ns" '.[] | select(.ns == $ns) | .name' <<<"$FENCES_J"); do
+    log "${ns}: allows leave out the pods of ${p} ($(jq -c --arg ns "$ns" --arg p "$p" '.[] | select(.ns == $ns and .name == $p) | .sel' <<<"$FENCES_J" | sel_text))"
+  done
+  log "${ns}: allow policies select $(jq -c '.matchExpressions' <<<"$sel" | sed 's/"//g')"
+  out=$(jq -r --argjson sel "$sel" --argjson fences "$fences" "$SEL_MATCH"'
+    .items[] | select(matches($sel) | not) | .metadata.name as $n
+    | if (. as $pod | any($fences[]; . as $f | $pod | matches($f)))
+        or ((.metadata.labels.app // "") | IN("pgweb", "mcp-grafana"))
+      then "ok \($n)" else "orphan \($n)" end' <<<"$PODS_JSON")
+  excluded=$(sed -n 's/^ok //p' <<<"$out" | paste -sd' ' -)
+  orphans=$(sed -n 's/^orphan //p' <<<"$out" | paste -sd' ' -)
+  log "${ns}: pods left out of the allows: ${excluded:-none}"
+  if [[ -n "${orphans// /}" ]]; then
+    provision::error "${ns}: pods ${orphans} would lose the namespace-wide allows, but no policy of their own selects them"
+    provision::error "(a multi-label podSelector is left out by any of its labels); narrow the labels or --skip ${ns}; nothing was changed"
+    exit 1
+  fi
 done
 
 # --- Render -------------------------------------------------------------------
@@ -311,17 +425,8 @@ from_ns_pods() { # from_ns_pods <ns> <k=v> -> a NetworkPolicyPeer
   jq -nc --arg ns "$1" --arg k "${2%%=*}" --arg v "${2#*=}" \
     '{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": $ns}}, podSelector: {matchLabels: {($k): $v}}}'
 }
-# Pods with their own narrower fence are left out of the namespace-wide allows.
-exclusions() {
-  case "$1" in
-    "$NS_OBS") echo '["mcp-grafana"]' ;;
-    "$NS_POSTGRES") echo '["pgweb"]' ;;
-    *) echo '[]' ;;
-  esac
-}
-target_pods() { # podSelector for the allow policies of <ns>
-  local ex; ex=$(exclusions "$1")
-  jq -nc --argjson ex "$ex" 'if ($ex | length) == 0 then {} else {matchExpressions: [{key: "app", operator: "NotIn", values: $ex}]} end'
+target_pods() { # podSelector for the allow policies of <ns>: every pod but those with a fence of their own
+  jq -nc --arg ns "$1" --argjson m "$EXCL_J" '($m[$ns] // []) as $e | if ($e | length) == 0 then {} else {matchExpressions: $e} end'
 }
 needs_node_sources() { in_list "$1" "$NS_RUNNER $NS_CERT $NS_CNPG"; }
 
@@ -410,8 +515,6 @@ render_runner_egress() {
         + [{to: [{ipBlock: {cidr: "0.0.0.0/0", except: $except}}]}])}')"
 }
 
-TMPD=$(mktemp -d "${TMPDIR:-/tmp}/netpol.XXXXXX")
-trap 'rm -rf "$TMPD"' EXIT
 RENDERED="$TMPD/policies.json"
 {
   if [[ "$REMOVE" != true ]]; then
@@ -439,7 +542,7 @@ log "plan: ${COUNT} policies in ${#TARGET_NS[@]} namespaces (${TARGET_NS[*]:-non
 # ship such policies (the Argo CD chart's argocd-server policy is `ingress: [{}]`; INFRA-214
 # found it reachable from a tenant node). Named here; narrowing them is the chart's setting.
 if (( ${#TARGET_NS[@]} > 0 )); then
-  kubectl get networkpolicies -A -o json 2>/dev/null | jq -r --arg m "$MANAGER" --argjson ns "$(printf '%s\n' "${TARGET_NS[@]}" | jq -R . | jq -sc .)" '
+  jq -r --arg m "$MANAGER" --argjson ns "$TARGET_NS_J" <<<"$NETPOLS_JSON" '
     .items[] | select(.metadata.namespace as $n | $ns | index($n))
     | select((.metadata.labels["app.kubernetes.io/managed-by"] // "") != $m)
     | select(any(.spec.ingress[]?; (.from // []) | length == 0))
