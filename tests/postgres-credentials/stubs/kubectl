@@ -17,7 +17,7 @@
 #     session whose SQL holds <text> gets only the lines up to the first one holding it (the
 #     connection is lost there), and the stub then fails; STUB_CUT_BEFORE=<text>: the same, but
 #     the line holding <text> is not sent either.
-#   STUB_NO_NS=1: `get ns` finds no namespace.
+#   STUB_NO_NS=1: `get ns` finds no namespace; STUB_NO_NS_CREATE=1: `create ns` fails.
 set -uo pipefail
 log="${STUB_LOG:?}"
 printf 'kubectl %s\n' "$*" >> "$log"
@@ -29,7 +29,7 @@ case "$args" in
   *" get cluster postgres-cluster "*) exit 0 ;;
   *" get pods "*) echo "postgres-cluster-1"; exit 0 ;;
   *" get ns "*) [[ "${STUB_NO_NS:-}" == 1 ]] && exit 1; exit 0 ;;
-  *" create ns "*) exit 0 ;;
+  *" create ns "*) [[ "${STUB_NO_NS_CREATE:-}" == 1 ]] && { echo "kubectl stub: namespace cannot be created" >&2; exit 1; }; exit 0 ;;
   *" apply -f - "*)
     mkdir -p "$log.applied"; n=$(find "$log.applied" -type f | wc -l | tr -d " ")
     cat > "$log.applied/stdin-$n.json"; exit 0 ;;

@@ -64,7 +64,7 @@ WORK="$(mktemp -d -t pg-credentials-test-XXXX)"
 export KUBECONFIG=/dev/null PATH="$HERE/stubs:$PATH"
 unset PG_READONLY_ROLE PG_TENANT_CONNECTION_LIMIT PG_APP_CONNECTION_LIMIT PG_MIGRATION_CONNECTION_LIMIT \
       STUB_DB_OWNERS STUB_ROLES STUB_NEED STUB_OPEN_DBS STUB_PGHOST STUB_PGPORT STUB_NO_NS STUB_NO_POOLER_ROLE \
-      STUB_OPENSSL_FAIL STUB_OPENSSL_SHORT APP_NAMESPACE STUB_INTENTS STUB_LEDGER STUB_VERIFIERS STUB_VERIFIERS_LATER STUB_CUT STUB_CUT_BEFORE STUB_OBJECTS
+      STUB_OPENSSL_FAIL STUB_OPENSSL_SHORT APP_NAMESPACE STUB_INTENTS STUB_LEDGER STUB_VERIFIERS STUB_VERIFIERS_LATER STUB_CUT STUB_CUT_BEFORE STUB_OBJECTS STUB_NO_NS_CREATE
 PW_RE='Pw0Stub[0-9]+AbCdEfGhIjKlMn\+/='
 US=$'\x1f'
 
@@ -604,6 +604,14 @@ check "--keep-password, an all-digit password: written quoted, the rest of the l
 # changes credentials (the default path keeps origin/main's order and checks at the end).
 STUB_NO_NS=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
   bad "--database, the tenant's namespace is missing (round 11 P2-a)" "Namespace symbioen does not exist: run tools/k3s/tenant.sh fake symbioen first. Nothing changed." evse-ts --tenant symbioen --database evse:JOURNAL_DB
+# Round 12 P2: not a tenant. A missing namespace is created early, before any credential SQL; one
+# that can be neither found nor created stops the run with nothing changed.
+STUB_NO_NS=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" run ns-early x --database evse
+check "--database, not a tenant, namespace missing: created, exit 0 (round 12 P2)" [ "$RC" = 0 ]
+check "--database, not a tenant: the namespace is created before any credential SQL (round 12 P2)" \
+  bash -c 'awk "/^kubectl create ns default\$/{ if (!c) c=NR } /^kubectl .* exec -i /{ n++; if (n == 2 && !e) e=NR } END{exit !(c && e && c < e)}" "$1"' _ "$D/log"
+STUB_NO_NS=1 STUB_NO_NS_CREATE=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
+  bad "--database, not a tenant, the namespace can be neither found nor created (round 12 P2)" "Namespace default does not exist and cannot be created. Nothing changed." x --database evse
 
 # --- 6. openssl failures (P2-b) -----------------------------------------------------------
 echo "== 6. password generation failures"
@@ -808,6 +816,7 @@ CREATE ROLE q10app NOLOGIN PASSWORD 'q10app-original-0123456789';
 COMMENT ON ROLE q10app IS 'infra-skills:app:q10app';
 -- round 11: a tenant database whose namespace goes missing
 CREATE DATABASE n11db;
+CREATE DATABASE n12db;
 \c evse evse_ts
 CREATE SCHEMA journal;
 CREATE TABLE journal.events (ordering bigserial PRIMARY KEY, payload text);
@@ -1452,6 +1461,18 @@ SQL
   check "real round 11 P2-a: the Secret is unchanged, and still logs in" \
     bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/n11app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$n11_secret" "$D"
   check "real round 11 P2-a: (its password logs in)" scram_login n11app "$(key "$D/fake/secrets.plain/n11app-db.secret.yaml" POSTGRES_PASSWORD)"
+  # Round 12 P2: n12app (not a tenant) on n12db; on the rerun its namespace can be neither found nor
+  # created. The run stops before any credential SQL: password and Secret stay as they were.
+  run real-n12 n12app --database n12db
+  check "real round 12 P2: first run (sanity)" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  n12_pw="$(pw_only n12app)"; n12_secret="$(cat "$D/fake/secrets.plain/n12app-db.secret.yaml")"
+  STUB_NO_NS=1 STUB_NO_NS_CREATE=1 PRE_RUN="$D" run real-n12 n12app --database n12db
+  check "real round 12 P2: a namespace that can be neither found nor created stops the rerun" \
+    bash -c '[ "$1" != 0 ] && grep -q "Namespace default does not exist and cannot be created. Nothing changed." "$2/out"' _ "$RC" "$D"
+  check "real round 12 P2: the password is unchanged" [ "$n12_pw" = "$(pw_only n12app)" ]
+  check "real round 12 P2: the Secret is unchanged, not applied" \
+    bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/n12app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$n12_secret" "$D"
+  check "real round 12 P2: (its password logs in)" scram_login n12app "$(key "$D/fake/secrets.plain/n12app-db.secret.yaml" POSTGRES_PASSWORD)"
   # Round 5 P2-b: --keep-password, and the app role's password is rotated elsewhere while the run
   # waits (a held intent row stalls it after its first check); the Secret is not applied.
   rc_dir="$WORK/real-create"

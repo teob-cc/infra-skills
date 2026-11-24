@@ -2060,12 +2060,17 @@ provision_credentials() {
     [[ "$refused" == "true" ]] && exit 1
   fi
 
-  # --database: the Secret's namespace must exist before any credential changes (read-only; a
-  # tenant's comes from tools/k3s/tenant.sh, another is created further down). The default path
-  # keeps origin/main's order (its kubectl calls are the argv golden) and checks it at the end.
-  if [[ "$existing_mode" == "true" && -n "$tenant" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
-    err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first. Nothing changed."
-    exit 1
+  # --database: the Secret's namespace is ready before any credential changes. A tenant's must
+  # exist (it comes from tools/k3s/tenant.sh); another one (APP_NAMESPACE, default) is created
+  # here, as the end of the run would. If it can be neither found nor created, nothing changes.
+  # The default path keeps origin/main's order (its kubectl calls are the argv golden) and makes
+  # the namespace ready at the end, an accepted exception.
+  if [[ "$existing_mode" == "true" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+    if [[ -n "$tenant" ]]; then
+      err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first. Nothing changed."
+      exit 1
+    fi
+    kubectl create ns "$app_namespace" || { err "Namespace ${app_namespace} does not exist and cannot be created. Nothing changed."; exit 1; }
   fi
 
   # Passwords (with --keep-password: the ones the Secret files hold, and only for a new role)
@@ -2318,7 +2323,8 @@ SQL
     exit 1
   fi
 
-  # Create secret file(s): on the default path exactly as before INFRA-243
+  # Create secret file(s). On the default path as before INFRA-243, except that the password is
+  # quoted when it is not a safe plain YAML scalar (pg_yaml_plain_ok)
   local legacy=true
   [[ "$existing_mode" == "true" ]] && legacy=false
   mkdir -p "$secrets_dir"
