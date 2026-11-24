@@ -39,7 +39,9 @@
 #      a creation cut after CREATE DATABASE (and a same-named database made by someone else), a
 #      password rotated during a run, a database owner or role comment changed or a database made
 #      again while a run waits, objects and default privileges the move cannot handle (refused
-#      before any password changes).
+#      before any password changes), another app's pending creation of a name, a renamed
+#      replacement of a created database, a move that times out with an existing role's password
+#      kept, a destination with default privileges of its own.
 #
 # Usage: tests/postgres-credentials/run.sh [--real-postgres]   (needs bash, jq, yq; --real-postgres
 #        also initdb, pg_ctl and psql on PATH). PG_SCRIPT=<path> runs another postgres.sh (for
@@ -219,23 +221,36 @@ check "--create-missing: PUBLIC revoked on the new database only" [ "$(grep -c '
 check "--create-missing: extensions only in manifest" bash -c 'grep "CREATE EXTENSION" "$1" | grep -qv -- "-d manifest" && exit 1; grep -q -- "-d manifest -qc CREATE EXTENSION" "$1"' _ "$D/log"
 check "--create-missing: the preflight reads create_intent only behind \\if :use_intent" before "$D/log.sql" "\\if :use_intent" "FROM infra_skills.create_intent i"
 # Round 5 P2-d: an earlier run created manifest and stopped before its ACL; the retry finishes it.
-STUB_INTENTS='intent|manifest|t' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest evse-ts t)" \
+STUB_INTENTS='intent|manifest|t|t|evse-ts' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest evse-ts t)" \
   run create-finish evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
 check "--create-missing, unfinished creation: exit 0 (round 5 P2-d)" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
 check "--create-missing, unfinished creation: says so" grep -q "manifest was created by an earlier run that did not finish" "$D/out"
 check "--create-missing, unfinished creation: not created again" bash -c '! grep -q "CREATE DATABASE" "$1"' _ "$D/log.sql"
 check "--create-missing, unfinished creation: PUBLIC's CONNECT is revoked on it" [ "$(grep -c 'REVOKE CONNECT, TEMPORARY ON DATABASE :"db" FROM PUBLIC' "$D/log.sql")" = 1 ]
 check "--create-missing, unfinished creation: extensions installed" grep -q -- "-d manifest -qc CREATE EXTENSION" "$D/log"
-STUB_INTENTS='intent|manifest|t' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest someone_else)" \
+STUB_INTENTS='intent|manifest|t|t|evse-ts' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest someone_else)" \
   bad "--create-missing, unfinished creation now owned by another role" "its owner is now someone_else" evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
 
 # Round 6 P2-a: a pending intent for a same-named database that is not bound to it (no oid, no marker).
-STUB_INTENTS='intent|manifest|f' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest evse-ts t)" \
+STUB_INTENTS='intent|manifest|t|f|evse-ts' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest evse-ts t)" \
   bad "--create-missing, a same-named database the intent is not bound to (round 6 P2-a)" "nothing shows it is the one an earlier run for evse-ts created" evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
-check "--create-missing: the intent is bound by oid or marker in the preflight (round 6 P2-a)" \
-  bash -c 'grep -q "i.datoid = d.oid OR shobj_description(d.oid, .pg_database.) = :.db_marker." "$1"' _ "$WORK/create-missing/log.sql"
-check "--create-missing: the new database gets the marker and the intent its oid right after CREATE DATABASE (round 6 P2-a)" \
-  bash -c 'grep -A3 "^CREATE DATABASE :\"db\" OWNER :\"owner\";" "$1" | tr "\n" " " | grep -q "COMMENT ON DATABASE :\"db\" IS :.db_marker.; UPDATE infra_skills.create_intent SET datoid"' _ "$WORK/create-missing/log.sql"
+check "--create-missing: the intent is bound by its oid once recorded, else by that creation's marker (round 7 P2-b)" \
+  bash -c 'grep -q "CASE WHEN i.datoid IS NOT NULL THEN i.datoid = d.oid" "$1" && grep -q "ELSE shobj_description(d.oid, .pg_database.) = .infra-skills:created:. || i.app || .:. || i.nonce END" "$1"' _ "$WORK/create-missing/log.sql"
+check "--create-missing: the new database gets its creation's marker and the intent its oid right after CREATE DATABASE (round 7 P2-b)" \
+  bash -c 'grep -A3 "^CREATE DATABASE :\"db\" OWNER :\"owner\";" "$1" | tr "\n" " " | grep -q "COMMENT ON DATABASE :\"db\" IS :.c_marker.; UPDATE infra_skills.create_intent SET datoid"' _ "$WORK/create-missing/log.sql"
+check "--create-missing: each creation's nonce is recorded with the intent, before CREATE DATABASE (round 7 P2-b)" \
+  before "$WORK/create-missing/log.sql" "VALUES (:'db', :'app', true, gen_random_uuid()::text)" 'CREATE DATABASE :"db" OWNER :"owner";'
+check "--create-missing: the ACL runs in a transaction that checks the database's identity first (round 7 P2-b)" \
+  bash -c 'awk "/its ACL is left as it is/{c=NR} /ON DATABASE :\"db\" FROM PUBLIC;/{ if (c && !r) r=NR } /^COMMIT;/{ if (r && !m) m=NR } END{exit !(c && r > c && m > r)}" "$1"' _ "$WORK/create-missing/log.sql"
+check "--create-missing: intents are claimed and finished by (app, name) (round 7 P2-a)" \
+  bash -c 'grep -q "belongs to another app; nothing created" "$1" && grep -q "SET done_at = now() WHERE datname = :.db. AND app = :.app. AND done_at IS NULL" "$1"' _ "$WORK/create-missing/log.sql"
+check "--create-missing: the refusal says how to finish the ACL by hand (round 7 P3)" \
+  grep -q "fake --provision-credentials evse-ts --database manifest\[:<PREFIX>\] --revoke-public --keep-connect" "$D/out"
+# Round 7 P2-a: another app's pending creation of the same database name, made or not.
+STUB_INTENTS='intent|manifest|f|f|other-app' STUB_DB_OWNERS="$(dbrow evse scala_owner; nodb manifest)" \
+  bad "--create-missing, another app's pending creation of that name, database not made (round 7 P2-a)" "app other-app has a pending creation of a database by that name" evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
+STUB_INTENTS='intent|manifest|f|f|other-app' STUB_DB_OWNERS="$(dbrow evse scala_owner; dbrow manifest evse-ts t)" \
+  bad "--create-missing, another app's pending creation of that name, database made (round 7 P2-a)" "app other-app has a pending creation of a database by that name" evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
 
 # --revoke-public --keep-connect (P1-d)
 bad "--revoke-public without --keep-connect" "--revoke-public needs --keep-connect" x --database evse --revoke-public
@@ -330,6 +345,21 @@ check "--take-ownership: the ledger insert takes the database by the preflight's
   bash -c 'grep -q "^\\\\set datoid 17700$" "$1" && grep -q "WHERE d.oid = :datoid AND d.datname = :.db. AND n.oid = :dest_goid AND n.rolname = :.owner." "$1" && grep -q "was dropped and made again since the preflight (another oid under the same name)" "$1"' _ "$D/log.sql"
 check "--take-ownership: the guarded oid comes from the role transaction (round 6 P1-2)" \
   bash -c 'grep -B1 "^COMMIT;" "$1" | grep -q "SELECT oid AS app_goid FROM pg_roles WHERE rolname = :.role. \\\\gset" && grep -q "^\\\\set dest_goid :app_goid$" "$1"' _ "$D/log.sql"
+# Round 7 P2-c: with moves, an existing role's new password comes only after every move committed;
+# a role made in this run gets its password when it is created.
+STUB_ROLES="$(rolerow app x; rolerow migrate x_mig)" STUB_DB_OWNERS="$(dbrow evse scala_owner)" run own-late x --database evse --take-ownership --migration-role x_mig
+check "--take-ownership, existing roles: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+check "--take-ownership, existing roles: no password before the move (round 7 P2-c)" \
+  bash -c 'awk "/PASSWORD :.pw./{ if (!p) p=NR } /ALTER DATABASE %I OWNER TO/{a=NR} END{exit !(a && p > a)}" "$1"' _ "$D/log.sql"
+check "--take-ownership, existing roles: both passwords after it, each in a guarded transaction (round 7 P2-c)" \
+  bash -c '[ "$(awk "/ALTER DATABASE %I OWNER TO/{a=1} a && /WITH LOGIN PASSWORD :.pw./{n++} END{print n+0}" "$1")" = 2 ] && [ "$(awk "/ALTER DATABASE %I OWNER TO/{a=1} a && /LOCK TABLE pg_catalog.pg_authid/{n++} END{print n+0}" "$1")" = 2 ]' _ "$D/log.sql"
+STUB_DB_OWNERS="$(dbrow evse scala_owner)" run own-new x --database evse --take-ownership
+check "--take-ownership, a role made in this run: its password at creation, before the move (round 7 P2-c)" before "$D/log.sql" "PASSWORD :'pw'" "ALTER DATABASE %I OWNER TO"
+# Round 7 P2-d: the destination already has other default privileges in the database.
+STUB_OBJECTS='dstacl|evse|tables: x has PUBLIC SELECT, the copy from the old owner gives nothing' STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
+  bad "--take-ownership, the destination's own default privileges differ (round 7 P2-d)" "x already has default privileges that differ from what the copy would give: tables: x has PUBLIC SELECT, the copy from the old owner gives nothing" x --database evse --take-ownership
+check "--take-ownership: the destination's default privileges are compared in the second preflight (round 7 P2-d)" \
+  bash -c 'awk "/^-- infra-skills:preflight-objects/{p=1} /^-- ### /{p=0} p" "$1" | grep -q "SELECT .dstacl."' _ "$WORK/own-new/log.sql"
 # --- 3. migration role --------------------------------------------------------------------
 echo "== 3. --migration-role"
 run mig evse-ts --tenant symbioen --pooler --database evse:JOURNAL_DB --database evse_ts:STATE_DB --migration-role \
@@ -670,8 +700,8 @@ GRANT p2c TO p2c_grp;
 GRANT p2c_grp TO p2c_migrate;
 -- P3: a NOINHERIT member of a group that holds CONNECT still relies on PUBLIC
 CREATE ROLE p3grp;
-CREATE ROLE noinh LOGIN NOINHERIT;
-GRANT p3grp TO noinh;
+CREATE ROLE aaa_noinh LOGIN NOINHERIT;
+GRANT p3grp TO aaa_noinh;
 CREATE DATABASE p3db;
 GRANT CONNECT ON DATABASE p3db TO p3grp;
 -- round 6: adoptable roles changed concurrently; a database made again; objects and default
@@ -686,6 +716,14 @@ CREATE ROLE unsup_src LOGIN;
 CREATE DATABASE unsup OWNER unsup_src;
 CREATE ROLE dacl_src LOGIN;
 CREATE DATABASE dacl OWNER dacl_src;
+-- round 7: a move with an existing app role under a held lock; a destination with its own
+-- default privileges
+CREATE ROLE lock_src NOLOGIN;
+CREATE DATABASE lockdb OWNER lock_src;
+CREATE ROLE d7src NOLOGIN;
+CREATE DATABASE d7db OWNER d7src;
+CREATE ROLE d7app NOLOGIN PASSWORD 'd7app-original-0123456789';
+COMMENT ON ROLE d7app IS 'infra-skills:app:d7app';
 \c evse evse_ts
 CREATE SCHEMA journal;
 CREATE TABLE journal.events (ordering bigserial PRIMARY KEY, payload text);
@@ -1021,6 +1059,37 @@ SQL
   check "real round 6 P2-c: and the grant option" grep -q "tables: SELECT to other_reader WITH GRANT OPTION" "$D/out"
   check "real round 6 P2-c: nothing changed (no role dacl-app, dacl and its table keep their owner)" \
     bash -c '[ -z "$1" ] && [ "$2" = dacl_src ] && [ "$3" = dacl_src ]' _ "$(pw_of dacl-app)" "$(owner_of_db dacl)" "$(q postgres dacl "SELECT tableowner FROM pg_tables WHERE tablename='dt'")"
+  # Round 7 P2-c: lock-app exists (grant mode first) with its Secret. Its --take-ownership run times
+  # out on a held table lock: its password and Secret stay as they were. The retry completes.
+  q postgres lockdb "SET ROLE lock_src; CREATE TABLE public.lt (x int)" >/dev/null || fail "real round 7 P2-c: fixture table"
+  run real-lock lock-app --database lockdb
+  check "real round 7 P2-c: grant mode first (sanity)" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  lock_pw="$(pw_only lock-app)"; lock_secret="$(cat "$D/fake/secrets.plain/lock-app-db.secret.yaml")"
+  hold lockdb "LOCK TABLE public.lt IN ACCESS EXCLUSIVE MODE;" || fail "real round 7 P2-c: lock holder did not start"
+  PRE_RUN="$D" run real-lock lock-app --database lockdb --take-ownership
+  release
+  check "real round 7 P2-c: the move times out" bash -c '[ "$1" != 0 ] && grep -q "canceling statement due to lock timeout" "$2/out"' _ "$RC" "$D"
+  check "real round 7 P2-c: the existing role's password is unchanged" [ "$lock_pw" = "$(pw_only lock-app)" ]
+  check "real round 7 P2-c: and its Secret file too, nothing applied" \
+    bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/lock-app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$lock_secret" "$D"
+  check "real round 7 P2-c: the old Secret's password still logs in" scram_login lock-app "$(key "$D/fake/secrets.plain/lock-app-db.secret.yaml" POSTGRES_PASSWORD)"
+  PRE_RUN="$D" run real-lock lock-app --database lockdb --take-ownership; collect
+  check "real round 7 P2-c: the retry completes" bash -c '[ "$1" = 0 ] && [ "$2" = lock-app ] && [ "$3" = lock-app ]' _ "$RC" "$(owner_of_db lockdb)" \
+    "$(q postgres lockdb "SELECT tableowner FROM pg_tables WHERE tablename='lt'")"
+  check "real round 7 P2-c: with a new password, in the new Secret" \
+    bash -c '[ "$1" != "$2" ]' _ "$lock_pw" "$(pw_only lock-app)"
+  check "real round 7 P2-c: the new Secret's password logs in" scram_login lock-app "$(key "$D/fake/secrets.plain/lock-app-db.secret.yaml" POSTGRES_PASSWORD)"
+  # Round 7 P2-d: the destination d7app already has a PUBLIC SELECT default in d7db; the copy from
+  # d7src would not give it. Refused before any change, both sides printed.
+  q postgres d7db "ALTER DEFAULT PRIVILEGES FOR ROLE d7app GRANT SELECT ON TABLES TO PUBLIC" >/dev/null || fail "real round 7 P2-d: fixture"
+  q postgres d7db "SET ROLE d7src; CREATE TABLE public.d7t (x int)" >/dev/null || fail "real round 7 P2-d: fixture table"
+  d7_pw="$(pw_only d7app)"
+  run real-d7 d7app --database d7db --take-ownership
+  check "real round 7 P2-d: a destination with its own PUBLIC SELECT default is refused" [ "$RC" != 0 ]
+  check "real round 7 P2-d: both sides printed" \
+    grep -q "d7app already has default privileges that differ from what the copy would give: tables: d7app has PUBLIC SELECT, the copy from the old owner gives nothing" "$D/out"
+  check "real round 7 P2-d: nothing changed (password, owners)" \
+    bash -c '[ "$1" = "$2" ] && [ "$3" = d7src ] && [ "$4" = d7src ]' _ "$d7_pw" "$(pw_only d7app)" "$(owner_of_db d7db)" "$(q postgres d7db "SELECT tableowner FROM pg_tables WHERE tablename='d7t'")"
 
   # Round 4 P1-2: SHARE ROW EXCLUSIVE on pg_database holds off ALTER DATABASE OWNER (PG14)...
   hold postgres "LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;" || fail "real P1-2: lock holder did not start"
@@ -1123,7 +1192,7 @@ SQL
   check "real round 5 P2-d: the app role connects" can p2dapp p2d_new "SELECT 1"
   check "real round 5 P2-d: the intent is done" [ "$(q postgres postgres "SELECT count(*) FROM infra_skills.create_intent WHERE datname='p2d_new' AND done_at IS NOT NULL")" = 1 ]
   check "real round 6 P2-a: the database the run made carries its marker" \
-    [ "$(q postgres postgres "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname='p2d_new'")" = infra-skills:created:p2dapp ]
+    bash -c '[[ "$1" == infra-skills:created:p2dapp:?* ]]' _ "$(q postgres postgres "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname='p2d_new'")"
   # Round 6 P2-a: the session is cut before CREATE DATABASE (the intent is recorded); then someone
   # else makes a database of that name, owned by the same role. The retry must not take it for its own.
   STUB_CUT_BEFORE='CREATE DATABASE' run real-p2a p2aapp --database p2a_new --create-missing
@@ -1139,10 +1208,36 @@ SQL
   check "real round 6 P2-a: a database cut off before its marker is not finished blindly either" \
     bash -c '[ "$1" != 0 ] && grep -q "nothing shows it is the one" "$2/out"' _ "$RC" "$D"
   check "real round 6 P2-a: PUBLIC is untouched on it" can stranger p2a2_new "SELECT 1"
+  check "real round 7 P3: the refusal spells out the ACL step (--revoke-public --keep-connect)" \
+    grep -q "fake --provision-credentials p2a2app --database p2a2_new\[:<PREFIX>\] --revoke-public --keep-connect" "$D/out"
+  # Round 7 P2-a: app p7a's creation of p7db is cut before CREATE DATABASE; app p7b then asks for a
+  # database of the same name. It is refused, and p7a's pending intent stays exactly as it was.
+  STUB_CUT_BEFORE='CREATE DATABASE' run real-p7a p7a --database p7db --create-missing
+  intent_of() { q postgres postgres "SELECT row_to_json(i)::text FROM infra_skills.create_intent i WHERE datname = '$1'" || true; }   # the whole row, any version
+  p7_before="$(intent_of p7db)"
+  check "real round 7 P2-a: p7a's intent is pending, no database yet (sanity)" bash -c '[[ "$1" == *"\"app\":\"p7a\""* && "$1" == *"\"done_at\":null"* && -z "$2" ]]' _ "$p7_before" "$(owner_of_db p7db)"
+  run real-p7b p7b --database p7db --create-missing
+  check "real round 7 P2-a: another app with the same database name is refused" \
+    bash -c '[ "$1" != 0 ] && grep -q "app p7a has a pending creation of a database by that name" "$2/out"' _ "$RC" "$D"
+  check "real round 7 P2-a: p7a's intent row is unchanged, and no database p7db was made" \
+    bash -c '[ "$1" = "$2" ] && [ -z "$3" ]' _ "$p7_before" "$(intent_of p7db)" "$(owner_of_db p7db)"
+  # Round 7 P2-b: p7r's creation is cut after the intent recorded its oid; someone renames p7rdb
+  # away and makes a replacement with the app-wide marker an earlier version used. The retry must
+  # require the recorded oid.
+  STUB_CUT='UPDATE infra_skills.create_intent SET datoid' run real-p7r p7r --database p7rdb --create-missing
+  check "real round 7 P2-b: the intent recorded the oid (sanity)" \
+    [ "$(q postgres postgres "SELECT (datoid = (SELECT oid FROM pg_database WHERE datname = 'p7rdb'))::text FROM infra_skills.create_intent WHERE datname = 'p7rdb'")" = true ]
+  q postgres postgres "ALTER DATABASE p7rdb RENAME TO p7rdb_old" >/dev/null || fail "real round 7 P2-b: rename"
+  q postgres postgres "CREATE DATABASE p7rdb OWNER p7r" >/dev/null || fail "real round 7 P2-b: replacement"
+  q postgres postgres "COMMENT ON DATABASE p7rdb IS 'infra-skills:created:p7r'" >/dev/null || fail "real round 7 P2-b: marker"
+  PRE_RUN="$D" run real-p7r p7r --database p7rdb --create-missing
+  check "real round 7 P2-b: a renamed replacement with the app's marker is refused" \
+    bash -c '[ "$1" != 0 ] && grep -q "nothing shows it is the one an earlier run for p7r created" "$2/out"' _ "$RC" "$D"
+  check "real round 7 P2-b: PUBLIC is untouched on the replacement" can stranger p7rdb "SELECT 1"
   # Round 5 P2-b: --keep-password, and the app role's password is rotated elsewhere while the run
   # waits (a held intent row stalls it after its first check); the Secret is not applied.
   rc_dir="$WORK/real-create"
-  hold postgres "INSERT INTO infra_skills.create_intent (datname, app, revoke_public) VALUES ('p2b_new', 'x', true);" || fail "real P2-b: holder did not start"
+  hold postgres "INSERT INTO infra_skills.create_intent (datname, app, revoke_public, nonce) VALUES ('p2b_new', 'x', true, 'held');" || fail "real P2-b: holder did not start"
   p2b_secret_before="$(cat "$rc_dir/fake/secrets.plain/evse-ts-db.secret.yaml")"
   ( PRE_RUN="$rc_dir" run real-create evse-ts --tenant symbioen --pooler --database evse:JOURNAL_DB --database manifest:MANIFEST_DB \
       --database p2b_new:P2B_DB --create-missing --migration-role --keep-password; echo "$RC" > "$WORK/p2b.rc" ) &
@@ -1164,7 +1259,7 @@ SQL
   check "real round 5 P2-b: the rotated password still logs in" scram_login evse-ts rotated-elsewhere-0123456789abcdef
   # Round 5 P3: a NOINHERIT member of the group holding CONNECT still relies on PUBLIC.
   run real-p3 p3app --database p3db
-  check "real round 5 P3: the PUBLIC warning names the NOINHERIT member" grep -q "connect through PUBLIC only: .*noinh" "$D/out"
+  check "real round 5 P3: the PUBLIC warning names the NOINHERIT member" grep -q "connect through PUBLIC only: .*aaa_noinh" "$D/out"
   run real-default my-app --migration-role --migration-schema my-app.flyway; collect
   check "real default + migration role: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
   check "real default: my-app owns database my-app" [ "$(owner_of_db my-app)" = my-app ]

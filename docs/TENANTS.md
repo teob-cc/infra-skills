@@ -154,7 +154,7 @@ five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. Th
 | Flag | What it does |
 | --- | --- |
 | `--database <name>[:<PREFIX>]` | Repeatable. Use these databases instead of creating `<app>`. With a prefix, the Secret gets `<PREFIX>_HOST`, `_PORT`, `_DATABASE`, `_USERNAME` and `_PASSWORD` for that database; without one, `POSTGRES_*` (at most one database can go without). A database that does not exist is an error. |
-| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. The intent is recorded in `infra_skills.create_intent` first: if the run stops after creating the database, the next run with `--create-missing` finishes it (PUBLIC's CONNECT revoked, grants) instead of taking it for an existing one. Right after `CREATE DATABASE` the database gets the marker `COMMENT ON DATABASE ... IS 'infra-skills:created:<app>'` and the intent its oid; a retry finishes only a database that one of the two names, and refuses a same-named database someone else made (PUBLIC untouched). |
+| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. The intent is recorded in `infra_skills.create_intent` first, for this app and name, with a nonce for this one creation: if the run stops after creating the database, the next run of this app with `--create-missing` finishes it (PUBLIC's CONNECT revoked, grants) instead of taking it for an existing one. Another app's pending creation of the same name is refused, whether that database exists yet or not. Right after `CREATE DATABASE` the database gets the marker `COMMENT ON DATABASE ... IS 'infra-skills:created:<app>:<nonce>'` and the intent its oid. A retry finishes only the database with that oid (or, if the run stopped before the oid was recorded, with that creation's marker), checks it again in the transaction that closes PUBLIC, and refuses any other same-named database (PUBLIC untouched). The refusal prints how to finish by hand: identify the database, then `--database <db> --revoke-public --keep-connect ...`, then delete the intent row. |
 | `--revoke-public` | Revoke PUBLIC's CONNECT and TEMPORARY on the named databases. Needs `--keep-connect`. Off by default. |
 | `--keep-connect <role>[,<role>]` | With `--revoke-public`: the roles, besides the owner, that keep CONNECT (`none` for no other role). |
 | `--take-ownership` | Move each named database to the migration role (or the app role): the old owner's objects in it, then the database, in one transaction, then a check. Never its other databases or tablespaces. Off by default. |
@@ -230,8 +230,16 @@ database to move. It refuses the run when the old owner owns objects there that 
 not handle (operators, collations, text search objects and the like: the message names their
 catalogs, to move by hand first), or has default privileges that `GRANT` cannot copy exactly (a
 grant option, or a privilege revoked from the built-in defaults, such as PUBLIC's EXECUTE on
-functions): the message prints them. It warns about what stays with the old owner: extensions it
-owns, and its objects inside any extension, its own or another role's.
+functions): the message prints them. It also refuses when the new owner already has default
+privileges in that database that differ from what the copy would give (the grants this script
+manages for the app and migration roles aside), and prints both sides. It warns about what stays
+with the old owner: extensions it owns, and its objects inside any extension, its own or another
+role's.
+
+With moves, a role that already exists keeps its current password until every move has
+committed: a move that fails (a lock timeout, say) leaves the password and the Secret as they
+were, and the retry completes the run. Its new password is set at the end of the session, in
+its guarded transaction again. A role this run creates gets its password when it is created.
 
 Once the preflight has passed, and before anything moves, the run records each database's oid as
 the preflight saw it, that owner, and the destination role as its transaction guarded it, in

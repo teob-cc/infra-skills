@@ -1097,9 +1097,9 @@ SQL
 #        role of this run, or it of this one, by any path>
 #   need <role> <exists>
 #   ledger <schema owner ok> <tables' owner and kind ok> <columns ok>   (--take-ownership, --revoke-public, --create-missing)
-#   intent <database> <bound: the intent is this app's and names this database (its oid, or its
-#          COMMENT ON DATABASE marker infra-skills:created:<app-id>)>   (--create-missing: an earlier
-#          run recorded it and did not finish)
+#   intent <database> <it is this app's> <bound: this app's, and it names this database: by the oid
+#          it recorded, or, before that, by the marker of that one creation (COMMENT ON DATABASE
+#          infra-skills:created:<app-id>:<nonce>)> <its app>   (--create-missing: a pending intent)
 #   db <name> <exists> <owner> <owner is the new owner> <transfer pending> <old owner> <old owner is
 #      the new owner> <old owner privileged> <PUBLIC has CONNECT> <roles connected now only
 #      through PUBLIC> <login roles relying on PUBLIC> <pending transfer's destination> <that
@@ -1161,7 +1161,7 @@ SELECT to_regclass('infra_skills.ownership_transfer') IS NOT NULL AS l_exists,
          OR (SELECT count(*) = 6 AND count(*) FILTER (WHERE attname IN ('datoid', 'datname', 'from_role', 'to_role', 'started_at', 'done_at')) = 6
                FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.ownership_transfer') AND attnum > 0 AND NOT attisdropped))
        AND (to_regclass('infra_skills.create_intent') IS NULL
-         OR (SELECT count(*) = 6 AND count(*) FILTER (WHERE attname IN ('datname', 'app', 'revoke_public', 'started_at', 'done_at', 'datoid')) = 6
+         OR (SELECT count(*) = 7 AND count(*) FILTER (WHERE attname IN ('datname', 'app', 'revoke_public', 'started_at', 'done_at', 'datoid', 'nonce')) = 7
                FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.create_intent') AND attnum > 0 AND NOT attisdropped)) AS l_cols_ok \gset
 SELECT 'ledger', :'l_schema_ok', :'l_table_ok', :'l_cols_ok';
 SELECT (:'l_schema_ok'::boolean AND :'l_table_ok'::boolean AND :'l_cols_ok'::boolean) AS l_trusted \gset
@@ -1170,12 +1170,16 @@ SQL
   # Only --create-missing reads create_intent, and only --take-ownership ownership_transfer; each
   # only once the checks above passed.
   if [[ "$PG_CREATE_MISSING" == "true" ]]; then
-    printf '\\set app_id %s\n\\set db_marker %s\n' "'${app_id}'" "'${PG_ROLE_MARKER}:created:${app_id}'"
+    printf '\\set app_id %s\n' "'${app_id}'"
+    # A pending intent is bound to its database by the oid it recorded right after CREATE DATABASE;
+    # before that oid is recorded, only by the marker of that one creation (its nonce).
     cat <<'SQL'
 SELECT (:'l_trusted'::boolean AND :'i_exists'::boolean) AS use_intent \gset
 \if :use_intent
-SELECT 'intent', i.datname,
-       coalesce(i.app = :'app_id' AND (i.datoid = d.oid OR shobj_description(d.oid, 'pg_database') = :'db_marker'), false)
+SELECT 'intent', i.datname, (i.app = :'app_id'),
+       coalesce(i.app = :'app_id' AND CASE WHEN i.datoid IS NOT NULL THEN i.datoid = d.oid
+                                           ELSE shobj_description(d.oid, 'pg_database') = 'infra-skills:created:' || i.app || ':' || i.nonce END, false),
+       regexp_replace(i.app, '[[:cntrl:]]', '?', 'g')
   FROM infra_skills.create_intent i LEFT JOIN pg_database d ON d.datname = i.datname
  WHERE i.done_at IS NULL AND i.datname = ANY (string_to_array(:'targets', ' '));
 \endif
@@ -1241,7 +1245,7 @@ SQL
 pg_sql_app_role() {
   printf '\\set role %s\n\\set stmt_to %s\n\\set idle_to %s\n' \
     "'${app_username}'" "'${statement_timeout}'" "'${idle_tx_timeout}'"
-  pg_sql_role_tx role app "$app_oid" "$mig_role" "$app_pw_set" app_verifier "$conn_limit" true
+  pg_sql_role_tx role app "$app_oid" "$mig_role" "${app_pw_now:-$app_pw_set}" app_verifier "$conn_limit" true
   cat <<'SQL'
 SELECT format('ALTER ROLE %I SET statement_timeout = %L', :'role', :'stmt_to') WHERE :'stmt_to' <> '' \gexec
 SELECT format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', :'role', :'idle_to') WHERE :'idle_to' <> '' \gexec
@@ -1254,7 +1258,7 @@ SQL
 # that). Needs :role set.
 pg_sql_migration_role() {
   printf '\\set mrole %s\n' "'${mig_role}'"
-  pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" "$mig_pw_set" mig_verifier "$mig_conn_limit" true
+  pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" "${mig_pw_now:-$mig_pw_set}" mig_verifier "$mig_conn_limit" true
   cat <<'SQL'
 ALTER ROLE :"mrole" SET statement_timeout = 0;
 ALTER ROLE :"mrole" SET idle_in_transaction_session_timeout = 0;
@@ -1338,6 +1342,9 @@ pg_migration_schemas() {
 #   defacl <database> <entries>     default privileges of the source that GRANT cannot reproduce
 #                                   exactly (a grant option, or a privilege revoked from the
 #                                   built-in default): the run refuses and prints them;
+#   dstacl <database> <both sides>  the destination already has default privileges here that
+#                                   differ from what the copy from the source would give (the
+#                                   grants this script manages aside): the run refuses and prints both;
 #   extskip <database> <what>       extensions of the source, and the source's members of any
 #                                   extension: they stay with the source (a warning).
 pg_sql_preflight_objects() {
@@ -1345,7 +1352,8 @@ pg_sql_preflight_objects() {
   printf '%s\n' '-- infra-skills:preflight-objects' 'SET client_min_messages = warning;'
   for i in "${!target_names[@]}"; do
     [[ "${t_transfer[$i]}" == "true" ]] || continue
-    printf '\\set db %s\n\\set src %s\n\\c :"db"\n' "'${target_names[$i]}'" "${t_src_oid[$i]}"
+    printf '\\set db %s\n\\set src %s\n\\set dst %s\n\\set app_r %s\n\\set mig_r %s\n\\c :"db"\n' \
+      "'${target_names[$i]}'" "${t_src_oid[$i]}" "'${new_owner}'" "'${app_username}'" "'${mig_role}'"
     cat <<'SQL'
 SELECT 'objects', current_database(), string_agg(DISTINCT s.classid::regclass::text, ', ')
   FROM pg_shdepend s
@@ -1385,6 +1393,31 @@ SELECT 'defacl', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
          WHERE a.defaclrole = :src AND a.defaclnamespace = 0
            AND NOT EXISTS (SELECT FROM aclexplode(a.defaclacl) e WHERE e.grantee = d.grantee AND e.privilege_type = d.privilege_type)) x
 HAVING count(*) > 0;
+WITH norm AS (
+  -- default privileges of the source and the destination here, without each role's own entries,
+  -- the grants this script manages (to the app, migration and destination roles) and, for global
+  -- entries, the built-in defaults
+  SELECT a.defaclrole AS role, a.defaclobjtype AS t, a.defaclnamespace AS ns,
+         format('%s %s%s', CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE regexp_replace(pg_get_userbyid(e.grantee), '[[:cntrl:]]', '?', 'g') END,
+                e.privilege_type, CASE WHEN e.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) AS entry
+    FROM pg_default_acl a CROSS JOIN LATERAL aclexplode(a.defaclacl) e
+   WHERE a.defaclrole IN (:src, coalesce((SELECT oid FROM pg_roles WHERE rolname = :'dst'), 0))
+     AND e.grantee <> a.defaclrole
+     AND e.grantee NOT IN (SELECT oid FROM pg_roles WHERE rolname IN (:'dst', :'app_r', :'mig_r'))
+     AND NOT (a.defaclnamespace = 0 AND EXISTS (
+           SELECT FROM aclexplode(acldefault((CASE a.defaclobjtype WHEN 'S' THEN 's' ELSE a.defaclobjtype::text END)::"char", a.defaclrole)) d
+            WHERE d.grantee = e.grantee AND d.privilege_type = e.privilege_type))
+), side AS (
+  SELECT (role = :src) AS is_src, t, ns, string_agg(entry, ', ' ORDER BY entry) AS l FROM norm GROUP BY 1, 2, 3
+)
+SELECT 'dstacl', current_database(),
+       string_agg(format('%s%s: %s has %s, the copy from the old owner gives %s',
+                         CASE d.t WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions' WHEN 'T' THEN 'types' ELSE 'schemas' END,
+                         CASE WHEN d.ns <> 0 THEN ' in schema ' || quote_ident((SELECT nspname FROM pg_namespace WHERE oid = d.ns)) ELSE '' END,
+                         :'dst', d.l, coalesce(s.l, 'nothing')), '; ')
+  FROM side d LEFT JOIN side s ON s.is_src AND s.t = d.t AND s.ns = d.ns
+ WHERE NOT d.is_src AND d.l IS DISTINCT FROM s.l
+HAVING count(*) > 0;
 SELECT 'extskip', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
   FROM (SELECT format('extension %s (its own)', regexp_replace(x.extname, '[[:cntrl:]]', '?', 'g')) AS d
           FROM pg_extension x WHERE x.extowner = :src
@@ -1413,25 +1446,53 @@ pg_sql_existing_db() {
   [[ "$PG_REVOKE_PUBLIC" == "true" || "${t_creates[$i]}" == "true" ]] && revoke=true
   printf '\\set db %s\n' "'${db}'"
   if [[ "${t_creates[$i]}" == "true" ]]; then
-    # The intent first: a run that stops after CREATE DATABASE leaves it pending, and the next run
-    # with --create-missing finishes the database (PUBLIC's CONNECT revoked) instead of taking it
-    # for an existing one. CREATE DATABASE is not conditional: a database someone else made since
-    # the preflight stops the run. Right after it, the database gets this app's marker (COMMENT ON
-    # DATABASE infra-skills:created:<app-id>) and the intent its oid: a retry finishes only the
-    # database one of these two names, never a same-named one made by someone else.
-    printf '\\set app %s\n\\set db_marker %s\n' "'${app_id}'" "'${PG_ROLE_MARKER}:created:${app_id}'"
+    # The intent first, claimed by (app, name): a run that stops after CREATE DATABASE leaves it
+    # pending, and the next run of this app with --create-missing finishes the database (PUBLIC's
+    # CONNECT revoked) instead of taking it for an existing one; another app's pending intent for
+    # the name is never taken over (the preflight refused it; checked again here). Each creation
+    # gets a nonce: right after CREATE DATABASE (not conditional: a database someone else made
+    # since the preflight stops the run) the database gets the marker infra-skills:created:<app-id>:
+    # <nonce> and the intent its oid. A retry finishes only the database that oid names, or, if the
+    # run stopped before the oid was recorded, the one with that creation's marker.
+    printf '\\set app %s\n' "'${app_id}'"
     cat <<'SQL'
-INSERT INTO infra_skills.create_intent AS t (datname, app, revoke_public) VALUES (:'db', :'app', true)
-ON CONFLICT (datname) DO UPDATE SET app = excluded.app, revoke_public = true, started_at = now(), done_at = NULL, datoid = NULL
+INSERT INTO infra_skills.create_intent AS t (datname, app, revoke_public, nonce) VALUES (:'db', :'app', true, gen_random_uuid()::text)
+ON CONFLICT (datname) DO UPDATE SET app = excluded.app, revoke_public = true, nonce = excluded.nonce, started_at = now(), done_at = NULL, datoid = NULL
  WHERE t.done_at IS NOT NULL;
+SELECT set_config('infra_skills.c_db', :'db', false) AS c_db_set, set_config('infra_skills.c_app', :'app', false) AS c_app_set \gset
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM infra_skills.create_intent
+                  WHERE datname = current_setting('infra_skills.c_db') AND app = current_setting('infra_skills.c_app') AND done_at IS NULL) THEN
+    RAISE EXCEPTION 'infra-skills: the pending creation of database % belongs to another app; nothing created', current_setting('infra_skills.c_db');
+  END IF;
+END
+$$;
+SELECT 'infra-skills:created:' || app || ':' || nonce AS c_marker FROM infra_skills.create_intent
+ WHERE datname = :'db' AND app = :'app' AND done_at IS NULL \gset
 SQL
     if [[ "${t_finish[$i]}" != "true" ]]; then
       echo 'CREATE DATABASE :"db" OWNER :"owner";'
-      echo "COMMENT ON DATABASE :\"db\" IS :'db_marker';"
+      echo "COMMENT ON DATABASE :\"db\" IS :'c_marker';"
     fi
     cat <<'SQL'
-UPDATE infra_skills.create_intent SET datoid = (SELECT oid FROM pg_database WHERE datname = :'db' AND shobj_description(oid, 'pg_database') = :'db_marker')
- WHERE datname = :'db' AND done_at IS NULL AND datoid IS NULL;
+UPDATE infra_skills.create_intent SET datoid = (SELECT oid FROM pg_database WHERE datname = :'db' AND shobj_description(oid, 'pg_database') = :'c_marker')
+ WHERE datname = :'db' AND app = :'app' AND done_at IS NULL AND datoid IS NULL;
+-- The ACL of a database this run (or an earlier one) created: one transaction that holds off a
+-- rename or drop (pg_database) and first checks it is still the recorded database, by oid and
+-- by that creation's marker.
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM infra_skills.create_intent i JOIN pg_database x ON x.oid = i.datoid AND x.datname = i.datname
+                  WHERE i.datname = current_setting('infra_skills.c_db') AND i.app = current_setting('infra_skills.c_app') AND i.done_at IS NULL
+                    AND shobj_description(x.oid, 'pg_database') = 'infra-skills:created:' || i.app || ':' || i.nonce) THEN
+    RAISE EXCEPTION 'infra-skills: database % is not the one this app''s creation recorded (its oid and marker); its ACL is left as it is', current_setting('infra_skills.c_db');
+  END IF;
+END
+$$;
 SQL
   fi
   if [[ "${t_transfer[$i]}" == "true" ]]; then
@@ -1469,6 +1530,7 @@ SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db', :'ro_keep') WHERE :'r
 REVOKE CONNECT, TEMPORARY ON DATABASE :"db" FROM PUBLIC;
 SQL
   fi
+  [[ "${t_creates[$i]}" == "true" ]] && echo 'COMMIT;'
   cat <<'SQL'
 \c :"db"
 SET client_min_messages = warning;
@@ -1483,7 +1545,7 @@ SQL
     echo "UPDATE infra_skills.ownership_transfer SET done_at = now() WHERE datoid = :l_datoid AND done_at IS NULL;"
   fi
   if [[ "${t_creates[$i]}" == "true" ]]; then
-    echo "UPDATE infra_skills.create_intent SET done_at = now() WHERE datname = :'db' AND done_at IS NULL;"
+    echo "UPDATE infra_skills.create_intent SET done_at = now() WHERE datname = :'db' AND app = :'app' AND done_at IS NULL;"
   fi
 }
 
@@ -1816,9 +1878,16 @@ provision_credentials() {
         fi
         ;;
       intent)
-        # intent <database> <bound to this app and this database>
-        intents+="${f[1]} "
-        [[ "${f[2]:-f}" == t ]] && intents_bound+="${f[1]} "
+        # intent <database> <this app's> <bound to this app and this database> <its app>
+        if [[ "${f[2]:-f}" != t ]]; then
+          # Another app's pending creation of a database by that name (made or not): never this run's.
+          err "Database ${f[1]}: app ${f[4]:-?} has a pending creation of a database by that name (infra_skills.create_intent)."
+          err "  Nothing changed. Pick another database name, or finish or clear that app's creation first."
+          refused=true
+        else
+          intents+="${f[1]} "
+          [[ "${f[3]:-f}" == t ]] && intents_bound+="${f[1]} "
+        fi
         ;;
       db)
         # db <name> <exists> <owner> <owner is new> <pending> <old owner> <old is new> <old privileged> <public> <now> <may>
@@ -1836,18 +1905,28 @@ provision_credentials() {
             fi
           elif [[ "$intents" == *" ${f[1]} "* ]]; then
             # --create-missing: an earlier run recorded it and stopped before its ACL was done. Only a
-            # database that run made (its oid in the intent, or its marker) is finished.
+            # database that run made (the oid the intent recorded, or before that its creation's
+            # marker) is finished.
             if [[ "$intents_bound" != *" ${f[1]} "* ]]; then
               err "Database ${f[1]} exists, but nothing shows it is the one an earlier run for ${app_id} created: neither the oid"
-              err "  recorded in infra_skills.create_intent nor the marker COMMENT ON DATABASE '${PG_ROLE_MARKER}:created:${app_id}' matches."
-              err "  Nothing changed (PUBLIC keeps its CONNECT). Check it by hand; then delete its row in infra_skills.create_intent (postgres database)."
+              err "  recorded in infra_skills.create_intent nor that creation's marker (COMMENT ON DATABASE '${PG_ROLE_MARKER}:created:${app_id}:<nonce>') matches."
+              err "  Nothing changed; PUBLIC keeps its CONNECT on it. To finish by hand:"
+              err "  1. identify the database: SELECT oid, datdba::regrole, shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = '${f[1]}';"
+              err "     and compare with SELECT * FROM infra_skills.create_intent WHERE datname = '${f[1]}'; (postgres database);"
+              err "  2. if it is this app's database, close it and grant the roles (the ACL step the creation did not reach):"
+              err "     tools/k3s/postgres.sh ${ENV_NAME} --provision-credentials ${app_id} --database ${f[1]}[:<PREFIX>] --revoke-public --keep-connect <role>[,<role>]|none"
+              err "     (with the same other flags as this run); if it is not, rename or drop it, or pick another name;"
+              err "  3. then delete the row: DELETE FROM infra_skills.create_intent WHERE datname = '${f[1]}' AND app = '${app_id}';"
+              err "  Deleting the row and re-running --create-missing alone would leave PUBLIC's CONNECT on it."
               refused=true
             elif [[ "${f[4]}" == t ]]; then
               t_creates[i]=true; t_finish[i]=true
               info "Database ${f[1]} was created by an earlier run that did not finish: finishing it (PUBLIC's CONNECT revoked, grants)"
             else
-              err "Database ${f[1]} was being created by an earlier run, but its owner is now ${f[3]}, not ${new_owner}. Check it by hand;"
-              err "  then delete its row in infra_skills.create_intent (postgres database). Nothing changed."
+              err "Database ${f[1]} was being created by an earlier run, but its owner is now ${f[3]}, not ${new_owner}. Nothing changed;"
+              err "  PUBLIC keeps its CONNECT on it. Check it by hand; to finish its ACL: tools/k3s/postgres.sh ${ENV_NAME} --provision-credentials ${app_id}"
+              err "  --database ${f[1]}[:<PREFIX>] --revoke-public --keep-connect <role>[,<role>]|none, then"
+              err "  DELETE FROM infra_skills.create_intent WHERE datname = '${f[1]}' AND app = '${app_id}'; (postgres database)."
               refused=true
             fi
           elif [[ "$PG_TAKE_OWNERSHIP" == "true" && "${f[5]}" == t && "${f[13]:-f}" != t ]]; then
@@ -1900,6 +1979,10 @@ provision_credentials() {
         defacl)
           err "--take-ownership: in ${f[1]}, the old owner has default privileges that cannot be copied exactly: ${f[2]:-?}."
           err "  Set them for ${new_owner} by hand (ALTER DEFAULT PRIVILEGES FOR ROLE ...) and reset the old owner's, then re-run; nothing changed."
+          refused=true ;;
+        dstacl)
+          err "--take-ownership: in ${f[1]}, ${new_owner} already has default privileges that differ from what the copy would give: ${f[2]:-?}."
+          err "  Align them by hand (ALTER DEFAULT PRIVILEGES FOR ROLE ${new_owner} ...), then re-run; nothing changed."
           refused=true ;;
         extskip)
           warn "--take-ownership: in ${f[1]}, these stay with the old owner (Postgres has no ALTER EXTENSION ... OWNER): ${f[2]:-?}" ;;
@@ -2010,9 +2093,18 @@ CREATE TABLE IF NOT EXISTS infra_skills.ownership_transfer (
 REVOKE ALL ON infra_skills.ownership_transfer FROM PUBLIC;
 CREATE TABLE IF NOT EXISTS infra_skills.create_intent (
   datname name PRIMARY KEY, app text NOT NULL, revoke_public boolean NOT NULL,
-  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz, datoid oid);
+  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz, datoid oid, nonce text NOT NULL);
 REVOKE ALL ON infra_skills.create_intent FROM PUBLIC;
 SQL
+      fi
+      # With ownership moves, a role that exists keeps its current password until every move has
+      # committed (a move that fails, on a lock timeout say, then leaves both the password and
+      # the Secret as they were); its new password is set at the end of this session. A role made
+      # in this run gets its password when it is created.
+      local app_pw_now="$app_pw_set" mig_pw_now="$mig_pw_set" app_pw_late=false mig_pw_late=false
+      if [[ " ${t_transfer[*]} " == *" true "* ]]; then
+        [[ "$app_pw_set" == "true" && "$app_exists" == "t" ]] && { app_pw_now=false; app_pw_late=true; }
+        [[ -n "$mig_role" && "$mig_pw_set" == "true" && "$mig_exists" == "t" ]] && { mig_pw_now=false; mig_pw_late=true; }
       fi
       pg_sql_app_role
       # The migration role first: a database created or taken over below may be its own.
@@ -2047,6 +2139,16 @@ $$;
 SQL
       done
       for i in "${!targets[@]}"; do pg_sql_existing_db "$i"; done
+      # Every move has committed (ON_ERROR_STOP ends the session at the first failure): now the
+      # new passwords of the roles that existed, each in its guarded transaction again.
+      if [[ "$app_pw_late" == "true" ]]; then
+        printf '\\set role %s\n' "'${app_username}'"
+        pg_sql_role_tx role app "$app_oid" "$mig_role" true app_verifier "$conn_limit" true
+      fi
+      if [[ "$mig_pw_late" == "true" ]]; then
+        printf '\\set mrole %s\n' "'${mig_role}'"
+        pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" true mig_verifier "$mig_conn_limit" true
+      fi
     } | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q \
       || { err "Failed to set up role ${app_username} on: ${target_names[*]}"; exit 1; }
 
