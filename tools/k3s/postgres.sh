@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# No allexport: an inherited SHELLOPTS=allexport would put every secret into child environments.
+set +a
 
 # ============================================================================
 # K3S PostgreSQL Provisioning (CloudNativePG Operator)
@@ -24,13 +26,45 @@ set -euo pipefail
 #       --tenant <name>      ... for a tenant (docs/TENANTS.md): secret in the tenant namespace, stricter
 #                            limits, no read-only role access, Pooler labelled for the tenant
 #       --pooler             ... and a CNPG Pooler pooler-<app-id> (PgBouncer); the secret points at it
-#       --connection-limit N ... role CONNECTION LIMIT (default PG_APP_CONNECTION_LIMIT, else 50; tenant 20)
+#       --connection-limit N ... role CONNECTION LIMIT (default PG_APP_CONNECTION_LIMIT, else 50; tenant 20).
+#                            Per role: it counts the role's sessions across all its databases
 #       --statement-timeout D  role statement_timeout (default PG_APP_STATEMENT_TIMEOUT; tenant 60s)
+#       --database <name>[:<PREFIX>]  (repeatable) use these existing databases instead of creating
+#                            <app-id>: the role gets CONNECT, schema USAGE/CREATE, table and sequence
+#                            rights and default privileges on each (PUBLIC's CONNECT stays; a warning
+#                            names the roles that rely on it);
+#                            the Secret gets <PREFIX>_HOST/PORT/DATABASE/USERNAME/PASSWORD per
+#                            database (POSTGRES_* when no prefix; at most one such database)
+#       --revoke-public --keep-connect <role>[,<role>]|none  ... and revoke PUBLIC's CONNECT and
+#                            TEMPORARY on them; the owner, the former owner, these roles,
+#                            PG_READONLY_ROLE and the pooler role get CONNECT first
+#       --take-ownership     ... move each database to the role (or to the migration role) instead:
+#                            the old owner's objects in it one by one, then the database, in one
+#                            transaction (never its other databases or tablespaces), checked; an
+#                            interrupted move is completed by the next run; refused when that owner is
+#                            a superuser or the owner was changed by hand since the move started
+#       --create-missing     ... create a named database that does not exist (else: an error); a
+#                            creation an earlier run did not finish is finished
+#       --migration-role [name]  a second login role (default <app-id>_migrate) for migrate Jobs: no
+#                            statement_timeout, its own small connection limit, the app role's rights
+#                            on the named databases (no membership), Secret <app-id>-db-migrate with
+#                            the same keys; the app role gets rights on what it creates through
+#                            default privileges
+#       --migration-schema <db>.<schema>  (repeatable) a schema the migration role owns (created
+#                            if missing); it gets CREATE on <db>
+#       --migration-connection-limit N  its CONNECTION LIMIT (default PG_MIGRATION_CONNECTION_LIMIT, else 2)
+#       --keep-password      keep the passwords in secrets.plain/<app-id>-db[-migrate].secret.yaml: an
+#                            existing role's password is not touched (the stored one must match its
+#                            verifier in the cluster), a missing role is created with it (stops when a
+#                            file has none, or its *_PASSWORD values differ)
+#                            Passwords reach the server only as SCRAM-SHA-256 verifiers (pg-scram.pl)
+#                            Existing roles are reused only when this script made them for this app
+#                            (COMMENT ON ROLE marker); reserved, pg_* and privileged roles are refused
 #   --revoke-public-connect [--apply]  List (or, with --apply, revoke) CONNECT and TEMPORARY that
 #                            PUBLIC still holds on application databases; owners, the read-only role
 #                            and the pooler role get explicit grants first
 #   --dump-table <table>     Dump a specific table (use --database to specify database, --output to specify file)
-#   --database <dbname>      Database name for dump-table (default: app)
+#   --database <dbname>      Database name for dump-table (default: app; see also --provision-credentials)
 #   --output <file>          Output file for dump-table (default: stdout)
 #
 # env.properties (optional):
@@ -90,6 +124,16 @@ PG_TENANT=""
 PG_POOLER=false
 PG_CONN_LIMIT=""
 PG_STATEMENT_TIMEOUT=""
+PG_DATABASES=()
+PG_MIGRATION_ROLE=false
+PG_MIGRATION_ROLE_NAME=""
+PG_MIGRATION_CONN_LIMIT=""
+PG_TAKE_OWNERSHIP=false
+PG_CREATE_MISSING=false
+PG_KEEP_PASSWORD=false
+PG_MIGRATION_SCHEMAS=()
+PG_REVOKE_PUBLIC=false
+PG_KEEP_CONNECT=""
 REVOKE_PUBLIC_CONNECT=false
 REVOKE_PUBLIC_APPLY=false
 SHOW_CREDENTIALS_APP_ID=""
@@ -136,6 +180,22 @@ while [[ $# -gt 0 ]]; do
     --pooler) PG_POOLER=true; shift ;;
     --connection-limit) PG_CONN_LIMIT="${2:?--connection-limit needs a number}"; shift 2 ;;
     --statement-timeout) PG_STATEMENT_TIMEOUT="${2:?--statement-timeout needs a duration, e.g. 60s}"; shift 2 ;;
+    --migration-role)
+      PG_MIGRATION_ROLE=true
+      if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
+        PG_MIGRATION_ROLE_NAME="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --migration-connection-limit) PG_MIGRATION_CONN_LIMIT="${2:?--migration-connection-limit needs a number}"; shift 2 ;;
+    --take-ownership) PG_TAKE_OWNERSHIP=true; shift ;;
+    --create-missing) PG_CREATE_MISSING=true; shift ;;
+    --keep-password) PG_KEEP_PASSWORD=true; shift ;;
+    --migration-schema) PG_MIGRATION_SCHEMAS+=("${2:?--migration-schema needs <database>.<schema>}"); shift 2 ;;
+    --revoke-public) PG_REVOKE_PUBLIC=true; shift ;;
+    --keep-connect) PG_KEEP_CONNECT="${2:?--keep-connect needs <role>[,<role>] or none}"; shift 2 ;;
     --revoke-public-connect) REVOKE_PUBLIC_CONNECT=true; shift ;;
     --apply) REVOKE_PUBLIC_APPLY=true; shift ;;
     --dump-table)
@@ -152,7 +212,9 @@ while [[ $# -gt 0 ]]; do
         echo "ERROR: --database requires a database name argument" >&2
         exit 1
       fi
+      # --dump-table reads one (the last); --provision-credentials takes each as <name>[:<PREFIX>]
       DUMP_DATABASE="$2"
+      PG_DATABASES+=("$2")
       shift 2
       ;;
     --output)
@@ -166,6 +228,32 @@ while [[ $# -gt 0 ]]; do
     *) echo "ERROR: Unknown option: $1" >&2; exit 1 ;;
   esac
 done
+if [[ "$PROVISION_CREDENTIALS" != "true" ]] && \
+   [[ "$PG_MIGRATION_ROLE" == "true" || -n "$PG_MIGRATION_CONN_LIMIT" || "$PG_TAKE_OWNERSHIP" == "true" || "$PG_CREATE_MISSING" == "true" || "$PG_KEEP_PASSWORD" == "true" || ${#PG_MIGRATION_SCHEMAS[@]} -gt 0 || "$PG_REVOKE_PUBLIC" == "true" || -n "$PG_KEEP_CONNECT" ]]; then
+  echo "ERROR: --migration-role, --migration-connection-limit, --take-ownership, --create-missing, --keep-password, --migration-schema, --revoke-public and --keep-connect go with --provision-credentials" >&2
+  exit 1
+fi
+if [[ "$PROVISION_CREDENTIALS" == "true" && ${#PG_DATABASES[@]} -eq 0 ]] && \
+   [[ "$PG_TAKE_OWNERSHIP" == "true" || "$PG_CREATE_MISSING" == "true" || "$PG_REVOKE_PUBLIC" == "true" ]]; then
+  echo "ERROR: --take-ownership, --create-missing and --revoke-public go with --database <name>[:<PREFIX>]" >&2
+  exit 1
+fi
+if [[ -n "$PG_MIGRATION_CONN_LIMIT" && "$PG_MIGRATION_ROLE" != "true" ]]; then
+  echo "ERROR: --migration-connection-limit goes with --migration-role" >&2
+  exit 1
+fi
+if [[ ${#PG_MIGRATION_SCHEMAS[@]} -gt 0 && "$PG_MIGRATION_ROLE" != "true" ]]; then
+  echo "ERROR: --migration-schema goes with --migration-role" >&2
+  exit 1
+fi
+if [[ "$PG_REVOKE_PUBLIC" == "true" && -z "$PG_KEEP_CONNECT" ]]; then
+  echo "ERROR: --revoke-public needs --keep-connect <role>[,<role>] (or --keep-connect none): the roles besides the owner that keep CONNECT" >&2
+  exit 1
+fi
+if [[ -n "$PG_KEEP_CONNECT" && "$PG_REVOKE_PUBLIC" != "true" ]]; then
+  echo "ERROR: --keep-connect goes with --revoke-public" >&2
+  exit 1
+fi
 
 # --- Validation ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing $1" >&2; exit 1; }; }
@@ -656,122 +744,360 @@ fi
 # ============================================================================
 # Provision Credentials Mode
 # ============================================================================
-provision_credentials() {
-  local app_id="$1"
-  local namespace="$NAMESPACE_POSTGRES"
-  local tenant="$PG_TENANT"
-  local app_namespace="${APP_NAMESPACE:-${tenant:-default}}"
-  
-  # Validate app_id (alphanumeric and hyphens only, for safety)
-  if [[ ! "$app_id" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
-    err "Invalid app-id: ${app_id}"
-    err "App ID must be lowercase alphanumeric with hyphens (e.g., 'my-app', 'evse')"
-    exit 1
-  fi
-  if [[ -n "$tenant" && ! "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
-    err "Invalid tenant: ${tenant}"; exit 1
-  fi
-  # Role limits. A tenant shares the cluster with the platform's apps: its role gets a small
-  # connection budget and time limits, so a runaway query or pool cannot starve them.
-  local conn_limit statement_timeout idle_tx_timeout
-  if [[ -n "$tenant" ]]; then
-    conn_limit="${PG_CONN_LIMIT:-${PG_TENANT_CONNECTION_LIMIT:-20}}"
-    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_TENANT_STATEMENT_TIMEOUT:-60s}}"
-    idle_tx_timeout="${PG_TENANT_IDLE_IN_TRANSACTION_TIMEOUT:-5min}"
-  else
-    conn_limit="${PG_CONN_LIMIT:-${PG_APP_CONNECTION_LIMIT:-50}}"
-    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_APP_STATEMENT_TIMEOUT:-}}"
-    idle_tx_timeout="${PG_APP_IDLE_IN_TRANSACTION_TIMEOUT:-}"
-  fi
-  [[ "$conn_limit" =~ ^(-1|[0-9]+)$ ]] || { err "connection limit must be a number (or -1): ${conn_limit}"; exit 1; }
-  for v in "$statement_timeout" "$idle_tx_timeout"; do
-    [[ -z "$v" || "$v" =~ ^[0-9]+(ms|s|min|h)?$ ]] || { err "not a Postgres duration: ${v}"; exit 1; }
-  done
-  
-  log "=== Provisioning PostgreSQL credentials for application: ${app_id}${tenant:+ (tenant ${tenant})} ==="
-  
-  # Check if cluster exists and is ready
-  if ! kubectl -n "$namespace" get cluster postgres-cluster >/dev/null 2>&1; then
-    err "PostgreSQL cluster not found in namespace: $namespace"
-    err "Run provisioning first: tools/k3s/postgres.sh ${ENV_NAME}"
-    exit 1
-  fi
-  
-  # Check cluster status
-  local phase
-  phase=$(kubectl -n "$namespace" get cluster postgres-cluster -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-  if [[ "$phase" != "Cluster in healthy state" ]]; then
-    warn "PostgreSQL cluster is not in healthy state (phase: ${phase})"
-    warn "Credentials provisioning may fail. Continue anyway? (y/N)"
-    read -r response
-    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+# Plaintext passwords never reach the server, argv or a trace. They are made and read with
+# xtrace off (provision::without_xtrace), and only the Secret file gets them, written by a
+# function that gets the variable's name rather than its value. The server gets a SCRAM-SHA-256
+# verifier computed here (tools/k3s/pg-scram.pl, core Perl), on stdin: ALTER ROLE ... PASSWORD
+# 'SCRAM-SHA-256$4096:...' is stored as is, so no server log setting (log_statement, duration
+# or sampled logging, error statements) can show a password. The password statement still runs
+# with log_statement = none, and on the --database and migration paths also with
+# log_min_error_statement = panic and log_min_duration_statement = -1; numbers are range-checked
+# here first so the server has nothing to reject.
+#
+# Roles: the script reuses an existing role only when it made the role for this app. COMMENT ON
+# ROLE holds the marker infra-skills:app:<app-id> (app role) or infra-skills:migrate:<app-id>
+# (migration role); an unmarked app role is adopted only when it has LOGIN, owns the database
+# <app-id> (made by the default path before the marker), has no elevated attribute and no role
+# membership at all, in either direction. Reserved and pg_* names are refused, and so are roles
+# that are superusers, hold CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS, belong to a role that
+# does, or are members of one another (app and migration role, by any path). The same preflight
+# runs on every path, the plain default one included, and each role's marker and password are
+# then written in one transaction that locks the role catalogs and checks all of it again first
+# (pg_sql_role_tx).
+
+PG_ROLE_MARKER="infra-skills"
+PG_INT_MAX=2147483647
+PG_US=$'\x1f'   # field separator of the preflight rows (psql -F)
+PG_SCRAM="$REPO_ROOT/tools/k3s/pg-scram.pl"
+# shellcheck disable=SC2016  # a regex: the $ are literal
+PG_VERIFIER_RE='^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$'
+
+# pg_reserved_role <name>: true for a name this script never provisions or adopts.
+pg_reserved_role() {
+  case "$1" in
+    postgres|app|streaming_replica|cnpg_pooler_pgbouncer|public|none|all|user|current_user|current_role|session_user|pg_*) return 0 ;;
+  esac
+  [[ -n "${PG_READONLY_ROLE:-}" && "$1" == "$PG_READONLY_ROLE" ]]
+}
+
+# pg_int_between <value> <min> <max>: an integer (at most 10 digits) in [min, max].
+pg_int_between() {
+  [[ "$1" =~ ^-?[0-9]{1,10}$ ]] || return 1
+  local v=$((10#${1#-}))
+  [[ "$1" == -* ]] && v=$((-v))
+  (( v >= $2 && v <= $3 ))
+}
+
+# pg_duration_ok <value>: a Postgres duration (ms, s, min, h; bare = ms) that fits in an int of ms.
+pg_duration_ok() {
+  [[ "$1" =~ ^([0-9]{1,10})(ms|s|min|h)?$ ]] || return 1
+  local n=$((10#${BASH_REMATCH[1]})) mult=1
+  case "${BASH_REMATCH[2]}" in s) mult=1000 ;; min) mult=60000 ;; h) mult=3600000 ;; esac
+  (( n * mult <= PG_INT_MAX ))
+}
+
+# pg_new_password <var>: a new random password into <var>; fails when openssl fails or prints
+# fewer than 24 characters. Call it through provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_new_password() {
+  local +x _pw
+  _pw=$(openssl rand -base64 24 | tr -d '\n') || return 1
+  [[ ${#_pw} -ge 24 ]] || return 1
+  printf -v "$1" '%s' "$_pw"
+}
+
+# pg_make_verifier <password var> <verifier var>: the SCRAM-SHA-256 verifier of the password (a
+# new random salt, 4096 iterations). Call it through provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_make_verifier() {
+  local +x _v
+  _v=$(printf '%s\n' "${!1}" | perl "$PG_SCRAM" make) || return 1
+  [[ "$_v" =~ $PG_VERIFIER_RE ]] || return 1
+  printf -v "$2" '%s' "$_v"
+}
+
+# pg_matches_live <password var> <role>: true when the password matches the role's verifier in
+# the cluster (pg_authid.rolpassword, read over the pod's socket; SCRAM with its own salt and
+# iterations, or md5). Uses the caller's namespace, pg_pod and superuser. Call it through
+# provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_matches_live() {
+  local +x _live
+  _live=$(kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q -tA <<SQL
+-- infra-skills:verifier
+\\set r '$2'
+SELECT coalesce(rolpassword, '') FROM pg_authid WHERE rolname = :'r';
+SQL
+) || return 1
+  printf '%s\n%s\n' "${!1}" "$_live" | perl "$PG_SCRAM" check "$2"
+}
+
+# pg_stored_password <var> <secret file> <role>: the *_PASSWORD value the Secret file holds, into
+# <var> (empty when the file or the key is missing). Returns 3 when the file's *_PASSWORD values
+# differ and 4 when a *_USERNAME names another role. Call it through provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_stored_password() {
+  local +x _pws="" _users=""
+  printf -v "$1" '%s' ""
+  [[ -f "$2" ]] || return 0
+  _pws=$(yq -r '[(.stringData // {}) | to_entries | .[] | select(.key | test("_PASSWORD$")) | .value | tostring] | unique | .[]' "$2" 2>/dev/null) || return 2
+  _users=$(yq -r '[(.stringData // {}) | to_entries | .[] | select(.key | test("_USERNAME$")) | .value | tostring] | unique | .[]' "$2" 2>/dev/null) || return 2
+  [[ "$_pws" != *$'\n'* ]] || return 3
+  [[ -z "$_users" || "$_users" == "$3" ]] || return 4
+  printf -v "$1" '%s' "$_pws"
+}
+
+# pg_password_usable <var>: at least 24 characters that can go into the Secret as they are.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_password_usable() { [[ "${!1}" =~ ^[A-Za-z0-9+/=._~-]{24,}$ ]]; }
+
+# pg_password <var> <secret file> <role> <role exists: t|f> <set var> <verifier var>: the
+# password into <var>, into <set var> whether the run sets it (true) or leaves the role's
+# password alone (false), and when it sets it, its SCRAM verifier into <verifier var>.
+#   default          a new password, set on the role;
+#   --keep-password  the password the file holds (every *_PASSWORD in it must agree). A role that
+#                    exists keeps its password untouched, and the stored one must match it (else
+#                    the run stops and the Secret stays as it is); a missing role is created with it.
+pg_password() {
+  local var="$1" file="$2" role="$3" exists="$4" setvar="$5" vvar="$6" rc=0
+  if [[ "$PG_KEEP_PASSWORD" == "true" ]]; then
+    provision::without_xtrace pg_stored_password "$var" "$file" "$role" || rc=$?
+    case "$rc" in
+      0) ;;
+      3) err "--keep-password: ${file} holds different *_PASSWORD values for role ${role}; they must all agree"; exit 1 ;;
+      4) err "--keep-password: ${file} names another *_USERNAME than ${role}"; exit 1 ;;
+      *) err "--keep-password: cannot read ${file}"; exit 1 ;;
+    esac
+    if ! provision::without_xtrace pg_password_usable "$var"; then
+      err "--keep-password: ${file} holds no usable *_PASSWORD for role ${role} (24 or more of A-Z a-z 0-9 + / = . _ ~ -)."
+      err "  Decrypt it first (tools/sops/decrypt.sh ${ENV_NAME}), or leave --keep-password out to set a new password."
       exit 1
     fi
+    if [[ "$exists" == "t" ]]; then
+      if ! provision::without_xtrace pg_matches_live "$var" "$role"; then
+        err "--keep-password: the password in ${file##*/} is not role ${role}'s password in the cluster (stale Secret?)."
+        err "  Nothing changed and the Secret is left as it is. Decrypt the current one from secrets.sops, or leave --keep-password out to set a new password."
+        exit 1
+      fi
+      printf -v "$setvar" '%s' false
+      info "Keeping the password of role ${role}: it matches the role's verifier, and is not touched (${file##*/})"
+      return 0
+    fi
+    printf -v "$setvar" '%s' true
+    info "Role ${role} does not exist yet: it is created with the password from ${file##*/}"
+  else
+    if ! provision::without_xtrace pg_new_password "$var"; then
+      err "Could not make a password for role ${role}: openssl rand failed or printed fewer than 24 characters"
+      exit 1
+    fi
+    printf -v "$setvar" '%s' true
   fi
-  
-  local pg_host="postgres-cluster-rw.${namespace}.svc.cluster.local"
-  local pg_port="5432"
-  local pooler_name="pooler-${app_id}"
-  local superuser="postgres"
-  
-  # Generate app credentials
-  local app_username="${app_id}"
-  local app_password
-  app_password=$(openssl rand -base64 24 | tr -d '\n')
-  local app_database="${app_id}"
-  
-  # Find the primary to execute commands (psql as the local superuser over the socket)
-  local pg_pod
-  pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  [[ -n "$pg_pod" ]] || pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-  
-  if [[ -z "$pg_pod" ]]; then
-    err "No PostgreSQL pod found in cluster"
+  if ! provision::without_xtrace pg_make_verifier "$var" "$vvar"; then
+    err "Could not compute the SCRAM verifier for role ${role} (perl ${PG_SCRAM##*/} failed)"
     exit 1
   fi
+}
 
-  # --- Pooler (before the grants: CNPG creates its auth role cnpg_pooler_pgbouncer) ---
-  if [[ "$PG_POOLER" == "true" ]]; then
-    info "Applying CNPG Pooler ${pooler_name} (PgBouncer, ${PG_POOLER_MODE:-session} mode)..."
-    jq -nc --arg n "$pooler_name" --arg ns "$namespace" --arg t "$tenant" --arg app "$app_id" \
-       --arg mode "${PG_POOLER_MODE:-session}" --arg pool "$([[ "$conn_limit" == -1 ]] && echo 20 || echo "$conn_limit")" '
-      ({"app.kubernetes.io/part-of": $app} + (if $t != "" then {"infra-skills/tenant": $t} else {} end)) as $l
-      | {apiVersion: "postgresql.cnpg.io/v1", kind: "Pooler", metadata: {name: $n, namespace: $ns, labels: $l},
-         spec: {cluster: {name: "postgres-cluster"}, instances: 1, type: "rw",
-                pgbouncer: {poolMode: $mode, parameters: {max_client_conn: "200", default_pool_size: $pool}},
-                template: {metadata: {labels: $l}, spec: {containers: []}}}}' \
-      | kubectl apply -f - || { err "Failed to apply Pooler ${pooler_name}"; exit 1; }
-    pg_host="${pooler_name}.${namespace}.svc.cluster.local"
-    local i
-    for i in $(seq 1 30); do
-      kubectl -n "$namespace" exec "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -tAc \
-        "SELECT 1 FROM pg_roles WHERE rolname = 'cnpg_pooler_pgbouncer'" 2>/dev/null | grep -q 1 && break
-      sleep 2
-    done
+
+# pg_write_secret <file> <secret> <namespace> <host> <port> <username> <password var> <host note>
+#                 <legacy: true|false> <db:PREFIX>...
+# legacy (the default path): the Secret exactly as before INFRA-243, POSTGRES_* for one database.
+# Otherwise <PREFIX>_HOST/PORT/DATABASE/USERNAME/PASSWORD for each database, values quoted. Call
+# it through provision::without_xtrace: printf would trace the password.
+# pg_yaml_plain_ok <value>: true when <value> is safe as a plain (unquoted) YAML scalar that reads
+# back as the same string: a letter first, then only A-Z a-z 0-9 + / = . _ ~ -, and not a YAML
+# 1.1 boolean or null word. Anything else (all digits, a leading digit or special character, a
+# boolean, ': ' or ' #' inside) is written quoted. Call it through provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_yaml_plain_ok() {
+  local r=0
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+/=._~-]*$ ]] || return 1
+  shopt -s nocasematch
+  [[ "$1" =~ ^(true|false|yes|no|on|off|null|y|n)$ ]] && r=1
+  shopt -u nocasematch
+  return "$r"
+}
+
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_write_secret() {
+  local file="$1" name="$2" ns="$3" host="$4" port="$5" user="$6" pw_var="$7" note="$8" legacy="$9"; shift 9
+  local entry db prefix sep=""
+  local pw_plain=false
+  pg_yaml_plain_ok "${!pw_var}" && pw_plain=true
+  (umask 077
+   {
+     printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: Opaque\nstringData:\n' "$name" "$ns"
+     if [[ "$legacy" == "true" ]]; then
+       db="${1%%:*}"
+       printf '  # PostgreSQL host%s\n  POSTGRES_HOST: %s\n\n' "$note" "$host"
+       printf '  # PostgreSQL port\n  POSTGRES_PORT: "%s"\n\n' "$port"
+       printf '  # PostgreSQL database name\n  POSTGRES_DATABASE: %s\n\n' "$db"
+       printf '  # PostgreSQL username\n  POSTGRES_USERNAME: %s\n\n' "$user"
+       # quoted only when the value is not a safe plain scalar (pg_yaml_plain_ok), generated or kept;
+       # a password that is one is written exactly as before INFRA-243
+       if [[ "$pw_plain" == "true" ]]; then
+         printf '  # PostgreSQL password\n  POSTGRES_PASSWORD: %s\n' "${!pw_var}"
+       else
+         printf '  # PostgreSQL password\n  POSTGRES_PASSWORD: "%s"\n' "${!pw_var}"
+       fi
+     else
+       for entry in "$@"; do
+         db="${entry%%:*}"; prefix="${entry#*:}"
+         printf '%s' "$sep"; sep=$'\n'
+         if [[ $# -gt 1 ]]; then printf '  # Database %s\n' "$db"; fi
+         printf '  # PostgreSQL host%s\n  %s_HOST: "%s"\n\n' "$note" "$prefix" "$host"
+         printf '  # PostgreSQL port\n  %s_PORT: "%s"\n\n' "$prefix" "$port"
+         printf '  # PostgreSQL database name\n  %s_DATABASE: "%s"\n\n' "$prefix" "$db"
+         printf '  # PostgreSQL username\n  %s_USERNAME: "%s"\n\n' "$prefix" "$user"
+         printf '  # PostgreSQL password\n  %s_PASSWORD: "%s"\n' "$prefix" "${!pw_var}"
+       done
+     fi
+   } > "$file")
+}
+
+# pg_sql_role_guard <role> <kind: app|migrate> <oid the preflight saw, '' = no such role> <the
+# other role of this run, or ''>: inside the caller's transaction, lock the role catalogs
+# (pg_authid, pg_auth_members: no role can be created, altered or granted until it commits),
+# pg_database (no ALTER DATABASE OWNER: an adopted role keeps owning its database) and
+# pg_shdescription (no COMMENT ON ROLE: the marker stays as checked), all SHARE ROW EXCLUSIVE,
+# waiting at most 5 s; logins only read them and are not held off. Then check again what the
+# preflight checked; any change raises and rolls the transaction back,
+# before the role's marker or password is written. Names are validated (a closed character set),
+# the oid is digits. Prints SQL.
+pg_sql_role_guard() {
+  cat <<SQL
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_shdescription IN SHARE ROW EXCLUSIVE MODE;
+SELECT set_config('infra_skills.g_role', '$1', true) AS g_role, set_config('infra_skills.g_kind', '$2', true) AS g_kind,
+       set_config('infra_skills.g_oid', '$3', true) AS g_oid, set_config('infra_skills.g_other', '$4', true) AS g_other,
+       set_config('infra_skills.g_marker', '${PG_ROLE_MARKER}:$2:${app_id}', true) AS g_marker \\gset
+SQL
+  cat <<'SQL'
+DO $$
+DECLARE
+  nm text := current_setting('infra_skills.g_role');
+  kind text := current_setting('infra_skills.g_kind');
+  want text := current_setting('infra_skills.g_oid');
+  other text := current_setting('infra_skills.g_other');
+  mk text := current_setting('infra_skills.g_marker');
+  r record;
+  c text;
+BEGIN
+  SELECT oid, rolcanlogin, (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls) AS elevated
+    INTO r FROM pg_roles WHERE rolname = nm;
+  IF NOT FOUND THEN
+    IF want <> '' THEN RAISE EXCEPTION 'infra-skills: role % was dropped after the preflight; nothing changed', nm; END IF;
+    RETURN;
+  END IF;
+  IF want = '' THEN RAISE EXCEPTION 'infra-skills: role % was made by someone else after the preflight; nothing changed', nm; END IF;
+  IF r.oid::text <> want THEN RAISE EXCEPTION 'infra-skills: role % was dropped and made again after the preflight; nothing changed', nm; END IF;
+  IF r.elevated THEN
+    RAISE EXCEPTION 'infra-skills: role % gained SUPERUSER, CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS after the preflight; nothing changed', nm;
+  END IF;
+  IF EXISTS (SELECT FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')
+               AND (g.rolname ~ '^pg_' OR g.rolsuper OR g.rolcreaterole OR g.rolcreatedb OR g.rolreplication OR g.rolbypassrls)) THEN
+    RAISE EXCEPTION 'infra-skills: role % joined a privileged or pg_* role after the preflight; nothing changed', nm;
+  END IF;
+  IF other <> '' AND EXISTS (SELECT FROM pg_roles o WHERE o.rolname = other
+                               AND (pg_has_role(r.oid, o.oid, 'MEMBER') OR pg_has_role(o.oid, r.oid, 'MEMBER'))) THEN
+    RAISE EXCEPTION 'infra-skills: roles % and % are members of one another (directly or through a group); nothing changed', nm, other;
+  END IF;
+  c := shobj_description(r.oid, 'pg_authid');
+  IF c IS NOT DISTINCT FROM mk THEN RETURN; END IF;
+  IF kind = 'app' AND c IS NULL AND r.rolcanlogin
+     AND EXISTS (SELECT FROM pg_database d WHERE d.datname = nm AND d.datdba = r.oid)
+     AND NOT EXISTS (SELECT FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid) THEN
+    RETURN;
+  END IF;
+  RAISE EXCEPTION 'infra-skills: role % changed after the preflight (marker, LOGIN, owner of its database or memberships); nothing changed', nm;
+END
+$$;
+SQL
+}
+
+# pg_sql_role_tx <psql variable holding the role> <kind: app|migrate> <oid the preflight saw>
+# <the other role or ''> <password set: true|false> <name of the bash variable with the SCRAM
+# verifier> <connection limit> <guarded logging: true|false>: one transaction that runs the guard
+# (pg_sql_role_guard), creates the role if missing, writes its marker and its password (or only
+# LOGIN and the limit). Guarded logging (the --database and migration paths): psql's errors terse,
+# and the password statement with log_min_error_statement = panic and log_min_duration_statement
+# = -1 as well as log_statement = none. The default path keeps origin/main's lines (log_statement
+# = none) around its own \set pw. [own transaction: true|false] false: no BEGIN/COMMIT, inside the
+# caller's transaction (the late passwords of both roles: both or neither). Prints SQL.
+pg_sql_role_tx() {
+  local v="$1" kind="$2" oid="$3" other="$4" pw_set="$5" vvar="$6" limit="$7" guarded="$8" own_tx="${9:-true}" name marker
+  name="$app_username"; [[ "$kind" == migrate ]] && name="$mig_role"
+  marker="${PG_ROLE_MARKER}:${kind}:${app_id}"
+  if [[ "$guarded" == "true" && "$pw_set" == "true" ]]; then
+    # a heredoc: bash -x does not trace its expansion (printf's arguments it would)
+    cat <<SQL
+\\set pw '${!vvar}'
+\\set VERBOSITY terse
+SQL
   fi
-  
-  info "Creating database '${app_database}' and role '${app_username}' (connection limit ${conn_limit}${statement_timeout:+, statement_timeout ${statement_timeout}}${idle_tx_timeout:+, idle_in_transaction_session_timeout ${idle_tx_timeout}})..."
-  
-  # The SQL goes over stdin, never on a command line, and the password statement runs with
-  # log_statement off, so the password lands in neither ps nor the server log. Identifiers are
-  # quoted (:"name"), so app ids with hyphens work.
-  #   * REVOKE CONNECT, TEMPORARY ... FROM PUBLIC: by default every role may connect to every
-  #     database; with it revoked only the owner and explicit grants can. Other databases
-  #     keep PUBLIC's CONNECT until --revoke-public-connect --apply (listed below for a tenant).
-  #   * a new role gets no attribute beyond LOGIN; an existing one keeps its attributes (a
-  #     warning names the dangerous ones).
-  local ro_role=""
-  [[ -z "$tenant" ]] && ro_role="${PG_READONLY_ROLE:-}"
-  kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q <<SQL || { err "Failed to create/update the database role and database"; exit 1; }
+  [[ "$own_tx" == "true" ]] && echo 'BEGIN;'
+  pg_sql_role_guard "$name" "$kind" "$oid" "$other"
+  cat <<SQL
+SELECT format('CREATE ROLE %I LOGIN', :'$v') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'$v') \\gexec
+SQL
+  if [[ "$guarded" == "true" ]]; then
+    printf '\\set marker %s\n' "'${marker}'"
+    cat <<SQL
+SELECT format('COMMENT ON ROLE %I IS %L', :'$v', :'marker')
+ WHERE shobj_description((SELECT oid FROM pg_roles WHERE rolname = :'$v'), 'pg_authid') IS DISTINCT FROM :'marker' \\gexec
+SQL
+  else
+    cat <<SQL
+SELECT format('COMMENT ON ROLE %I IS %L', :'$v', '${marker}') WHERE shobj_description((SELECT oid FROM pg_roles WHERE rolname = :'$v'), 'pg_authid') IS DISTINCT FROM '${marker}' \\gexec
+SQL
+  fi
+  if [[ "$pw_set" == "true" ]]; then
+    echo "SET LOCAL log_statement = 'none';"
+    if [[ "$guarded" == "true" ]]; then
+      printf "SET LOCAL log_min_error_statement = 'panic';\nSET LOCAL log_min_duration_statement = -1;\n"
+    fi
+    printf 'ALTER ROLE :"%s" WITH LOGIN PASSWORD :'"'"'pw'"'"' CONNECTION LIMIT %s;\n' "$v" "$limit"
+  else
+    printf 'ALTER ROLE :"%s" WITH LOGIN CONNECTION LIMIT %s;\n' "$v" "$limit"
+  fi
+  if [[ "$guarded" == "true" ]]; then
+    # The role's oid as guarded (the catalogs are still locked): :app_goid / :migrate_goid, the
+    # identity a later ledger row and ownership move are bound to.
+    printf 'SELECT oid AS %s_goid FROM pg_roles WHERE rolname = :'"'"'%s'"'"' \\gset\n' "$kind" "$v"
+  fi
+  [[ "$own_tx" == "true" ]] && echo 'COMMIT;'
+  if [[ "$guarded" == "true" && "$pw_set" == "true" ]]; then
+    printf '\\unset pw\n\\set VERBOSITY default\n'
+  fi
+}
+
+# The SQL below uses the caller's variables (provision_credentials). Values spliced into it are
+# validated names and numbers (a closed character set); every name read from the server stays on
+# the server and is quoted there with format('%I').
+
+# The default path's session, as before INFRA-243 byte for byte when $1 is true, except that the
+# password goes to the server as its SCRAM verifier (\set pw), and that CREATE ROLE, the role's
+# marker (COMMENT ON ROLE) and the password statement run in one transaction behind the role
+# guard (pg_sql_role_guard: the preflight's checks again, under a lock). $1 false
+# (--keep-password, the role exists): no password is sent and the role's password stays.
+pg_sql_default_app() {
+  cat <<SQL
 \\set role '${app_username}'
 \\set db '${app_database}'
-\\set pw '${app_password}'
+SQL
+  if [[ "$1" == "true" ]]; then
+    cat <<SQL
+\\set pw '${app_verifier}'
+SQL
+  fi
+  cat <<SQL
 \\set ro '${ro_role}'
-SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') \\gexec
-BEGIN;
-SET LOCAL log_statement = 'none';
-ALTER ROLE :"role" WITH LOGIN PASSWORD :'pw' CONNECTION LIMIT ${conn_limit};
-COMMIT;
+SQL
+  pg_sql_role_tx role app "$app_oid" "$mig_role" "$1" app_verifier "$conn_limit" false
+  cat <<SQL
 SELECT format('ALTER ROLE %I SET statement_timeout = %L', :'role', '${statement_timeout}') WHERE '${statement_timeout}' <> '' \\gexec
 SELECT format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', :'role', '${idle_tx_timeout}') WHERE '${idle_tx_timeout}' <> '' \\gexec
 SELECT format('CREATE DATABASE %I OWNER %I', :'db', :'role') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'db') \\gexec
@@ -785,7 +1111,1014 @@ SELECT 'WARN role ' || rolname || ' has ' || concat_ws(', ', CASE WHEN rolsuper 
 \\c :"db"
 GRANT CREATE ON SCHEMA public TO :"role";
 SQL
-  
+}
+
+# The preflight: one read of the catalog before anything changes (it writes nothing). Rows
+# (fields split by \x1f, names with control characters replaced by '?'):
+#   role <kind> <name> <exists> <marker ok> <comment> <attributes> <privileged memberships> <owns
+#        database <name>> <oid> <LOGIN> <any membership, either direction> <member of the other
+#        role of this run, or it of this one, by any path>
+#   need <role> <exists>
+#   ledger <schema owner ok> <tables' owner and kind ok> <columns ok>   (--take-ownership, --revoke-public, --create-missing)
+#   intent <database> <it is this app's> <bound: this app's, and it names this database: by the oid
+#          it recorded, or, before that, by the marker of that one creation (COMMENT ON DATABASE
+#          infra-skills:created:<app-id>:<nonce>)> <its app>   (--create-missing: a pending intent)
+#   db <name> <exists> <owner> <owner is the new owner> <transfer pending> <old owner> <old owner is
+#      the new owner> <old owner privileged> <PUBLIC has CONNECT> <roles connected now only
+#      through PUBLIC> <login roles relying on PUBLIC> <pending transfer's destination> <that
+#      destination is the new owner> <the owner is the pending transfer's source or destination>
+#      <the owner's oid> <the database's oid> <the move's source oid (the pending row's, else the owner)>
+# The ledger (postgres database, schema infra_skills, no PUBLIC access; the main session makes it
+# once the preflight has passed): ownership_transfer holds, per database oid, the original owner
+# and the destination role of an ownership move (an interrupted move is completed by the next run
+# with the same destination; a run with another destination is refused); create_intent holds
+# each database --create-missing is about to create, until its ACL is done.
+pg_sql_preflight() {
+  cat <<SQL
+-- infra-skills:preflight
+\\set app_role '${app_username}'
+\\set mig_role '${mig_role}'
+\\set app_marker '${PG_ROLE_MARKER}:app:${app_id}'
+\\set mig_marker '${PG_ROLE_MARKER}:migrate:${app_id}'
+\\set targets '${target_names[*]}'
+\\set owner '${new_owner}'
+\\set excluded '${pub_excluded}'
+\\set need '${need_roles}'
+SET client_min_messages = warning;
+SQL
+  cat <<'SQL'
+SELECT 'role', k.kind, k.name, (r.oid IS NOT NULL),
+       coalesce(shobj_description(r.oid, 'pg_authid') = k.marker, false),
+       coalesce(regexp_replace(shobj_description(r.oid, 'pg_authid'), '[[:cntrl:]]', '?', 'g'), ''),
+       coalesce(concat_ws(',', CASE WHEN r.rolsuper THEN 'SUPERUSER' END, CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
+                CASE WHEN r.rolcreatedb THEN 'CREATEDB' END, CASE WHEN r.rolreplication THEN 'REPLICATION' END,
+                CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END), ''),
+       coalesce((SELECT string_agg(regexp_replace(g.rolname, '[[:cntrl:]]', '?', 'g'), ',' ORDER BY g.rolname)
+                   FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')
+                    AND (g.rolname ~ '^pg_' OR g.rolsuper OR g.rolcreaterole OR g.rolcreatedb OR g.rolreplication OR g.rolbypassrls)), ''),
+       coalesce(k.kind = 'app' AND EXISTS (SELECT FROM pg_database d WHERE d.datname = k.name AND d.datdba = r.oid), false),
+       coalesce(r.oid::text, ''), coalesce(r.rolcanlogin, false),
+       coalesce((SELECT string_agg(CASE WHEN m.member = r.oid THEN 'member of ' ELSE 'has member ' END
+                                   || regexp_replace(g.rolname, '[[:cntrl:]]', '?', 'g'), ', ' ORDER BY g.rolname)
+                   FROM pg_auth_members m JOIN pg_roles g ON g.oid = CASE WHEN m.member = r.oid THEN m.roleid ELSE m.member END
+                  WHERE m.member = r.oid OR m.roleid = r.oid), ''),
+       coalesce((SELECT pg_has_role(r.oid, o.oid, 'MEMBER') OR pg_has_role(o.oid, r.oid, 'MEMBER') FROM pg_roles o WHERE o.rolname = k.other), false)
+  FROM (VALUES (1, 'app', :'app_role', :'app_marker', :'mig_role'), (2, 'migrate', :'mig_role', :'mig_marker', :'app_role')) k(ord, kind, name, marker, other)
+  LEFT JOIN pg_roles r ON r.rolname = k.name
+ WHERE k.name <> ''
+ ORDER BY k.ord;
+SELECT 'need', k, EXISTS (SELECT FROM pg_roles WHERE rolname = k) FROM unnest(string_to_array(:'need', ',')) k WHERE k <> '';
+SQL
+  local dummy="(SELECT NULL::oid AS datoid, NULL::name AS datname, NULL::oid AS from_role, NULL::oid AS to_role, NULL::timestamptz AS done_at WHERE false)"
+  [[ "$pg_ledger" == "true" ]] || { [[ "$existing_mode" == "true" ]] && pg_sql_preflight_db "$dummy"; return 0; }
+  # Trust first, from the catalogs only (pg_namespace, pg_class, pg_attribute): the ledger
+  # itself is not read here.
+  cat <<'SQL'
+SELECT to_regclass('infra_skills.ownership_transfer') IS NOT NULL AS l_exists,
+       to_regclass('infra_skills.create_intent') IS NOT NULL AS i_exists,
+       coalesce((SELECT n.nspowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) FROM pg_namespace n WHERE n.nspname = 'infra_skills'), true) AS l_schema_ok,
+       NOT EXISTS (SELECT FROM pg_class c
+                    WHERE c.oid IN (to_regclass('infra_skills.ownership_transfer'), to_regclass('infra_skills.create_intent'))
+                      AND NOT (c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user) AND c.relkind = 'r')) AS l_table_ok,
+       (to_regclass('infra_skills.ownership_transfer') IS NULL
+         OR (SELECT count(*) = 6 AND count(*) FILTER (WHERE attname IN ('datoid', 'datname', 'from_role', 'to_role', 'started_at', 'done_at')) = 6
+               FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.ownership_transfer') AND attnum > 0 AND NOT attisdropped))
+       AND (to_regclass('infra_skills.create_intent') IS NULL
+         OR (SELECT count(*) = 7 AND count(*) FILTER (WHERE attname IN ('datname', 'app', 'revoke_public', 'started_at', 'done_at', 'datoid', 'nonce')) = 7
+               FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.create_intent') AND attnum > 0 AND NOT attisdropped)) AS l_cols_ok \gset
+SELECT 'ledger', :'l_schema_ok', :'l_table_ok', :'l_cols_ok';
+SELECT (:'l_schema_ok'::boolean AND :'l_table_ok'::boolean AND :'l_cols_ok'::boolean) AS l_trusted \gset
+SQL
+  [[ "$existing_mode" == "true" ]] || return 0
+  # Only --create-missing reads create_intent, and only --take-ownership ownership_transfer; each
+  # only once the checks above passed.
+  if [[ "$PG_CREATE_MISSING" == "true" ]]; then
+    printf '\\set app_id %s\n' "'${app_id}'"
+    # A pending intent is bound to its database by the oid it recorded right after CREATE DATABASE;
+    # before that oid is recorded, only by the marker of that one creation (its nonce).
+    cat <<'SQL'
+SELECT (:'l_trusted'::boolean AND :'i_exists'::boolean) AS use_intent \gset
+\if :use_intent
+SELECT 'intent', i.datname, (i.app = :'app_id'),
+       coalesce(i.app = :'app_id' AND CASE WHEN i.datoid IS NOT NULL THEN i.datoid = d.oid
+                                           ELSE shobj_description(d.oid, 'pg_database') = 'infra-skills:created:' || i.app || ':' || i.nonce END, false),
+       regexp_replace(i.app, '[[:cntrl:]]', '?', 'g')
+  FROM infra_skills.create_intent i LEFT JOIN pg_database d ON d.datname = i.datname
+ WHERE i.done_at IS NULL AND i.datname = ANY (string_to_array(:'targets', ' '));
+\endif
+SQL
+  fi
+  if [[ "$PG_TAKE_OWNERSHIP" != "true" ]]; then
+    pg_sql_preflight_db "$dummy"
+    return 0
+  fi
+  cat <<'SQL'
+SELECT (:'l_trusted'::boolean AND :'l_exists'::boolean) AS use_ledger \gset
+\if :use_ledger
+SQL
+  pg_sql_preflight_db "infra_skills.ownership_transfer"
+  printf '%s\n' '\else'
+  pg_sql_preflight_db "$dummy"
+  printf '%s\n' '\endif'
+}
+
+# pg_sql_preflight_db <ledger source>: the preflight's db rows.
+pg_sql_preflight_db() {
+  cat <<SQL
+SELECT 'db', t.name, (d.oid IS NOT NULL),
+       coalesce(regexp_replace(o.rolname, '[[:cntrl:]]', '?', 'g'), ''),
+       coalesce(d.datdba = n.oid, false),
+       (l.datoid IS NOT NULL),
+       coalesce(regexp_replace(eo.rolname, '[[:cntrl:]]', '?', 'g'), ''),
+       coalesce(eo.oid = n.oid, false),
+       coalesce(eo.rolsuper OR eo.rolname ~ '^pg_', false),
+       coalesce(has_database_privilege('public', d.oid, 'CONNECT'), false),
+       coalesce(pub.now, ''), coalesce(pub.may, ''),
+       coalesce(regexp_replace(pg_get_userbyid(l.to_role), '[[:cntrl:]]', '?', 'g'), ''),
+       coalesce(l.to_role = n.oid, false),
+       coalesce(d.datdba IN (l.from_role, l.to_role), true),
+       coalesce(d.datdba::text, ''),
+       coalesce(d.oid::text, ''), coalesce(eo.oid::text, '')
+  FROM unnest(string_to_array(:'targets', ' ')) WITH ORDINALITY t(name, ord)
+  LEFT JOIN pg_database d ON d.datname = t.name
+  LEFT JOIN pg_roles o ON o.oid = d.datdba
+  LEFT JOIN pg_roles n ON n.rolname = :'owner'
+  LEFT JOIN $1 l ON l.datoid = d.oid AND l.done_at IS NULL
+  LEFT JOIN pg_roles eo ON eo.oid = coalesce(l.from_role, d.datdba)
+  LEFT JOIN LATERAL (
+    SELECT array_to_string((array_agg(x.name ORDER BY x.name) FILTER (WHERE x.connected))[1:20], ', ')
+             || CASE WHEN count(*) FILTER (WHERE x.connected) > 20 THEN format(' (+%s more)', count(*) FILTER (WHERE x.connected) - 20) ELSE '' END AS now,
+           array_to_string((array_agg(x.name ORDER BY x.name))[1:20], ', ')
+             || CASE WHEN count(*) > 20 THEN format(' (+%s more)', count(*) - 20) ELSE '' END AS may
+      FROM (SELECT regexp_replace(r.rolname, '[[:cntrl:]]', '?', 'g') AS name,
+                   EXISTS (SELECT FROM pg_stat_activity a WHERE a.datid = d.oid AND a.usesysid = r.oid) AS connected
+              FROM pg_roles r
+             WHERE r.rolcanlogin AND NOT r.rolsuper AND r.oid <> d.datdba
+               AND r.rolname <> ALL (string_to_array(:'excluded', ','))
+               AND r.rolname NOT IN (:'app_role', :'mig_role')
+               AND NOT EXISTS (SELECT FROM $1 la WHERE la.datoid = d.oid AND la.from_role = r.oid)
+               AND NOT EXISTS (SELECT FROM aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) e
+                                WHERE e.grantee <> 0 AND e.privilege_type = 'CONNECT' AND pg_has_role(r.oid, e.grantee, 'USAGE'))) x
+  ) pub ON d.oid IS NOT NULL AND has_database_privilege('public', d.oid, 'CONNECT')
+ ORDER BY t.ord;
+SQL
+}
+
+# The app role's cluster-wide part in --database mode: created with this app's marker, LOGIN,
+# the connection limit, the password (unless kept), the timeouts.
+pg_sql_app_role() {
+  printf '\\set role %s\n\\set stmt_to %s\n\\set idle_to %s\n' \
+    "'${app_username}'" "'${statement_timeout}'" "'${idle_tx_timeout}'"
+  pg_sql_role_tx role app "$app_oid" "$mig_role" "${app_pw_now:-$app_pw_set}" app_verifier "$conn_limit" true
+  cat <<'SQL'
+SELECT format('ALTER ROLE %I SET statement_timeout = %L', :'role', :'stmt_to') WHERE :'stmt_to' <> '' \gexec
+SELECT format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', :'role', :'idle_to') WHERE :'idle_to' <> '' \gexec
+SQL
+}
+
+# The migration role's cluster-wide part: created with its marker, LOGIN, its own connection
+# limit, the password (unless kept), no statement or idle-in-transaction timeout. It is never a
+# member of the app role, nor the app role of it, by any path (the preflight and the guard refuse
+# that). Needs :role set.
+pg_sql_migration_role() {
+  printf '\\set mrole %s\n' "'${mig_role}'"
+  pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" "${mig_pw_now:-$mig_pw_set}" mig_verifier "$mig_conn_limit" true
+  cat <<'SQL'
+ALTER ROLE :"mrole" SET statement_timeout = 0;
+ALTER ROLE :"mrole" SET idle_in_transaction_session_timeout = 0;
+SQL
+}
+
+# pg_sql_rights <psql variable holding the grantee>: in the current database, USAGE and CREATE
+# on every schema (pg_* and information_schema aside), DML on all tables, USAGE, SELECT, UPDATE
+# on all sequences.
+pg_sql_rights() {
+  cat <<SQL
+SELECT format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', nspname, :'$1') FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' \\gexec
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA %I TO %I', nspname, :'$1') FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' \\gexec
+SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I', nspname, :'$1') FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema' \\gexec
+SQL
+}
+
+# pg_sql_creator_defaults <psql variable holding the grantee>: default privileges for the roles
+# that create objects here (the database owner, each schema owner and the app role; not
+# superusers, not pg_*) to the grantee, the grantee itself aside. Needs the temp view
+# infra_skills_creators.
+pg_sql_creator_defaults() {
+  cat <<SQL
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLES TO %I', rolname, :'$1') FROM infra_skills_creators WHERE rolname <> :'$1' \\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO %I', rolname, :'$1') FROM infra_skills_creators WHERE rolname <> :'$1' \\gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT USAGE ON SCHEMAS TO %I', rolname, :'$1') FROM infra_skills_creators WHERE rolname <> :'$1' \\gexec
+SQL
+}
+
+pg_sql_creators_view() {
+  cat <<'SQL'
+CREATE TEMP VIEW infra_skills_creators AS
+  SELECT DISTINCT r.rolname FROM pg_roles r
+   WHERE (r.oid IN (SELECT datdba FROM pg_database WHERE datname = current_database()
+                   UNION SELECT nspowner FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname <> 'information_schema')
+      OR r.rolname = :'role')
+     AND NOT r.rolsuper AND r.rolname !~ '^pg_';
+SQL
+}
+
+# pg_sql_migration_in_db <schemas>: the migration role in the current database. Its schemas
+# (--migration-schema) are created or moved to it, and the app role gets USAGE, CREATE and DML
+# on them; the migration role gets the same rights as the app role and default privileges from
+# the creators; ALTER DEFAULT PRIVILEGES FOR ROLE <migrate> gives the app role what it creates.
+pg_sql_migration_in_db() {
+  if [[ -n "$1" ]]; then
+    printf '\\set mschemas %s\n' "'$1'"
+    cat <<'SQL'
+SELECT format('CREATE SCHEMA IF NOT EXISTS %I AUTHORIZATION %I', s, :'mrole') FROM unnest(string_to_array(:'mschemas', ' ')) s \gexec
+SELECT format('ALTER SCHEMA %I OWNER TO %I', n.nspname, :'mrole') FROM pg_namespace n
+ WHERE n.nspname = ANY (string_to_array(:'mschemas', ' ')) AND n.nspowner <> (SELECT oid FROM pg_roles WHERE rolname = :'mrole') \gexec
+SELECT format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', s, :'role') FROM unnest(string_to_array(:'mschemas', ' ')) s \gexec
+SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA %I TO %I', s, :'role') FROM unnest(string_to_array(:'mschemas', ' ')) s \gexec
+SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I', s, :'role') FROM unnest(string_to_array(:'mschemas', ' ')) s \gexec
+SQL
+  fi
+  pg_sql_rights mrole
+  pg_sql_creator_defaults mrole
+  cat <<'SQL'
+ALTER DEFAULT PRIVILEGES FOR ROLE :"mrole" GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLES TO :"role";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"mrole" GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO :"role";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"mrole" GRANT USAGE ON SCHEMAS TO :"role";
+SQL
+}
+
+# pg_migration_schemas <db>: the schemas --migration-schema names in <db>, space separated.
+pg_migration_schemas() {
+  local s out=""
+  for s in ${PG_MIGRATION_SCHEMAS[@]+"${PG_MIGRATION_SCHEMAS[@]}"}; do
+    [[ "${s%%.*}" == "$1" ]] && out+="${out:+ }${s#*.}"
+  done
+  printf '%s' "$out"
+}
+
+# pg_public_list_sql <database>: a read-only query that lists every login role (superusers and the
+# owner aside) that reaches <database> only through PUBLIC (with the preflight's predicate: PUBLIC
+# holds CONNECT there, else nothing), and whether it is connected now. The name is a validated
+# database name (no quote).
+pg_public_list_sql() {
+  printf '%s' "SELECT r.rolname, EXISTS (SELECT FROM pg_stat_activity a WHERE a.datid = d.oid AND a.usesysid = r.oid) AS connected_now FROM pg_database d JOIN pg_roles r ON r.rolcanlogin AND NOT r.rolsuper AND r.oid <> d.datdba WHERE d.datname = '$1' AND has_database_privilege('public', d.oid, 'CONNECT') AND NOT EXISTS (SELECT FROM aclexplode(coalesce(d.datacl, acldefault('d', d.datdba))) e WHERE e.grantee <> 0 AND e.privilege_type = 'CONNECT' AND pg_has_role(r.oid, e.grantee, 'USAGE')) ORDER BY 1;"
+}
+
+# pg_recovery_sql <target index>: prints, on stderr, plain SQL that finishes by hand the ACL of a
+# database an earlier --create-missing run made and did not finish, to run with psql as the
+# superuser (database postgres) once the database is identified: one transaction that holds off a
+# rename or drop, checks it is still the database the preflight saw (its oid), grants CONNECT to its
+# owner and this run's roles (those that exist), revokes PUBLIC's CONNECT and TEMPORARY and deletes
+# the intent row, all or nothing (it starts with \set ON_ERROR_STOP on: a failed check stops psql
+# before anything else runs). It changes no role's password and no Secret.
+pg_recovery_sql() {
+  local db="${target_names[$1]}" oid="${t_datoid[$1]}" r
+  printf '%s\n' "----- SQL: finish the ACL of ${db} by hand (psql as the superuser, database postgres) -----" \
+    '\set ON_ERROR_STOP on' 'BEGIN;' "SET LOCAL lock_timeout = '5s';" 'LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;' >&2
+  printf "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE oid = %s AND datname = '%s') THEN RAISE EXCEPTION 'database %s is no longer oid %s; nothing changed'; END IF; END \$\$;\n" \
+    "$oid" "$db" "$db" "$oid" >&2
+  printf "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %%I TO %%I', datname, pg_get_userbyid(datdba)) FROM pg_database WHERE oid = %s \\\\gexec\n" "$oid" >&2
+  for r in "$app_username" "$mig_role" ${keep_roles//,/ }; do
+    [[ -n "$r" ]] || continue
+    printf "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %%I TO %%I', '%s', '%s') WHERE EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') \\\\gexec\n" "$db" "$r" "$r" >&2
+  done
+  for r in "${ro_role:-}" "${ro_keep:-}" cnpg_pooler_pgbouncer; do
+    [[ -n "$r" ]] || continue
+    printf "SELECT format('GRANT CONNECT ON DATABASE %%I TO %%I', '%s', '%s') WHERE EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') \\\\gexec\n" "$db" "$r" "$r" >&2
+  done
+  printf '%s\n' "REVOKE CONNECT, TEMPORARY ON DATABASE \"${db}\" FROM PUBLIC;" \
+    "DELETE FROM infra_skills.create_intent WHERE datname = '${db}' AND app = '${app_id}' AND done_at IS NULL;" 'COMMIT;' \
+    '----- end of SQL -----' >&2
+}
+
+# pg_sql_preflight_objects: the second, read-only part of the preflight, for --take-ownership: in
+# each database to move (\c), with the source role the first part found (:src). It runs before any
+# password is made or set, so whatever would make the move fail stops the run with nothing changed.
+# Rows (fields split by \x1f):
+#   objects <database> <catalogs>   objects of the source that the move does not handle (operators,
+#                                   collations, text search objects, ...): the run refuses;
+#   defacl <database> <entries>     default privileges of the source that GRANT cannot reproduce
+#                                   exactly (a grant option, or a privilege revoked from the
+#                                   built-in default): the run refuses and prints them;
+#   dstacl <database> <entries>     the destination already has default privileges here that this
+#                                   script does not make itself (anything but exactly its own
+#                                   grants to the app and migration roles, compared by grantee oid,
+#                                   and the built-in defaults): the run refuses and prints them;
+#   extskip <database> <what>       extensions of the source, and the source's members of any
+#                                   extension: they stay with the source (a warning).
+pg_sql_preflight_objects() {
+  local i
+  printf '%s\n' '-- infra-skills:preflight-objects' 'SET client_min_messages = warning;'
+  for i in "${!target_names[@]}"; do
+    [[ "${t_transfer[$i]}" == "true" ]] || continue
+    printf '\\set db %s\n\\set src %s\n\\set dst %s\n\\set app_r %s\n\\set mig_r %s\n\\c :"db"\n' \
+      "'${target_names[$i]}'" "${t_src_oid[$i]}" "'${new_owner}'" "'${app_username}'" "'${mig_role}'"
+    cat <<'SQL'
+SELECT 'objects', current_database(), string_agg(DISTINCT s.classid::regclass::text, ', ')
+  FROM pg_shdepend s
+ WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND s.refclassid = 'pg_authid'::regclass AND s.refobjid = :src AND s.deptype = 'o'
+   AND s.classid NOT IN ('pg_default_acl'::regclass, 'pg_extension'::regclass, 'pg_namespace'::regclass,
+                         'pg_proc'::regclass, 'pg_largeobject'::regclass)
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = s.classid AND e.objid = s.objid AND e.deptype = 'e')
+   AND NOT (s.classid = 'pg_class'::regclass AND EXISTS (
+         SELECT FROM pg_class c WHERE c.oid = s.objid AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c')
+            AND NOT (c.relkind = 'S' AND EXISTS (SELECT FROM pg_depend a JOIN pg_class o ON o.oid = a.refobjid
+                                                  WHERE a.classid = 'pg_class'::regclass AND a.objid = c.oid AND a.refclassid = 'pg_class'::regclass
+                                                    AND a.deptype IN ('a', 'i') AND o.relowner <> :src))))
+   AND NOT (s.classid = 'pg_type'::regclass AND EXISTS (
+         SELECT FROM pg_type t WHERE t.oid = s.objid
+            AND ((t.typrelid = 0 AND t.typtype IN ('b', 'd', 'e', 'r', 'm') AND NOT EXISTS (SELECT FROM pg_type a WHERE a.typarray = t.oid))
+                 -- a standalone composite type: moved with its pg_class row (relkind c)
+                 OR (t.typtype = 'c' AND EXISTS (SELECT FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c')))))
+HAVING count(*) > 0;
+SELECT 'defacl', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
+  FROM (SELECT format('%s%s: %s to %s WITH GRANT OPTION', k.w, k.s, e.privilege_type,
+                      CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE regexp_replace(pg_get_userbyid(e.grantee), '[[:cntrl:]]', '?', 'g') END) AS d
+          FROM pg_default_acl a
+          CROSS JOIN LATERAL (SELECT CASE a.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions'
+                                                          WHEN 'T' THEN 'types' ELSE 'schemas' END AS w,
+                                     CASE WHEN a.defaclnamespace <> 0 THEN ' in schema ' || quote_ident((SELECT nspname FROM pg_namespace WHERE oid = a.defaclnamespace))
+                                          ELSE '' END AS s) k
+          CROSS JOIN LATERAL aclexplode(a.defaclacl) e
+         WHERE a.defaclrole = :src AND e.is_grantable AND e.grantee <> a.defaclrole
+        UNION ALL
+        SELECT format('%s: %s revoked from %s (a built-in default)', k.w, d.privilege_type,
+                      CASE WHEN d.grantee = 0 THEN 'PUBLIC' ELSE regexp_replace(pg_get_userbyid(d.grantee), '[[:cntrl:]]', '?', 'g') END)
+          FROM pg_default_acl a
+          CROSS JOIN LATERAL (SELECT CASE a.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions'
+                                                          WHEN 'T' THEN 'types' ELSE 'schemas' END AS w) k
+          CROSS JOIN LATERAL aclexplode(acldefault((CASE a.defaclobjtype WHEN 'S' THEN 's' ELSE a.defaclobjtype::text END)::"char", a.defaclrole)) d
+         WHERE a.defaclrole = :src AND a.defaclnamespace = 0
+           AND NOT EXISTS (SELECT FROM aclexplode(a.defaclacl) e WHERE e.grantee = d.grantee AND e.privilege_type = d.privilege_type)) x
+HAVING count(*) > 0;
+WITH bad AS (
+  -- the destination's default privileges in this database, entry by entry (by grantee oid; 0 =
+  -- PUBLIC), that are neither, on a global entry (no per-schema one is ever exempt), exactly a
+  -- grant this script makes (to this run's app or migration role, or to another role this script
+  -- made, by its marker; no grant option: DML on tables; USAGE, SELECT, UPDATE on sequences;
+  -- USAGE on schemas) nor the built-in default; and on a global entry, each built-in default revoked
+  SELECT a.defaclobjtype AS t, a.defaclnamespace AS ns,
+         format('%s %s%s', CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(e.grantee)) END,
+                e.privilege_type, CASE WHEN e.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) AS entry
+    FROM pg_default_acl a CROSS JOIN LATERAL aclexplode(a.defaclacl) e
+   WHERE a.defaclrole = coalesce((SELECT oid FROM pg_roles WHERE rolname = :'dst'), 0)
+     AND NOT (a.defaclnamespace = 0 AND NOT e.is_grantable
+              AND (e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (:'app_r', :'mig_r'))
+                   OR coalesce(shobj_description(e.grantee, 'pg_authid'), '') ~ '^infra-skills:(app|migrate):')
+              AND (a.defaclobjtype::text, e.privilege_type) IN (('r', 'SELECT'), ('r', 'INSERT'), ('r', 'UPDATE'), ('r', 'DELETE'), ('r', 'TRUNCATE'),
+                                                                ('r', 'REFERENCES'), ('r', 'TRIGGER'), ('S', 'USAGE'), ('S', 'SELECT'), ('S', 'UPDATE'),
+                                                                ('n', 'USAGE')))
+     AND NOT (a.defaclnamespace = 0 AND NOT e.is_grantable AND EXISTS (
+           SELECT FROM aclexplode(acldefault((CASE a.defaclobjtype WHEN 'S' THEN 's' ELSE a.defaclobjtype::text END)::"char", a.defaclrole)) d
+            WHERE d.grantee = e.grantee AND d.privilege_type = e.privilege_type))
+  UNION ALL
+  SELECT a.defaclobjtype, a.defaclnamespace,
+         format('%s %s revoked (a built-in default)', CASE WHEN d.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(d.grantee)) END,
+                d.privilege_type)
+    FROM pg_default_acl a
+    CROSS JOIN LATERAL aclexplode(acldefault((CASE a.defaclobjtype WHEN 'S' THEN 's' ELSE a.defaclobjtype::text END)::"char", a.defaclrole)) d
+   WHERE a.defaclrole = coalesce((SELECT oid FROM pg_roles WHERE rolname = :'dst'), 0) AND a.defaclnamespace = 0
+     AND NOT EXISTS (SELECT FROM aclexplode(a.defaclacl) e WHERE e.grantee = d.grantee AND e.privilege_type = d.privilege_type)
+)
+SELECT 'dstacl', current_database(),
+       string_agg(format('%s%s: %s', CASE b.t WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions' WHEN 'T' THEN 'types' ELSE 'schemas' END,
+                         CASE WHEN b.ns <> 0 THEN ' in schema ' || quote_ident((SELECT nspname FROM pg_namespace WHERE oid = b.ns)) ELSE '' END,
+                         regexp_replace(b.entry, '[[:cntrl:]]', '?', 'g')), '; ' ORDER BY b.t, b.ns, b.entry)
+  FROM bad b
+HAVING count(*) > 0;
+SELECT 'extskip', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
+  FROM (SELECT format('extension %s (its own)', regexp_replace(x.extname, '[[:cntrl:]]', '?', 'g')) AS d
+          FROM pg_extension x WHERE x.extowner = :src
+        UNION ALL
+        SELECT format('%s object(s) in extension %s (owned by %s)', count(*), regexp_replace(x.extname, '[[:cntrl:]]', '?', 'g'),
+                      regexp_replace(pg_get_userbyid(x.extowner), '[[:cntrl:]]', '?', 'g'))
+          FROM pg_shdepend s
+          JOIN pg_depend e ON e.classid = s.classid AND e.objid = s.objid AND e.deptype = 'e' AND e.refclassid = 'pg_extension'::regclass
+          JOIN pg_extension x ON x.oid = e.refobjid
+         WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND s.refclassid = 'pg_authid'::regclass AND s.refobjid = :src AND s.deptype = 'o' AND x.extowner <> :src
+         GROUP BY x.extname, x.extowner) x
+HAVING count(*) > 0;
+SQL
+  done
+}
+
+# pg_sql_existing_db <index>: one --database target, from the postgres database: create it
+# (--create-missing, after recording the intent; or finish one an earlier run created), move its
+# ownership (--take-ownership, through the ledger), CONNECT for the roles, PUBLIC's CONNECT
+# (revoked only with --revoke-public, or on a database made here), then in the database the
+# rights and default privileges. Prints SQL.
+pg_sql_existing_db() {
+  local i="$1" db="${target_names[$1]}" schemas revoke=false
+  schemas="$(pg_migration_schemas "$db")"
+  [[ "$PG_REVOKE_PUBLIC" == "true" || "${t_creates[$i]}" == "true" ]] && revoke=true
+  printf '\\set db %s\n' "'${db}'"
+  if [[ "${t_creates[$i]}" == "true" ]]; then
+    # The intent first, claimed by (app, name): a run that stops after CREATE DATABASE leaves it
+    # pending, and the next run of this app with --create-missing finishes the database (PUBLIC's
+    # CONNECT revoked) instead of taking it for an existing one; another app's pending intent for
+    # the name is never taken over (the preflight refused it; checked again here). Each creation
+    # gets a nonce: right after CREATE DATABASE (not conditional: a database someone else made
+    # since the preflight stops the run) the database gets the marker infra-skills:created:<app-id>:
+    # <nonce> and the intent its oid. A retry finishes only the database that oid names, or, if the
+    # run stopped before the oid was recorded, the one with that creation's marker.
+    printf '\\set app %s\n' "'${app_id}'"
+    cat <<'SQL'
+INSERT INTO infra_skills.create_intent AS t (datname, app, revoke_public, nonce) VALUES (:'db', :'app', true, gen_random_uuid()::text)
+ON CONFLICT (datname) DO UPDATE SET app = excluded.app, revoke_public = true, nonce = excluded.nonce, started_at = now(), done_at = NULL, datoid = NULL
+ WHERE t.done_at IS NOT NULL;
+SELECT set_config('infra_skills.c_db', :'db', false) AS c_db_set, set_config('infra_skills.c_app', :'app', false) AS c_app_set \gset
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM infra_skills.create_intent
+                  WHERE datname = current_setting('infra_skills.c_db') AND app = current_setting('infra_skills.c_app') AND done_at IS NULL) THEN
+    RAISE EXCEPTION 'infra-skills: the pending creation of database % belongs to another app; nothing created', current_setting('infra_skills.c_db');
+  END IF;
+END
+$$;
+SELECT 'infra-skills:created:' || app || ':' || nonce AS c_marker FROM infra_skills.create_intent
+ WHERE datname = :'db' AND app = :'app' AND done_at IS NULL \gset
+SQL
+    if [[ "${t_finish[$i]}" != "true" ]]; then
+      echo 'CREATE DATABASE :"db" OWNER :"owner";'
+      echo "COMMENT ON DATABASE :\"db\" IS :'c_marker';"
+    fi
+    cat <<'SQL'
+UPDATE infra_skills.create_intent SET datoid = (SELECT oid FROM pg_database WHERE datname = :'db' AND shobj_description(oid, 'pg_database') = :'c_marker')
+ WHERE datname = :'db' AND app = :'app' AND done_at IS NULL AND datoid IS NULL;
+-- The ACL of a database this run (or an earlier one) created: one transaction that holds off a
+-- rename or drop (pg_database) and first checks it is still the recorded database. The recorded
+-- oid is authoritative (the marker only established it, in the UPDATE above or an earlier run).
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM infra_skills.create_intent i JOIN pg_database x ON x.oid = i.datoid AND x.datname = i.datname
+                  WHERE i.datname = current_setting('infra_skills.c_db') AND i.app = current_setting('infra_skills.c_app') AND i.done_at IS NULL) THEN
+    RAISE EXCEPTION 'infra-skills: database % is not the one this app''s creation recorded (its oid); its ACL is left as it is', current_setting('infra_skills.c_db');
+  END IF;
+END
+$$;
+SQL
+  fi
+  if [[ "${t_transfer[$i]}" == "true" ]]; then
+    # The pending ledger row of this database, by the oid the preflight saw (0 when there is none:
+    # the transaction below then refuses); the destination is the role as its transaction guarded it.
+    printf '\\set datoid %s\n' "${t_datoid[$i]}"
+    cat <<'SQL'
+SELECT coalesce(l.datoid, 0) AS l_datoid, coalesce(l.from_role, 0) AS from_oid, coalesce(l.to_role, 0) AS to_oid,
+       :dest_goid AS owner_oid
+  FROM (SELECT 1) one
+  LEFT JOIN LATERAL (SELECT t.datoid, t.from_role, t.to_role FROM infra_skills.ownership_transfer t
+                      WHERE t.datoid = :datoid AND t.done_at IS NULL) l ON true \gset
+SQL
+  fi
+  echo 'GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"role";'
+  if [[ -n "$mig_role" ]]; then
+    echo 'GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"mrole";'
+    if [[ -n "$schemas" ]]; then echo 'GRANT CREATE ON DATABASE :"db" TO :"mrole";'; fi
+  fi
+  cat <<'SQL'
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db', :'ro') WHERE :'ro' <> '' AND EXISTS (SELECT FROM pg_roles WHERE rolname = :'ro') \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO cnpg_pooler_pgbouncer', :'db') WHERE EXISTS (SELECT FROM pg_roles WHERE rolname = 'cnpg_pooler_pgbouncer') \gexec
+SQL
+  if [[ "$revoke" == "true" ]]; then
+    echo "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', datname, pg_get_userbyid(datdba)) FROM pg_database WHERE datname = :'db' \\gexec"
+    if [[ "$pg_ledger" == "true" ]]; then
+      cat <<'SQL'
+SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', d.datname, r.rolname) FROM infra_skills.ownership_transfer l
+  JOIN pg_database d ON d.oid = l.datoid JOIN pg_roles r ON r.oid = l.from_role WHERE d.datname = :'db' \gexec
+SQL
+    fi
+    cat <<'SQL'
+SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', :'db', k) FROM unnest(string_to_array(:'keep', ',')) k WHERE k <> '' \gexec
+SELECT format('GRANT CONNECT ON DATABASE %I TO %I', :'db', :'ro_keep') WHERE :'ro_keep' <> '' \gexec
+REVOKE CONNECT, TEMPORARY ON DATABASE :"db" FROM PUBLIC;
+SQL
+  fi
+  [[ "${t_creates[$i]}" == "true" ]] && echo 'COMMIT;'
+  cat <<'SQL'
+\c :"db"
+SET client_min_messages = warning;
+SQL
+  [[ "${t_transfer[$i]}" == "true" ]] && pg_sql_takeover
+  pg_sql_rights role
+  pg_sql_creators_view
+  pg_sql_creator_defaults role
+  if [[ -n "$mig_role" ]]; then pg_sql_migration_in_db "$schemas"; fi
+  echo '\c postgres'
+  if [[ "${t_transfer[$i]}" == "true" ]]; then
+    echo "UPDATE infra_skills.ownership_transfer SET done_at = now() WHERE datoid = :l_datoid AND done_at IS NULL;"
+  fi
+  if [[ "${t_creates[$i]}" == "true" ]]; then
+    echo "UPDATE infra_skills.create_intent SET done_at = now() WHERE datname = :'db' AND app = :'app' AND done_at IS NULL;"
+  fi
+}
+
+# pg_sql_takeover: the ownership move of the current database, from the source role the ledger
+# recorded (:from_oid) to the destination (:to_oid), as one transaction with bounded waits
+# (lock_timeout 5s, statement_timeout 60s): a lock held elsewhere fails the run fast, with
+# nothing changed. No REASSIGN OWNED: it would also move the source's other databases and its
+# tablespaces. Instead:
+#   1. ALTER ... OWNER for each object of the source in this database: schemas; tables,
+#      partitions, views, materialized views, sequences (those of a column follow their table),
+#      foreign tables, composite types; functions, procedures, aggregates; types, domains, ranges
+#      and multiranges (array types follow); large objects. Extensions and the source's members of
+#      any extension stay with the source (Postgres has no ALTER EXTENSION ... OWNER; the preflight
+#      warns about them). The source's default privileges are copied to the destination (the
+#      source's own stay); the preflight refused any it cannot copy exactly;
+#   2. LOCK pg_database (SHARE ROW EXCLUSIVE, held until commit, no concurrent ALTER DATABASE
+#      OWNER), then check the database oid, the role oids and the live owner against the ledger
+#      row: the owner must be the source (or already the destination, when an earlier run's move
+#      committed but was not marked done). Any mismatch rolls everything back;
+#   3. ALTER DATABASE ... OWNER, then CONNECT and TEMPORARY again for the source and the app role
+#      (ALTER DATABASE OWNER hands the old owner's own ACL entries to the new owner);
+#   4. a check that nothing in this database still belongs to the source (default privileges and
+#      extensions aside), else the whole move rolls back.
+pg_sql_takeover() {
+  cat <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '60s';
+SELECT set_config('infra_skills.from_oid', :'from_oid', true) AS s_from, set_config('infra_skills.to_oid', :'to_oid', true) AS s_to,
+       set_config('infra_skills.datoid', :'l_datoid', true) AS s_dat, set_config('infra_skills.owner_oid', :'owner_oid', true) AS s_own \gset
+SELECT format('ALTER SCHEMA %I OWNER TO %I', n.nspname, pg_get_userbyid(:to_oid)) FROM pg_namespace n
+ WHERE n.nspowner = :from_oid
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = 'pg_namespace'::regclass AND e.objid = n.oid AND e.deptype = 'e') \gexec
+SELECT format('ALTER %s %s OWNER TO %I', CASE c.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'S' THEN 'SEQUENCE'
+                                          WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'c' THEN 'TYPE' ELSE 'TABLE' END, c.oid::regclass, pg_get_userbyid(:to_oid))
+  FROM pg_class c
+ WHERE c.relowner = :from_oid AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c')
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = 'pg_class'::regclass AND e.objid = c.oid AND e.deptype = 'e')
+   AND NOT (c.relkind = 'S' AND EXISTS (SELECT FROM pg_depend a WHERE a.classid = 'pg_class'::regclass AND a.objid = c.oid
+                                          AND a.refclassid = 'pg_class'::regclass AND a.deptype IN ('a', 'i')))
+ ORDER BY c.oid \gexec
+SELECT format('ALTER ROUTINE %s OWNER TO %I', p.oid::regprocedure, pg_get_userbyid(:to_oid)) FROM pg_proc p
+ WHERE p.proowner = :from_oid
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid AND e.deptype = 'e') \gexec
+SELECT format('ALTER %s %s OWNER TO %I', CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, t.oid::regtype, pg_get_userbyid(:to_oid))
+  FROM pg_type t
+ WHERE t.typowner = :from_oid AND t.typrelid = 0 AND t.typtype IN ('b', 'd', 'e', 'r')
+   AND NOT EXISTS (SELECT FROM pg_type a WHERE a.typarray = t.oid)
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = 'pg_type'::regclass AND e.objid = t.oid AND e.deptype = 'e') \gexec
+SELECT format('ALTER TYPE %s OWNER TO %I', t.oid::regtype, pg_get_userbyid(:to_oid)) FROM pg_type t
+ WHERE t.typowner = :from_oid AND t.typtype = 'm'
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = 'pg_type'::regclass AND e.objid = t.oid AND e.deptype = 'e') \gexec
+SELECT format('ALTER LARGE OBJECT %s OWNER TO %I', l.oid, pg_get_userbyid(:to_oid)) FROM pg_largeobject_metadata l WHERE l.lomowner = :from_oid \gexec
+SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s GRANT %s ON %s TO %s', pg_get_userbyid(:to_oid),
+              CASE WHEN a.defaclnamespace <> 0 THEN format(' IN SCHEMA %I', n.nspname) ELSE '' END, e.privilege_type,
+              CASE a.defaclobjtype WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS' WHEN 'T' THEN 'TYPES' ELSE 'SCHEMAS' END,
+              CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(e.grantee)) END)
+  FROM pg_default_acl a LEFT JOIN pg_namespace n ON n.oid = a.defaclnamespace, aclexplode(a.defaclacl) e
+ WHERE a.defaclrole = :from_oid AND e.grantee NOT IN (a.defaclrole, :to_oid) \gexec
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+DO $$
+DECLARE
+  f oid := current_setting('infra_skills.from_oid')::oid;
+  t oid := current_setting('infra_skills.to_oid')::oid;
+  dat oid := current_setting('infra_skills.datoid')::oid;
+  own oid := current_setting('infra_skills.owner_oid')::oid;
+  cur oid;
+  live oid;
+BEGIN
+  SELECT oid, datdba INTO cur, live FROM pg_database WHERE datname = current_database();
+  IF dat = 0 OR cur <> dat THEN
+    RAISE EXCEPTION 'infra-skills: % is not the database the ledger recorded (no pending move, or it was dropped and made again); nothing moved', current_database();
+  END IF;
+  IF t = 0 OR t <> own THEN
+    RAISE EXCEPTION 'infra-skills: the destination role of % is not the one the ledger recorded (dropped and made again?); nothing moved', current_database();
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE oid = f AND NOT rolsuper) THEN
+    RAISE EXCEPTION 'infra-skills: the recorded owner of % (oid %) is gone or now a superuser; nothing moved', current_database(), f;
+  END IF;
+  IF live <> f AND live <> t THEN
+    RAISE EXCEPTION 'infra-skills: % is owned by % now, not by % as recorded when the move started (changed by hand?); nothing moved. Check it, then fix or delete its row in infra_skills.ownership_transfer (postgres database).',
+      current_database(), pg_get_userbyid(live), pg_get_userbyid(f);
+  END IF;
+END
+$$;
+SELECT format('ALTER DATABASE %I OWNER TO %I', current_database(), pg_get_userbyid(:to_oid)) \gexec
+SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', current_database(), pg_get_userbyid(:from_oid)) \gexec
+GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"role";
+DO $$
+DECLARE
+  f oid := current_setting('infra_skills.from_oid')::oid;
+  kinds text;
+BEGIN
+  SELECT string_agg(DISTINCT s.classid::regclass::text, ', ') INTO kinds FROM pg_shdepend s
+   WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+     AND s.refclassid = 'pg_authid'::regclass AND s.refobjid = f AND s.deptype = 'o'
+     AND s.classid NOT IN ('pg_default_acl'::regclass, 'pg_extension'::regclass)
+     AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = s.classid AND e.objid = s.objid AND e.deptype = 'e');
+  IF kinds IS NOT NULL THEN
+    RAISE EXCEPTION 'infra-skills: objects in database % are still owned by % (%), kinds this script does not move; nothing moved. Move them by hand (ALTER ... OWNER TO), then re-run.',
+      current_database(), pg_get_userbyid(f), kinds;
+  END IF;
+  IF (SELECT datdba FROM pg_database WHERE datname = current_database()) = f THEN
+    RAISE EXCEPTION 'infra-skills: database % is still owned by %', current_database(), pg_get_userbyid(f);
+  END IF;
+END
+$$;
+COMMIT;
+SQL
+}
+
+provision_credentials() {
+  local app_id="$1"
+  local namespace="$NAMESPACE_POSTGRES"
+  local tenant="$PG_TENANT"
+  local app_namespace="${APP_NAMESPACE:-${tenant:-default}}"
+
+  # Validate app_id (alphanumeric and hyphens only, for safety)
+  if [[ ! "$app_id" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    err "Invalid app-id: ${app_id}"
+    err "App ID must be lowercase alphanumeric with hyphens (e.g., 'my-app', 'evse')"
+    exit 1
+  fi
+  if pg_reserved_role "$app_id"; then
+    err "Invalid app-id: ${app_id} is a reserved role (postgres, app, streaming_replica, cnpg_pooler_pgbouncer, PG_READONLY_ROLE, pg_*, ...)"
+    exit 1
+  fi
+  if [[ -n "$tenant" && ! "$tenant" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    err "Invalid tenant: ${tenant}"; exit 1
+  fi
+  # Role limits. A tenant shares the cluster with the platform's apps: its role gets a small
+  # connection budget and time limits, so a runaway query or pool cannot starve them.
+  local conn_limit statement_timeout idle_tx_timeout v
+  if [[ -n "$tenant" ]]; then
+    conn_limit="${PG_CONN_LIMIT:-${PG_TENANT_CONNECTION_LIMIT:-20}}"
+    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_TENANT_STATEMENT_TIMEOUT:-60s}}"
+    idle_tx_timeout="${PG_TENANT_IDLE_IN_TRANSACTION_TIMEOUT:-5min}"
+  else
+    conn_limit="${PG_CONN_LIMIT:-${PG_APP_CONNECTION_LIMIT:-50}}"
+    statement_timeout="${PG_STATEMENT_TIMEOUT:-${PG_APP_STATEMENT_TIMEOUT:-}}"
+    idle_tx_timeout="${PG_APP_IDLE_IN_TRANSACTION_TIMEOUT:-}"
+  fi
+  if ! pg_int_between "$conn_limit" -1 "$PG_INT_MAX"; then
+    err "connection limit must be a number from -1 to ${PG_INT_MAX}: ${conn_limit}"; exit 1
+  fi
+  for v in "$statement_timeout" "$idle_tx_timeout"; do
+    [[ -z "$v" ]] || pg_duration_ok "$v" || { err "not a Postgres duration up to ${PG_INT_MAX} ms: ${v}"; exit 1; }
+  done
+
+  # --database <name>[:<PREFIX>]: existing databases instead of a new one named <app-id>. Each
+  # entry is kept as "<db>:<PREFIX>", POSTGRES when no prefix was given.
+  local targets=() spec t_db t_prefix seen_dbs=" " seen_prefixes=" "
+  for spec in ${PG_DATABASES[@]+"${PG_DATABASES[@]}"}; do
+    t_db="${spec%%:*}"; t_prefix="POSTGRES"
+    [[ "$spec" == *:* ]] && t_prefix="${spec#*:}"
+    if [[ ! "$t_db" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ || ${#t_db} -gt 63 ]]; then
+      err "--database ${spec}: '${t_db}' is not a database name this script handles (letters, digits, _ and -, at most 63)"; exit 1
+    fi
+    case "$t_db" in postgres|template0|template1)
+      err "--database ${t_db}: the cluster's own databases are not app databases"; exit 1 ;;
+    esac
+    if [[ ! "$t_prefix" =~ ^[A-Z]([A-Z0-9_]*[A-Z0-9])?$ ]]; then
+      err "--database ${spec}: the key prefix must be upper case, e.g. JOURNAL_DB (keys JOURNAL_DB_HOST, ...)"; exit 1
+    fi
+    [[ "$seen_dbs" == *" ${t_db} "* ]] && { err "--database ${t_db} is named twice"; exit 1; }
+    if [[ "$seen_prefixes" == *" ${t_prefix} "* ]]; then
+      err "--database ${spec}: key prefix ${t_prefix} is already used by another database"
+      [[ "$t_prefix" == POSTGRES ]] && err "  (only one database may go without a prefix)"
+      exit 1
+    fi
+    seen_dbs+="${t_db} "; seen_prefixes+="${t_prefix} "
+    targets+=("${t_db}:${t_prefix}")
+  done
+  local existing_mode=false entry i
+  [[ ${#targets[@]} -gt 0 ]] && existing_mode=true
+  local app_username="${app_id}"
+  local app_database="${app_id}"
+  [[ "$existing_mode" == "false" ]] && targets=("${app_database}:POSTGRES")
+  local target_names=()
+  for entry in "${targets[@]}"; do target_names+=("${entry%%:*}"); done
+
+  # --migration-role: a second login role for migrate Jobs and backfills.
+  local mig_role="" mig_conn_limit=""
+  if [[ "$PG_MIGRATION_ROLE" == "true" ]]; then
+    mig_role="${PG_MIGRATION_ROLE_NAME:-${app_id}_migrate}"
+    if [[ ! "$mig_role" =~ ^[a-z_][a-z0-9_-]*$ || ${#mig_role} -gt 63 || "$mig_role" == "$app_id" ]]; then
+      err "Invalid migration role name: ${mig_role} (lower case, digits, _ and -, at most 63, not the app role)"; exit 1
+    fi
+    if pg_reserved_role "$mig_role"; then
+      err "Invalid migration role name: ${mig_role} is a reserved role (postgres, app, streaming_replica, cnpg_pooler_pgbouncer, PG_READONLY_ROLE, pg_*, ...)"; exit 1
+    fi
+    mig_conn_limit="${PG_MIGRATION_CONN_LIMIT:-${PG_MIGRATION_CONNECTION_LIMIT:-2}}"
+    pg_int_between "$mig_conn_limit" 1 "$PG_INT_MAX" || { err "migration connection limit must be a number from 1 to ${PG_INT_MAX}: ${mig_conn_limit}"; exit 1; }
+  fi
+  # --migration-schema <db>.<schema>: schemas the migration role owns (it gets CREATE on <db>).
+  for spec in ${PG_MIGRATION_SCHEMAS[@]+"${PG_MIGRATION_SCHEMAS[@]}"}; do
+    t_db="${spec%%.*}"
+    if [[ "$spec" != *.* || ! "${spec#*.}" =~ ^[a-z_][a-z0-9_]*$ || ${#spec} -gt 127 || "${spec#*.}" == pg_* || "${spec#*.}" == information_schema ]]; then
+      err "--migration-schema ${spec}: give <database>.<schema>, the schema lower case, digits and _ (not pg_* or information_schema)"; exit 1
+    fi
+    [[ " ${target_names[*]} " == *" ${t_db} "* ]] || { err "--migration-schema ${spec}: ${t_db} is not one of this run's databases (${target_names[*]})"; exit 1; }
+  done
+
+  # --revoke-public --keep-connect <role>[,<role>] (with --database)
+  local keep_roles="" k need_roles="" pub_excluded="" _keep=()
+  if [[ "$PG_REVOKE_PUBLIC" == "true" ]]; then
+    if [[ "$PG_KEEP_CONNECT" != "none" ]]; then
+      IFS=',' read -r -a _keep <<<"$PG_KEEP_CONNECT"
+      for k in ${_keep[@]+"${_keep[@]}"}; do
+        if [[ ! "$k" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ || ${#k} -gt 63 ]]; then
+          err "--keep-connect: '${k}' is not a role name this script handles (letters, digits, _ . -, at most 63)"; exit 1
+        fi
+        keep_roles+="${keep_roles:+,}${k}"
+      done
+      [[ -n "$keep_roles" ]] || { err "--keep-connect: no role given (use --keep-connect none to keep no other role)"; exit 1; }
+    fi
+  fi
+
+  log "=== Provisioning PostgreSQL credentials for application: ${app_id}${tenant:+ (tenant ${tenant})} ==="
+
+  # Check if cluster exists and is ready
+  if ! kubectl -n "$namespace" get cluster postgres-cluster >/dev/null 2>&1; then
+    err "PostgreSQL cluster not found in namespace: $namespace"
+    err "Run provisioning first: tools/k3s/postgres.sh ${ENV_NAME}"
+    exit 1
+  fi
+
+  # Check cluster status
+  local phase
+  phase=$(kubectl -n "$namespace" get cluster postgres-cluster -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+  if [[ "$phase" != "Cluster in healthy state" ]]; then
+    warn "PostgreSQL cluster is not in healthy state (phase: ${phase})"
+    warn "Credentials provisioning may fail. Continue anyway? (y/N)"
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      exit 1
+    fi
+  fi
+
+  local pg_host="postgres-cluster-rw.${namespace}.svc.cluster.local"
+  local pg_port="5432"
+  local pooler_name="pooler-${app_id}"
+  local superuser="postgres"
+  local secrets_dir="$ENVS_ROOT/${ENV_NAME}/secrets.plain"
+  local secret_file="${secrets_dir}/${app_id}-db.secret.yaml"
+  local mig_secret_file="${secrets_dir}/${app_id}-db-migrate.secret.yaml"
+  # shellcheck disable=SC2034  # the passwords are read by name (pg_sql_role_tx, pg_write_secret)
+  # +x: never exported, even when the caller's environment holds these names (bash 3.2 locals
+  # inherit the export attribute) -- no secret reaches a child process's environment.
+  local +x app_password="" mig_password=""
+  local app_pw_set=true mig_pw_set=true app_exists=f mig_exists=f app_oid="" mig_oid=""
+  # shellcheck disable=SC2034  # read by name (pg_sql_role_tx)
+  local +x app_verifier="" mig_verifier=""
+  local ro_role=""
+  [[ -z "$tenant" ]] && ro_role="${PG_READONLY_ROLE:-}"
+  # --revoke-public keeps a configured read-only login's CONNECT, tenant or not (it reached the
+  # databases through PUBLIC until now).
+  local ro_keep=""
+  [[ "$PG_REVOKE_PUBLIC" == "true" ]] && ro_keep="${PG_READONLY_ROLE:-}"
+
+  # Find the primary to execute commands (psql as the local superuser over the socket)
+  local pg_pod
+  pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster,cnpg.io/instanceRole=primary -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  [[ -n "$pg_pod" ]] || pg_pod=$(kubectl -n "$namespace" get pods -l cnpg.io/cluster=postgres-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+
+  if [[ -z "$pg_pod" ]]; then
+    err "No PostgreSQL pod found in cluster"
+    exit 1
+  fi
+
+  # --- Preflight (every path, the plain default one included): the roles, the databases and
+  # their owners, the ledger, the roles that need to exist; nothing changes before it passes.
+  local new_owner="${mig_role:-$app_username}" pg_ledger=false
+  local t_creates=() t_finish=() t_transfer=() t_owner=() t_owner_oid=() t_public=() t_pub_now=() t_pub_may=() t_datoid=() t_src_oid=() intents=" " intents_bound=" "
+  [[ "$PG_TAKE_OWNERSHIP" == "true" || "$PG_REVOKE_PUBLIC" == "true" || "$PG_CREATE_MISSING" == "true" ]] && pg_ledger=true
+  if [[ "$PG_REVOKE_PUBLIC" == "true" ]]; then
+    need_roles="$keep_roles"
+    [[ -n "$ro_keep" ]] && need_roles+="${need_roles:+,}${ro_keep}"
+  fi
+  pub_excluded="${keep_roles}${PG_READONLY_ROLE:+,${PG_READONLY_ROLE}},cnpg_pooler_pgbouncer"
+  for i in "${!target_names[@]}"; do t_creates[i]=false; t_finish[i]=false; t_transfer[i]=false; done
+  local pre_out line refused=false missing=()
+  local -a f
+  pre_out=$(pg_sql_preflight | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres \
+              -v ON_ERROR_STOP=1 -q -tA -F "$PG_US") \
+    || { err "The preflight read of roles and databases failed"; exit 1; }
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$PG_US" read -r -a f <<<"$line"
+    case "${f[0]}" in
+      role)
+        # role <kind> <name> <exists> <marker ok> <comment> <attributes> <privileged memberships>
+        #      <owns its database> <oid> <LOGIN> <any membership> <linked with the other role>
+        local r_kind="${f[1]}" r_name="${f[2]}" r_exists="${f[3]}" r_marked="${f[4]}" r_comment="${f[5]:-}" r_attrs="${f[6]:-}"
+        local r_members="${f[7]:-}" r_owns="${f[8]:-f}" r_oid="${f[9]:-}" r_login="${f[10]:-f}" r_any="${f[11]:-}" r_linked="${f[12]:-f}"
+        [[ "$r_oid" =~ ^[0-9]*$ ]] || { err "The preflight returned an odd oid for role ${r_name}"; exit 1; }
+        [[ "$r_kind" == app ]] && { app_exists="$r_exists"; app_oid="$r_oid"; }
+        [[ "$r_kind" == migrate ]] && { mig_exists="$r_exists"; mig_oid="$r_oid"; }
+        [[ "$r_exists" == t ]] || continue
+        if [[ -n "$r_attrs" ]]; then
+          err "Role ${r_name} exists with ${r_attrs}: this script does not hand out such a role (${r_kind} role)"; refused=true
+        elif [[ -n "$r_members" ]]; then
+          err "Role ${r_name} belongs to ${r_members}: this script does not hand out such a role (${r_kind} role)"; refused=true
+        elif [[ "$r_linked" == t ]]; then
+          err "Roles ${app_username} and ${mig_role} are members of one another (directly or through a group): the migration role must not hold"
+          err "  the app role's rights, nor the app role the migration role's. Revoke that membership first; nothing changed."
+          refused=true
+        elif [[ "$r_marked" == t ]]; then
+          :
+        elif [[ "$r_kind" == app && "$r_owns" == t && -z "$r_comment" && "$r_login" == t && -z "$r_any" ]]; then
+          info "Role ${r_name} owns database ${r_name} (made by the default path): adopting it as this app's role"
+        else
+          if [[ "$r_kind" == app && "$r_owns" == t && -z "$r_comment" ]]; then
+            err "Role ${r_name} owns database ${r_name} but is not adopted automatically: $([[ "$r_login" == t ]] || printf 'it has NOLOGIN')$([[ "$r_login" != t && -n "$r_any" ]] && printf '; ')${r_any:+it is in role memberships (${r_any})}."
+          else
+            err "Role ${r_name} exists but was not made by this script for ${app_id} (${r_comment:+comment \"${r_comment}\", }no marker ${PG_ROLE_MARKER}:${r_kind}:${app_id})."
+          fi
+          err "  Pick another name, or, if it really is this app's ${r_kind} role, mark it first: COMMENT ON ROLE \"${r_name}\" IS '${PG_ROLE_MARKER}:${r_kind}:${app_id}';"
+          refused=true
+        fi
+        ;;
+      need)
+        [[ "${f[2]}" == t ]] || { err "--revoke-public: role ${f[1]} does not exist (named with --keep-connect or PG_READONLY_ROLE)"; refused=true; }
+        ;;
+      ledger)
+        if [[ "${f[1]}" != t || "${f[2]}" != t || "${f[3]}" != t ]]; then
+          err "infra_skills.ownership_transfer or infra_skills.create_intent (or their schema) in the postgres database is not what this script makes:"
+          err "  schema owner ok=${f[1]}, tables' owner and kind ok=${f[2]}, columns ok=${f[3]}. Check them by hand first."
+          refused=true
+        fi
+        ;;
+      intent)
+        # intent <database> <this app's> <bound to this app and this database> <its app>
+        if [[ "${f[2]:-f}" != t ]]; then
+          # Another app's pending creation of a database by that name (made or not): never this run's.
+          err "Database ${f[1]}: app ${f[4]:-?} has a pending creation of a database by that name (infra_skills.create_intent)."
+          err "  Nothing changed. Pick another database name, or finish or clear that app's creation first."
+          refused=true
+        else
+          intents+="${f[1]} "
+          [[ "${f[3]:-f}" == t ]] && intents_bound+="${f[1]} "
+        fi
+        ;;
+      db)
+        # db <name> <exists> <owner> <owner is new> <pending> <old owner> <old is new> <old privileged> <public> <now> <may>
+        #    <pending to> <pending to is new> <owner is the pending move's source or destination> <owner oid>
+        #    <database oid> <source oid>
+        for i in "${!target_names[@]}"; do
+          [[ "${target_names[$i]}" == "${f[1]}" ]] || continue
+          t_owner[i]="${f[3]:-}"; t_owner_oid[i]="${f[15]:-}"; t_datoid[i]="${f[16]:-}"; t_src_oid[i]="${f[17]:-}"; t_public[i]="${f[9]:-f}"; t_pub_now[i]="${f[10]:-}"; t_pub_may[i]="${f[11]:-}"
+          if [[ "${f[2]}" != t ]]; then
+            t_creates[i]=true
+            if [[ "$PG_CREATE_MISSING" == "true" ]]; then
+              info "Database ${f[1]} does not exist: it will be created, owned by ${new_owner}"
+            else
+              missing+=("${f[1]}")
+            fi
+          elif [[ "$intents" == *" ${f[1]} "* ]]; then
+            # --create-missing: an earlier run recorded it and stopped before its ACL was done. Only a
+            # database that run made (the oid the intent recorded, or before that its creation's
+            # marker) is finished.
+            if [[ "$intents_bound" != *" ${f[1]} "* ]]; then
+              err "Database ${f[1]} exists, but nothing shows it is the one an earlier run for ${app_id} created: neither the oid"
+              err "  recorded in infra_skills.create_intent nor that creation's marker (COMMENT ON DATABASE '${PG_ROLE_MARKER}:created:${app_id}:<nonce>') matches."
+              err "  Nothing changed; PUBLIC keeps its CONNECT on it. To finish by hand:"
+              err "  1. identify the database: SELECT oid, datdba::regrole, shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = '${f[1]}';"
+              err "     and compare with SELECT * FROM infra_skills.create_intent WHERE datname = '${f[1]}'; (postgres database);"
+              err "  2. if it is this app's database (oid ${t_datoid[i]}), run the SQL below with psql: it checks that oid, grants CONNECT to the"
+              err "     owner and this run's roles, revokes PUBLIC's CONNECT (the ACL step the creation did not reach) and deletes the intent row."
+              err "     It changes no password and no Secret. If it is not this app's database, rename or drop it, or pick another name;"
+              err "  3. then run this run's command again. Deleting the row and re-running --create-missing alone would leave PUBLIC's CONNECT on it."
+              pg_recovery_sql "$i"
+              refused=true
+            elif [[ "${f[4]}" == t ]]; then
+              t_creates[i]=true; t_finish[i]=true
+              info "Database ${f[1]} was created by an earlier run that did not finish: finishing it (PUBLIC's CONNECT revoked, grants)"
+            else
+              err "Database ${f[1]} was being created by an earlier run, but its owner is now ${f[3]}, not ${new_owner}. Nothing changed;"
+              err "  PUBLIC keeps its CONNECT on it. Check it by hand; if it is this app's (oid ${t_datoid[i]}), finish its ACL with the SQL below"
+              err "  (psql; no password or Secret changes), then run this run's command again."
+              pg_recovery_sql "$i"
+              refused=true
+            fi
+          elif [[ "$PG_TAKE_OWNERSHIP" == "true" && "${f[5]}" == t && "${f[13]:-f}" != t ]]; then
+            err "--take-ownership: an unfinished move of ${f[1]} from ${f[6]} to ${f[12]:-?} is recorded; this run would move it to ${new_owner}."
+            err "  Re-run with the same destination (${f[12]:-?}) to complete it first; nothing changed."
+            refused=true
+          elif [[ "$PG_TAKE_OWNERSHIP" == "true" && "${f[5]}" == t && "${f[14]:-t}" != t ]]; then
+            err "--take-ownership: ${f[1]} is owned by ${f[3]} now, not by ${f[6]} as recorded when the move started (changed by hand?)."
+            err "  Nothing changed. Check it, then fix or delete its row in infra_skills.ownership_transfer (postgres database)."
+            refused=true
+          elif [[ "$PG_TAKE_OWNERSHIP" == "true" && ( "${f[5]}" == t || "${f[4]}" != t ) && "${f[7]}" != t ]]; then
+            if [[ "${f[8]}" == t ]]; then
+              err "--take-ownership: ${f[1]} is owned by ${f[6]}, a superuser or system role; moving its objects is refused"; refused=true
+            else
+              t_transfer[i]=true
+              [[ "${t_owner_oid[i]}" =~ ^[0-9]+$ && "${t_datoid[i]}" =~ ^[0-9]+$ && "${t_src_oid[i]}" =~ ^[0-9]+$ ]] \
+                || { err "The preflight returned no owner, database or source oid for ${f[1]}"; exit 1; }
+              if [[ "${f[5]}" == t ]]; then
+                info "Ownership of ${f[1]}: an earlier run left the move from ${f[6]} unfinished; completing it to ${new_owner}"
+              else
+                info "Ownership of ${f[1]}: ${f[6]} -> ${new_owner} (its objects in ${f[1]}, then the database, one transaction)"
+              fi
+            fi
+          fi
+        done
+        ;;
+    esac
+  done <<<"$pre_out"
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    err "These databases do not exist: ${missing[*]} (check the names, or add --create-missing)"
+    exit 1
+  fi
+  [[ "$refused" == "true" ]] && exit 1
+
+  # --- Preflight, part 2 (--take-ownership): read-only, inside each database to move. Objects
+  # the move cannot handle and default privileges it cannot copy exactly stop the run here,
+  # before any password is made or set; what stays with the source is named.
+  if [[ " ${t_transfer[*]:-} " == *" true "* ]]; then
+    pre_out=$(pg_sql_preflight_objects | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres \
+                -v ON_ERROR_STOP=1 -q -tA -F "$PG_US") \
+      || { err "The preflight read inside the databases to take over failed"; exit 1; }
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS="$PG_US" read -r -a f <<<"$line"
+      case "${f[0]}" in
+        objects)
+          err "--take-ownership: in ${f[1]}, the old owner also owns objects this script does not move (${f[2]:-?})."
+          err "  Move them by hand first (ALTER ... OWNER TO ${new_owner}), then re-run; nothing changed."
+          refused=true ;;
+        defacl)
+          err "--take-ownership: in ${f[1]}, the old owner has default privileges that cannot be copied exactly: ${f[2]:-?}."
+          err "  Set them for ${new_owner} by hand (ALTER DEFAULT PRIVILEGES FOR ROLE ...) and reset the old owner's, then re-run; nothing changed."
+          refused=true ;;
+        dstacl)
+          err "--take-ownership: in ${f[1]}, ${new_owner} already has default privileges this script does not make: ${f[2]:-?}."
+          err "  Remove them by hand (ALTER DEFAULT PRIVILEGES FOR ROLE ${new_owner} ... REVOKE/GRANT), then re-run; nothing changed."
+          refused=true ;;
+        extskip)
+          warn "--take-ownership: in ${f[1]}, these stay with the old owner (Postgres has no ALTER EXTENSION ... OWNER): ${f[2]:-?}" ;;
+      esac
+    done <<<"$pre_out"
+    [[ "$refused" == "true" ]] && exit 1
+  fi
+
+  # --database: the Secret's namespace is ready before any credential changes. A tenant's must
+  # exist (it comes from tools/k3s/tenant.sh); another one (APP_NAMESPACE, default) is created
+  # here, as the end of the run would. If it can be neither found nor created, nothing changes.
+  # The default path keeps origin/main's order (its kubectl calls are the argv golden) and makes
+  # the namespace ready at the end, an accepted exception.
+  if [[ "$existing_mode" == "true" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+    if [[ -n "$tenant" ]]; then
+      err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first. Nothing changed."
+      exit 1
+    fi
+    kubectl create ns "$app_namespace" || { err "Namespace ${app_namespace} does not exist and cannot be created. Nothing changed."; exit 1; }
+  fi
+
+  # Passwords (with --keep-password: the ones the Secret files hold, and only for a new role)
+  pg_password app_password "$secret_file" "$app_username" "$app_exists" app_pw_set app_verifier
+  [[ -n "$mig_role" ]] && pg_password mig_password "$mig_secret_file" "$mig_role" "$mig_exists" mig_pw_set mig_verifier
+
+  # --- Pooler (before the grants: CNPG creates its auth role cnpg_pooler_pgbouncer) ---
+  if [[ "$PG_POOLER" == "true" ]]; then
+    info "Applying CNPG Pooler ${pooler_name} (PgBouncer, ${PG_POOLER_MODE:-session} mode)..."
+    jq -nc --arg n "$pooler_name" --arg ns "$namespace" --arg t "$tenant" --arg app "$app_id" \
+       --arg mode "${PG_POOLER_MODE:-session}" --arg pool "$([[ "$conn_limit" == -1 ]] && echo 20 || echo "$conn_limit")" '
+      ({"app.kubernetes.io/part-of": $app} + (if $t != "" then {"infra-skills/tenant": $t} else {} end)) as $l
+      | {apiVersion: "postgresql.cnpg.io/v1", kind: "Pooler", metadata: {name: $n, namespace: $ns, labels: $l},
+         spec: {cluster: {name: "postgres-cluster"}, instances: 1, type: "rw",
+                pgbouncer: {poolMode: $mode, parameters: {max_client_conn: "200", default_pool_size: $pool}},
+                template: {metadata: {labels: $l}, spec: {containers: []}}}}' \
+      | kubectl apply -f - || { err "Failed to apply Pooler ${pooler_name}"; exit 1; }
+    pg_host="${pooler_name}.${namespace}.svc.cluster.local"
+    local pooler_role_found=false
+    for i in $(seq 1 30); do
+      kubectl -n "$namespace" exec "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -tAc \
+        "SELECT 1 FROM pg_roles WHERE rolname = 'cnpg_pooler_pgbouncer'" 2>/dev/null | grep -q 1 && { pooler_role_found=true; break; }
+      sleep 2
+    done
+    # A run that closes PUBLIC on a database (the default path, --create-missing, --revoke-public)
+    # needs the pooler role first, or the Pooler could not reach that database.
+    local closes_public=false
+    [[ "$existing_mode" == "false" || "$PG_REVOKE_PUBLIC" == "true" || " ${t_creates[*]} " == *" true "* ]] && closes_public=true
+    if [[ "$closes_public" == "true" && "$pooler_role_found" != "true" ]]; then
+      err "The pooler role cnpg_pooler_pgbouncer does not exist after 60 s (Pooler ${pooler_name} not ready?)."
+      err "  This run would close PUBLIC's CONNECT on a database, so the Pooler needs that role first; nothing else changed. Re-run once the Pooler is up."
+      exit 1
+    fi
+  fi
+
+  if [[ "$existing_mode" == "false" ]]; then
+  info "Creating database '${app_database}' and role '${app_username}' (connection limit ${conn_limit}${statement_timeout:+, statement_timeout ${statement_timeout}}${idle_tx_timeout:+, idle_in_transaction_session_timeout ${idle_tx_timeout}})..."
+
+  # The SQL goes over stdin, never on a command line, and the password statement runs with
+  # log_statement off, so the password lands in neither ps nor the server log. Identifiers are
+  # quoted (:"name"), so app ids with hyphens work.
+  #   * REVOKE CONNECT, TEMPORARY ... FROM PUBLIC: by default every role may connect to every
+  #     database; with it revoked only the owner and explicit grants can. Other databases
+  #     keep PUBLIC's CONNECT until --revoke-public-connect --apply (listed below for a tenant).
+  #   * a new role gets no attribute beyond LOGIN; an existing one keeps its attributes (a
+  #     warning names the dangerous ones).
+  pg_sql_default_app "$app_pw_set" | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q || { err "Failed to create/update the database role and database"; exit 1; }
+
   # Pre-install common extensions as superuser so app user can use them
   info "Pre-installing common PostgreSQL extensions..."
   local ext
@@ -795,103 +2128,269 @@ SQL
   done
 
   info "✓ Database and user created"
+  else
+    # --- Existing databases (--database): the role gets rights on each, the database keeps its
+    # owner (grant mode) unless --take-ownership moves it to ${new_owner}.
+    #   * the app role (and the migration role) get CONNECT and TEMPORARY, the pooler role and
+    #     PG_READONLY_ROLE (not for a tenant) CONNECT. PUBLIC keeps its CONNECT unless
+    #     --revoke-public: then the owner, the former owner, the --keep-connect roles, the
+    #     read-only and the pooler role get CONNECT first (a database made here is closed too);
+    #   * in every schema (pg_* and information_schema aside): USAGE and CREATE, and SELECT,
+    #     INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER on all tables, USAGE, SELECT,
+    #     UPDATE on all sequences;
+    #   * default privileges for the database owner and each schema owner (not superusers), so
+    #     tables and sequences they create later are the role's too.
+    local entry_list=""
+    for i in "${!targets[@]}"; do entry_list+="${entry_list:+, }${target_names[$i]} (${targets[$i]#*:}_*)"; done
+    info "Role '${app_username}' (connection limit ${conn_limit}${statement_timeout:+, statement_timeout ${statement_timeout}}${idle_tx_timeout:+, idle_in_transaction_session_timeout ${idle_tx_timeout}}) on: ${entry_list}"
+    info "  $([[ "$PG_TAKE_OWNERSHIP" == "true" ]] && echo "ownership mode: the databases move to ${new_owner}" || echo "grant mode: the databases keep their owners")"
+    if [[ ${#targets[@]} -gt 1 && "$conn_limit" != -1 ]]; then
+      info "  CONNECTION LIMIT ${conn_limit} counts every session of ${app_username}, across all ${#targets[@]} databases (Pooler clients included)"
+    fi
+    for i in "${!targets[@]}"; do
+      [[ "${t_creates[$i]}" == "true" || "${t_public[$i]:-f}" != t ]] && continue
+      if [[ "$PG_REVOKE_PUBLIC" == "true" ]]; then
+        info "${target_names[$i]}: revoking PUBLIC's CONNECT and TEMPORARY (kept: owner ${t_owner[$i]:-?}${keep_roles:+, ${keep_roles}}${ro_keep:+, ${ro_keep}}, the pooler role, the former owner)"
+        [[ -n "${t_pub_may[$i]}" ]] && warn "${target_names[$i]}: these login roles connect only through PUBLIC and lose CONNECT now: ${t_pub_may[$i]}"
+        [[ -n "${t_pub_now[$i]}" ]] && warn "${target_names[$i]}:   connected now: ${t_pub_now[$i]}"
+      else
+        warn "${target_names[$i]}: PUBLIC keeps CONNECT (left as it is)."
+        if [[ -n "${t_pub_may[$i]}" ]]; then
+          warn "  Login roles that connect through PUBLIC only: ${t_pub_may[$i]}"
+          [[ -n "${t_pub_now[$i]}" ]] && warn "  connected now: ${t_pub_now[$i]}"
+        fi
+        warn "  To close it: --revoke-public --keep-connect <role>[,<role>] (or none); the owner, PG_READONLY_ROLE and the pooler role keep CONNECT"
+      fi
+      if [[ "${t_pub_may[$i]}" == *" more)" || "${t_pub_now[$i]}" == *" more)" ]]; then
+        warn "${target_names[$i]}: the lists above are cut at 20. The full list (read-only; run it in psql as the superuser, e.g."
+        warn "  tools/k3s/postgres.sh ${ENV_NAME} --watch sql, before any --revoke-public run):"
+        warn "  $(pg_public_list_sql "${target_names[$i]}")"
+      fi
+    done
+    {
+      printf '\\set ro %s\n\\set ro_keep %s\n\\set owner %s\n\\set keep %s\n\\set mrole %s\n\\set targets %s\nSET client_min_messages = warning;\n' \
+        "'${ro_role}'" "'${ro_keep}'" "'${new_owner}'" "'${keep_roles}'" "'${mig_role}'" "'${target_names[*]}'"
+      if [[ "$pg_ledger" == "true" ]]; then
+        cat <<'SQL'
+CREATE SCHEMA IF NOT EXISTS infra_skills;
+REVOKE ALL ON SCHEMA infra_skills FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS infra_skills.ownership_transfer (
+  datoid oid PRIMARY KEY, datname name NOT NULL, from_role oid NOT NULL, to_role oid NOT NULL,
+  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz);
+REVOKE ALL ON infra_skills.ownership_transfer FROM PUBLIC;
+CREATE TABLE IF NOT EXISTS infra_skills.create_intent (
+  datname name PRIMARY KEY, app text NOT NULL, revoke_public boolean NOT NULL,
+  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz, datoid oid, nonce text NOT NULL);
+REVOKE ALL ON infra_skills.create_intent FROM PUBLIC;
+SQL
+      fi
+      # A role that exists keeps its current password until every other step of this session has
+      # committed (ownership moves, the ACL of a database being created, grants): a step that
+      # fails, on a lock timeout say, leaves both the password and the Secret as they were. Its new
+      # password is set at the end of this session. A role made in this run gets its password
+      # when it is created.
+      local app_pw_now="$app_pw_set" mig_pw_now="$mig_pw_set" app_pw_late=false mig_pw_late=false
+      [[ "$app_pw_set" == "true" && "$app_exists" == "t" ]] && { app_pw_now=false; app_pw_late=true; }
+      [[ -n "$mig_role" && "$mig_pw_set" == "true" && "$mig_exists" == "t" ]] && { mig_pw_now=false; mig_pw_late=true; }
+      pg_sql_app_role
+      # The migration role first: a database created or taken over below may be its own.
+      [[ -n "$mig_role" ]] && pg_sql_migration_role
+      # The ledger: each database's original owner, recorded before anything moves. It records
+      # the owner and the database the preflight saw (by oid) and the destination role as its
+      # transaction above guarded it (:dest_goid), not whatever carries those names at this
+      # moment; a database or destination role dropped and made again since is refused here, and
+      # an owner changed in between fails the move's check under the lock.
+      printf '\\set dest_goid :%s\n' "$([[ -n "$mig_role" ]] && echo migrate_goid || echo app_goid)"
+      for i in "${!targets[@]}"; do
+        [[ "${t_transfer[$i]}" == "true" ]] || continue
+        printf '\\set db %s\n\\set seen_owner %s\n\\set datoid %s\n' "'${target_names[$i]}'" "${t_owner_oid[$i]}" "${t_datoid[$i]}"
+        cat <<'SQL'
+INSERT INTO infra_skills.ownership_transfer AS t (datoid, datname, from_role, to_role)
+SELECT d.oid, d.datname, :seen_owner, n.oid FROM pg_database d, pg_roles n
+ WHERE d.oid = :datoid AND d.datname = :'db' AND n.oid = :dest_goid AND n.rolname = :'owner' AND :seen_owner <> n.oid
+ON CONFLICT (datoid) DO UPDATE
+   SET datname = excluded.datname, from_role = excluded.from_role, to_role = excluded.to_role, started_at = now(), done_at = NULL
+ WHERE t.done_at IS NOT NULL;
+SELECT set_config('infra_skills.i_db', :'db', false) AS i_db,
+       set_config('infra_skills.i_ok', (EXISTS (SELECT FROM pg_database WHERE oid = :datoid AND datname = :'db')
+                                        AND EXISTS (SELECT FROM pg_roles WHERE oid = :dest_goid AND rolname = :'owner'))::text, false) AS i_ok \gset
+DO $$
+BEGIN
+  IF NOT current_setting('infra_skills.i_ok')::boolean THEN
+    RAISE EXCEPTION 'infra-skills: database % or the destination role was dropped and made again since the preflight (another oid under the same name); nothing moved',
+      current_setting('infra_skills.i_db');
+  END IF;
+END
+$$;
+SQL
+      done
+      for i in "${!targets[@]}"; do pg_sql_existing_db "$i"; done
+      # Every other step has committed (ON_ERROR_STOP ends the session at the first failure): now the
+      # new passwords of the roles that existed, in one transaction with both roles' guards, so
+      # both change or neither does.
+      if [[ "$app_pw_late" == "true" || "$mig_pw_late" == "true" ]]; then
+        echo 'BEGIN;'
+        if [[ "$app_pw_late" == "true" ]]; then
+          printf '\\set role %s\n' "'${app_username}'"
+          pg_sql_role_tx role app "$app_oid" "$mig_role" true app_verifier "$conn_limit" true false
+        fi
+        if [[ "$mig_pw_late" == "true" ]]; then
+          printf '\\set mrole %s\n' "'${mig_role}'"
+          pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" true mig_verifier "$mig_conn_limit" true false
+        fi
+        echo 'COMMIT;'
+      fi
+    } | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q \
+      || { err "Failed to set up role ${app_username} on: ${target_names[*]}"; exit 1; }
+
+    for i in "${!targets[@]}"; do
+      [[ "${t_creates[$i]}" == "true" ]] || continue
+      local ext
+      for ext in vector pg_trgm btree_gin btree_gist; do
+        kubectl -n "$namespace" exec "$pg_pod" -c postgres -- psql -U "$superuser" -d "${target_names[$i]}" -qc "CREATE EXTENSION IF NOT EXISTS ${ext};" >/dev/null 2>&1 || \
+          { [[ "$ext" == vector ]] && warn "pgvector extension not available in ${target_names[$i]} (image may not include it)"; }
+      done
+    done
+    info "✓ Role ${app_username} set up on: ${target_names[*]}"
+  fi
+
+  # --- Migration role on the default path (with --database it ran in the session above) ---
+  if [[ -n "$mig_role" && "$existing_mode" == "false" ]]; then
+    info "Migration role '${mig_role}' (connection limit ${mig_conn_limit}, no statement_timeout)..."
+    {
+      printf '\\set role %s\nSET client_min_messages = warning;\n' "'${app_username}'"
+      # An existing migration role gets its new password last, after this session's other steps.
+      local mig_pw_now="$mig_pw_set" mig_pw_late=false
+      [[ "$mig_pw_set" == "true" && "$mig_exists" == "t" ]] && { mig_pw_now=false; mig_pw_late=true; }
+      pg_sql_migration_role
+      local schemas
+      schemas="$(pg_migration_schemas "$app_database")"
+      printf '\\set db %s\n' "'${app_database}'"
+      echo 'GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"mrole";'
+      if [[ -n "$schemas" ]]; then echo 'GRANT CREATE ON DATABASE :"db" TO :"mrole";'; fi
+      printf '\\c :"db"\nSET client_min_messages = warning;\n'
+      pg_sql_creators_view
+      pg_sql_migration_in_db "$schemas"
+      echo '\c postgres'
+      if [[ "$mig_pw_late" == "true" ]]; then
+        pg_sql_role_tx mrole migrate "$mig_oid" "$app_username" true mig_verifier "$mig_conn_limit" true
+      fi
+    } | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -v ON_ERROR_STOP=1 -q \
+      || { err "Failed to set up the migration role ${mig_role}"; exit 1; }
+  fi
+  [[ -n "$mig_role" ]] && info "✓ Migration role ${mig_role} set up"
+
+  local db_list="" excl=""
+  for entry in "${targets[@]}"; do
+    db_list+="${db_list:+, }${entry%%:*}"; excl+="'${entry%%:*}', "
+  done
 
   # A tenant role can still reach every database where PUBLIC keeps CONNECT: name them.
   if [[ -n "$tenant" ]]; then
     local open_dbs
     open_dbs=$(kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres -tA <<SQL
 SELECT string_agg(datname, ' ' ORDER BY datname) FROM pg_database
- WHERE datallowconn AND NOT datistemplate AND datname NOT IN ('${app_database}', 'postgres') AND has_database_privilege('${app_username}', datname, 'CONNECT');
+ WHERE datallowconn AND NOT datistemplate AND datname NOT IN (${excl}'postgres') AND has_database_privilege('${app_username}', datname, 'CONNECT');
 SQL
 )
     if [[ -n "$open_dbs" ]]; then
       warn "Tenant role ${app_username} may still CONNECT to: ${open_dbs}"
       warn "  (PUBLIC holds CONNECT there). Close them: tools/k3s/postgres.sh ${ENV_NAME} --revoke-public-connect [--apply]"
     else
-      info "✓ Tenant role ${app_username} can connect only to ${app_database} (and postgres)"
+      info "✓ Tenant role ${app_username} can connect only to ${db_list} (and postgres)"
     fi
     info "  The postgres database stays open to every role (the exporter and CNPG use it); it holds no app data."
   fi
-  
-  # Create secret file
-  local secrets_dir="$ENVS_ROOT/${ENV_NAME}/secrets.plain"
-  local secret_file="${secrets_dir}/${app_id}-db.secret.yaml"
-  
-  # Ensure secrets directory exists
-  mkdir -p "$secrets_dir"
-  
-  # Create secret YAML file
-  info "Creating secret file: ${secret_file}"
-  (umask 077; cat > "$secret_file" <<YAML
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${app_id}-db
-  namespace: ${app_namespace}
-type: Opaque
-stringData:
-  # PostgreSQL host$([[ "$PG_POOLER" == "true" ]] && echo " (CNPG Pooler ${pooler_name})")
-  POSTGRES_HOST: ${pg_host}
 
-  # PostgreSQL port
-  POSTGRES_PORT: "${pg_port}"
-
-  # PostgreSQL database name
-  POSTGRES_DATABASE: ${app_database}
-
-  # PostgreSQL username
-  POSTGRES_USERNAME: ${app_username}
-
-  # PostgreSQL password
-  POSTGRES_PASSWORD: ${app_password}
-YAML
-  )
-
-  info "✓ Secret file created"
-  
-  # Ensure namespace exists (a tenant namespace comes from tools/k3s/tenant.sh)
-  if ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+  # Ensure namespace exists (a tenant namespace comes from tools/k3s/tenant.sh). The default path
+  # only: a --database run made it ready before any credential SQL, and does not look again.
+  if [[ "$existing_mode" == "false" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
     if [[ -n "$tenant" ]]; then
       err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first"
       exit 1
     fi
     kubectl create ns "$app_namespace"
   fi
-  
+
+  # --keep-password: the kept passwords must still be the roles' passwords right before the Secret
+  # is written and applied (another run or an operator may have rotated one since the first
+  # check). Runs for one app are not serialized: two at once are not supported.
+  if [[ "$app_pw_set" == "false" ]] && ! provision::without_xtrace pg_matches_live app_password "$app_username"; then
+    err "--keep-password: role ${app_username}'s password changed during this run (rotated elsewhere?); the Secret is neither written nor applied."
+    exit 1
+  fi
+  if [[ -n "$mig_role" && "$mig_pw_set" == "false" ]] && ! provision::without_xtrace pg_matches_live mig_password "$mig_role"; then
+    err "--keep-password: role ${mig_role}'s password changed during this run (rotated elsewhere?); the Secret is neither written nor applied."
+    exit 1
+  fi
+
+  # Create secret file(s). On the default path as before INFRA-243, except that the password is
+  # quoted when it is not a safe plain YAML scalar (pg_yaml_plain_ok)
+  local legacy=true
+  [[ "$existing_mode" == "true" ]] && legacy=false
+  mkdir -p "$secrets_dir"
+  local host_note=""
+  [[ "$PG_POOLER" == "true" ]] && host_note=" (CNPG Pooler ${pooler_name})"
+  info "Creating secret file: ${secret_file}"
+  provision::without_xtrace pg_write_secret "$secret_file" "${app_id}-db" "$app_namespace" "$pg_host" "$pg_port" \
+    "$app_username" app_password "$host_note" "$legacy" "${targets[@]}"
+  if [[ -n "$mig_role" ]]; then
+    info "Creating secret file: ${mig_secret_file}"
+    provision::without_xtrace pg_write_secret "$mig_secret_file" "${app_id}-db-migrate" "$app_namespace" "$pg_host" "$pg_port" \
+      "$mig_role" mig_password "$host_note" "$legacy" "${targets[@]}"
+  fi
+
+  info "✓ Secret file created"
+
   # Apply to kubectl
   info "Applying secret to Kubernetes..."
   kubectl apply -f "$secret_file" || {
     err "Failed to apply secret to Kubernetes"
     exit 1
   }
-  
+  if [[ -n "$mig_role" ]]; then
+    kubectl apply -f "$mig_secret_file" || { err "Failed to apply the migration secret to Kubernetes"; exit 1; }
+  fi
+
   info "✓ Secret applied to namespace: ${app_namespace}"
-  
+
   # Output summary
   echo ""
   info "=== Credentials Provisioned ==="
   info "Application ID:     ${app_id}"
-  info "Database:           ${app_database}"
+  info "Database:           ${db_list}"
   info "Username:           ${app_username}"
   info "Secret name:        ${app_id}-db"
   info "Secret namespace:   ${app_namespace}"
   info "Secret file:        ${secret_file}"
+  if [[ -n "$mig_role" ]]; then
+    info "Migration role:     ${mig_role} (connection limit ${mig_conn_limit}, no statement_timeout)"
+    info "Migration secret:   ${app_id}-db-migrate (${mig_secret_file##*/}), same keys"
+    if [[ "$PG_TAKE_OWNERSHIP" != "true" ]]; then
+      info "Note: ${mig_role} can create objects and change what it owns, but it cannot ALTER or DROP what other"
+      info "  roles own (the app role's tables, the old owner's). To hand the existing objects to it, run once:"
+      info "  tools/k3s/postgres.sh ${ENV_NAME} --provision-credentials ${app_id} --database <db>[:<PREFIX>] --take-ownership --migration-role ${mig_role}"
+    fi
+  fi
   info ""
   info "Connection details:"
   info "  Host:             ${pg_host}"
   info "  Port:             ${pg_port}"
-  info "  Database:         ${app_database}"
+  info "  Database:         ${db_list}"
   info "  Username:         ${app_username}"
-  info "  Connection limit: ${conn_limit}"
+  info "  Connection limit: ${conn_limit} (per role, across all its databases)"
   info ""
   info "Secret fields:"
-  info "  POSTGRES_HOST"
-  info "  POSTGRES_PORT"
-  info "  POSTGRES_DATABASE"
-  info "  POSTGRES_USERNAME"
-  info "  POSTGRES_PASSWORD"
+  for entry in "${targets[@]}"; do
+    local p="${entry#*:}"
+    info "  ${p}_HOST"
+    info "  ${p}_PORT"
+    info "  ${p}_DATABASE"
+    info "  ${p}_USERNAME"
+    info "  ${p}_PASSWORD"
+  done
   echo ""
-  
+
   exit 0
 }
 
@@ -1297,6 +2796,8 @@ ensure_minio_bucket_and_user() {
     return 1
   fi
   local out
+  # The sh -c script is single-quoted on purpose: it expands its variables inside the pod.
+  # shellcheck disable=SC2016
   if ! out=$(printf '%s\n%s\n' "$access" "$secret_key" | \
        kubectl -n "$ns" exec -i deploy/minio -c minio -- sh -c '
 set -eu

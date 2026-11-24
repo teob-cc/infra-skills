@@ -1,0 +1,35 @@
+{
+  "apiVersion": "postgresql.cnpg.io/v1",
+  "kind": "Pooler",
+  "metadata": {
+    "labels": {
+      "app.kubernetes.io/part-of": "app2"
+    },
+    "name": "pooler-app2",
+    "namespace": "postgres"
+  },
+  "spec": {
+    "cluster": {
+      "name": "postgres-cluster"
+    },
+    "instances": 1,
+    "pgbouncer": {
+      "parameters": {
+        "default_pool_size": "50",
+        "max_client_conn": "200"
+      },
+      "poolMode": "session"
+    },
+    "template": {
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/part-of": "app2"
+        }
+      },
+      "spec": {
+        "containers": []
+      }
+    },
+    "type": "rw"
+  }
+}

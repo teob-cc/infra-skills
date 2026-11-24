@@ -116,7 +116,8 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
   - a CNPG Pooler labelled for the tenant, which the Secret points at.
 
   `--revoke-public-connect [--apply]` closes the other databases. Every role may connect to a
-  database until PUBLIC's CONNECT is revoked there.
+  database until PUBLIC's CONNECT is revoked there. For an app whose data already exists, or
+  that runs its migrations under a role of their own, see "A tenant's databases" below.
 - **`tools/k3s/tenant-runners.sh <env> <tenant>`** runs CI runners for the tenant's GitHub
   organization:
   - in `<tenant>-ci`, only on the tenant's workers;
@@ -128,6 +129,232 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     can push a workflow in the tenant's organization then gets root on the tenant worker
     through it. Enable it only when the tenant needs `docker build`, and know that the
     node-level primitives above are then all that stands between that root and your cluster.
+
+## A tenant's databases
+
+Without more flags, `postgres.sh --provision-credentials <app> --tenant <tenant>` creates an
+empty database named `<app>`, owned by a new role `<app>`, and writes `POSTGRES_*` keys into the
+Secret `<app>-db`. An app that brings its own data, reads several databases, or keeps its
+migrations off the runtime role needs the flags below. For example, an event-sourced app with a
+journal database and a read-model database, a manifest database that does not exist yet, and
+migrations that must not hit the 60 s timeout:
+
+```bash
+tools/k3s/postgres.sh <env> --provision-credentials evse-ts --tenant symbioen --pooler \
+  --database evse:JOURNAL_DB --database evse_ts:STATE_DB \
+  --database evse_archive:MANIFEST_DB --create-missing \
+  --migration-role --connection-limit 32
+```
+
+This gives the role `evse-ts` rights on the three databases and writes, into the Secret
+`evse-ts-db` in namespace `symbioen`, `JOURNAL_DB_HOST/PORT/DATABASE/USERNAME/PASSWORD`, the same
+five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. The role
+`evse-ts_migrate` gets the Secret `evse-ts-db-migrate` with the same keys, for a migrate Job.
+
+| Flag | What it does |
+| --- | --- |
+| `--database <name>[:<PREFIX>]` | Repeatable. Use these databases instead of creating `<app>`. With a prefix, the Secret gets `<PREFIX>_HOST`, `_PORT`, `_DATABASE`, `_USERNAME` and `_PASSWORD` for that database; without one, `POSTGRES_*` (at most one database can go without). A database that does not exist is an error. |
+| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. The intent is recorded in `infra_skills.create_intent` first, for this app and name, with a nonce for this one creation: if the run stops after creating the database, the next run of this app with `--create-missing` finishes it (PUBLIC's CONNECT revoked, grants) instead of taking it for an existing one. Another app's pending creation of the same name is refused, whether that database exists yet or not. Right after `CREATE DATABASE` the database gets the marker `COMMENT ON DATABASE ... IS 'infra-skills:created:<app>:<nonce>'` and the intent its oid. Once recorded, the oid is authoritative: a retry finishes only the database with that oid (the marker counts only to find a creation whose oid was not recorded yet), checks the oid again in the transaction that closes PUBLIC, and refuses any other same-named database before any password changes (PUBLIC untouched). The refusal prints plain SQL to finish by hand with psql, once the database is identified: it stops at the first error (`\set ON_ERROR_STOP on`) and, in one transaction, checks the database by the oid the run saw, grants CONNECT to its owner and this run's roles, revokes PUBLIC's CONNECT and TEMPORARY and deletes the intent row: all of it or nothing. It changes no password and no Secret. |
+| `--revoke-public` | Revoke PUBLIC's CONNECT and TEMPORARY on the named databases. Needs `--keep-connect`. Off by default. |
+| `--keep-connect <role>[,<role>]` | With `--revoke-public`: the roles, besides the owner, that keep CONNECT (`none` for no other role). |
+| `--take-ownership` | Move each named database to the migration role (or the app role): the old owner's objects in it, then the database, in one transaction, then a check. Never its other databases or tablespaces. Off by default. |
+| `--migration-role [name]` | A second login role, `<app>_migrate` unless named, with its own Secret `<app>-db-migrate`. |
+| `--migration-schema <db>.<schema>` | Repeatable. A schema the migration role owns (created if missing, its owner changed if not). The role gets CREATE on that database. |
+| `--migration-connection-limit N` | That role's connection limit (default 2, or `PG_MIGRATION_CONNECTION_LIMIT`). |
+| `--connection-limit N` | The app role's connection limit (tenant default 20); -1 to 2147483647. |
+| `--keep-password` | Keep the passwords in `secrets.plain/<app>-db.secret.yaml` and `<app>-db-migrate.secret.yaml`. A role that exists keeps its password untouched, and the stored password must match the role's verifier in the cluster, checked at the start and again right before the Secret is written and applied; otherwise the run stops and leaves the Secret as it is. A missing role is created with the password from the file. |
+
+**Which roles the script uses.** It reuses an existing role only when it made that role for
+this app: `COMMENT ON ROLE` holds the marker `infra-skills:app:<app>` or
+`infra-skills:migrate:<app>`. An unmarked app role (made by the default path before the marker)
+is adopted and marked only when all of this holds: it has LOGIN, it owns the database `<app>`, it
+has no elevated attribute, and it has no role membership at all, in either direction (it belongs
+to no role and no role belongs to it). Otherwise the run stops; there is no flag to force it, so
+an existing app's re-runs keep working unchanged. These checks run on every path, the plain
+default one (no new flags) included. The script refuses:
+
+- reserved names: `postgres`, `app` (CNPG's owner), `streaming_replica`,
+  `cnpg_pooler_pgbouncer`, `PG_READONLY_ROLE`, `public`, `none` and every `pg_*` name. This also
+  applies to the app id;
+- an existing role that is a superuser, has CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS, or
+  belongs to a role that does or to a `pg_*` role;
+- an app role and a migration role that are members of one another, directly or through a group;
+- an existing role without this app's marker that is not adoptable as above. If it really is the
+  app's role, mark it by hand with the `COMMENT ON ROLE` the error message prints.
+
+Nothing changes before these checks pass. Then each role is written in one transaction: it locks
+`pg_authid` and `pg_auth_members` (no role can be created, altered or granted until it commits),
+`pg_database` (no database changes owner, so an adopted role still owns its database) and
+`pg_shdescription` (no `COMMENT ON ROLE`, so the marker stays as checked), each in SHARE ROW
+EXCLUSIVE mode, waiting at most 5 s; logins only read these catalogs and go on. Then it checks all
+of the above again against the role's oid from the preflight, and only then creates the role if
+missing, writes its marker and sets its password. A role that changed in between (dropped, made
+again, elevated, given a membership, its database given away, its comment changed) stops the run
+with its password untouched.
+
+**Grant mode** is the default for `--database`. Each database keeps its owner, and the app role
+gets:
+
+- CONNECT and TEMPORARY on the database. The pooler role and (not for a tenant)
+  `PG_READONLY_ROLE` get CONNECT. PUBLIC keeps its CONNECT. The run prints a warning that
+  lists the login roles that reach the database only through PUBLIC, and those connected now.
+  Each list shows at most 20 names and the count of the others; when a list is cut, the run
+  also prints a read-only query that lists them all (with the same rule: only while PUBLIC holds
+  CONNECT there), to run in psql before `--revoke-public`.
+- In every schema except `pg_*` and `information_schema`: USAGE and CREATE on the schema;
+  SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES and TRIGGER on all tables; USAGE, SELECT
+  and UPDATE on all sequences.
+- Default privileges for the database owner and each schema owner (superusers aside), so the
+  tables and sequences they create later are the app role's too.
+
+**`--revoke-public --keep-connect <roles>`** closes the database. First, CONNECT goes to the
+owner, the former owner (after `--take-ownership`), the `--keep-connect` roles,
+`PG_READONLY_ROLE` (for a tenant too: it reached the database through PUBLIC until then) and
+the pooler role. Then PUBLIC's CONNECT and TEMPORARY are revoked. If a kept role or the
+read-only role does not exist, the run stops before anything is revoked. The warning names the
+roles that lose CONNECT.
+
+With `--pooler`, a run that closes PUBLIC on any database (the default path, a
+`--create-missing` database, `--revoke-public`) waits up to 60 s for the Pooler's auth role
+`cnpg_pooler_pgbouncer`. If the role is still missing, the run stops before any SQL; otherwise
+the role gets CONNECT on the database first.
+
+Grant mode never changes the existing tables' owner, so DDL on those tables (ALTER, an index,
+DROP) still needs their owner. When the migrations must change existing tables, use
+`--take-ownership`.
+
+**`--take-ownership`** moves ownership instead, database by database, and only inside the named
+databases. It does not use `REASSIGN OWNED BY`, which moves *every* database and tablespace the
+old owner has, in the whole cluster: the old owner's other databases and its tablespaces are
+never touched. The move is refused when the old owner is a superuser or a `pg_*` role.
+
+Before any password is made or set, a second, read-only part of the preflight looks inside each
+database to move. It refuses the run when the old owner owns objects there that the move does
+not handle (operators, collations, text search objects and the like: the message names their
+catalogs, to move by hand first), or has default privileges that `GRANT` cannot copy exactly (a
+grant option, or a privilege revoked from the built-in defaults, such as PUBLIC's EXECUTE on
+functions): the message prints them. It also refuses, and prints them, when the new owner already has
+default privileges in that database other than, on global entries only, exactly the grants this
+script makes itself (to this run's app and migration roles or another role the script made,
+without grant option: DML on tables; USAGE, SELECT and UPDATE on sequences; USAGE on schemas) and
+the built-in defaults (a per-schema default is never one of them); a
+grant option, any other grant and a revoked built-in default all count. Entries are compared by
+the grantee's oid (0 is PUBLIC), never by name, and the old owner's are copied the same way. It
+warns about what stays with the old owner: extensions it owns, and its objects inside any extension, its own or another
+role's.
+
+With `--database`, a role that already exists keeps its current password until every other step
+of the run has committed (ownership moves, the ACL of a database being created, the grants): a
+step that fails (a lock timeout, say) leaves the password and the Secret as they were, and the
+retry completes the run. The same holds for an existing migration role on the default path. The
+default path's own app role keeps origin/main's order (its later steps are idempotent DDL). The new passwords are set at the end of the session, in
+one transaction with both roles' guards: both change or neither does. A role this run creates gets its password when it is created.
+
+Once the preflight has passed, and before anything moves, the run records each database's oid as
+the preflight saw it, that owner, and the destination role as its transaction guarded it, in
+`infra_skills.ownership_transfer`; a database or destination role dropped and made again under
+the same name since stops the run there. That table lives
+in the `postgres` database, PUBLIC cannot read it, and the script makes it on first use. The
+preflight first checks, from the catalogs alone, that the schema and its tables belong to the
+superuser the script runs as, that they are plain tables and have the expected columns; in the
+preflight only `--take-ownership` then reads `ownership_transfer`. (A plain `--revoke-public` run
+also reads it, in its main session, to give a database's former owner CONNECT before PUBLIC's is
+revoked; the preflight has checked the table by then.) Then, per database, in one transaction inside
+that database, with `lock_timeout` 5 s and `statement_timeout` 60 s (a lock another session holds
+fails the move fast, with nothing changed):
+
+1. `ALTER ... OWNER` for each of the old owner's objects in that database: schemas; tables,
+   partitions, views, materialized views, sequences (those of a column follow their table),
+   foreign tables and composite types; functions, procedures and aggregates; types, domains,
+   enums, ranges and multiranges (array types follow); large objects. Its default privileges are
+   copied to the new owner (its own entries stay). Extensions and the old owner's objects inside
+   extensions stay with it (Postgres has no `ALTER EXTENSION ... OWNER`; the preflight warned);
+2. `LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE`, as late as possible: until
+   the move commits, no other session can run `ALTER DATABASE ... OWNER` or `CREATE DATABASE`
+   (they need ROW EXCLUSIVE on `pg_database`; checked on PG14);
+3. a check, under that lock, against the ledger row: the database's oid, the old and new
+   role's oids, and the live owner, which must be the recorded old owner (or already the new
+   one, when an earlier run's move committed but was not marked done). An owner changed by hand
+   since the move started rolls the transaction back and fails the run;
+4. `ALTER DATABASE ... OWNER`, then CONNECT and TEMPORARY again for the old owner and the app
+   role (`ALTER DATABASE ... OWNER` hands the old owner's own ACL entries to the new owner);
+5. a check that no object in the database still belongs to the old owner (default privileges
+   and extension objects aside), else the whole move rolls back: a last guard, since the
+   preflight already refused the kinds the move does not handle;
+6. commit, and the ledger row is marked done.
+
+If a run stops halfway, the next run with the same destination reads the recorded owner and
+completes the move, even when the database already shows the new owner. A run with another
+destination (for example without `--migration-role` this time), or one where the database's
+owner was changed by hand in between, is refused before any change. Objects owned by other roles
+keep their owner.
+
+**The migration role** has:
+
+- no `statement_timeout` and no `idle_in_transaction_session_timeout`, while the app role keeps
+  60s and 5min;
+- its own small connection limit, on top of the app role's;
+- explicit grants in the named databases only: CONNECT and TEMPORARY, and the same schema,
+  table and sequence rights as the app role, plus default privileges from the database owner,
+  the schema owners and the app role. Neither role may be a member of the other, by any path (the
+  run refuses that), so the app role's rights in other databases don't reach it;
+- the schemas named with `--migration-schema`: it owns them, and it has CREATE on their
+  database, so it can create more schemas there. The app role gets USAGE, CREATE and DML on them.
+
+Whatever the migration role creates is its own. Default privileges
+(`ALTER DEFAULT PRIVILEGES FOR ROLE <app>_migrate ... TO <app>` in each database: DML on tables;
+USAGE, SELECT and UPDATE on sequences; USAGE on schemas) give the app role its rights on those
+objects the moment they exist, so a migrate Job needs no grants of its own. The app role cannot
+alter or drop them. Default privileges cover only objects the migration role creates itself;
+after a `SET ROLE` to another role, objects belong to that role.
+
+The migration role cannot ALTER or DROP objects other roles own: the app role's tables (on the
+default path the app role owns its database and everything it created) or an old owner's.
+Nothing hands them over automatically. To let the migration role change existing objects, move
+them with `--take-ownership` once:
+
+```bash
+tools/k3s/postgres.sh <env> --provision-credentials <app> --database <app> --take-ownership --migration-role
+```
+
+The run prints this hint whenever a migration role is set without `--take-ownership`.
+
+The app role keeps CREATE on its schemas, so an app that still runs migrations on its runtime
+pool keeps working (owner decision 2026-11-23, INFRA-243). Moving them to a migrate Job with the
+`-db-migrate` Secret is the goal.
+
+**The connection limit counts per role**, across all its databases and through the Pooler. In
+session mode every client connection holds a server connection. Add up the pool sizes of every
+process that uses the role (one pool per database, plus LISTEN connections and leases) and set
+`--connection-limit` above that total. The Pooler's `default_pool_size` follows the limit.
+
+**Re-runs** are safe: every statement is guarded or idempotent, and nothing that exists is
+dropped. A re-run sets new passwords and rewrites the Secrets, so the app's pods need a restart
+afterwards. With `--keep-password` an existing role's password is not touched and the Secrets get
+the stored one. The run stops if a file has no usable password (decrypt it from `secrets.sops`
+first) or if its `*_PASSWORD` values differ. A password is at least 24 characters. If openssl
+fails, the run stops before any SQL.
+
+**One run per app at a time.** Runs for the same app are not serialized: there is no lock across
+runs. Two at once (two operators, or a CI job next to a manual run) are not supported; their
+passwords and Secrets can cross. The checks above catch the cases that matter most (a password
+rotated during a `--keep-password` run, a role or owner changed between the preflight and the
+change), but they are no substitute for running one at a time.
+
+**Passwords never reach the server in plaintext**, on any path. The script computes a
+SCRAM-SHA-256 verifier on the client (`tools/k3s/pg-scram.pl`, core Perl: macOS's `/usr/bin/perl`
+or the runner image's) and sends `ALTER ROLE ... PASSWORD 'SCRAM-SHA-256$4096:...'`, which
+Postgres stores as it is. So no log setting (`log_statement`, `log_min_duration_statement`,
+sampled logging, error statements) can show a password; at most a verifier. The plaintext goes
+only into the Secret file. It never appears on a command line, and with `bash -x` it is not in the
+trace either. Secrets are never exported: the script turns allexport off, and its secret
+variables are declared `+x` (bash locals otherwise inherit an export from the caller's
+environment), so no child process (kubectl, openssl, perl, yq) sees one in its environment. The password statement still runs with `log_statement` off. Connection limits and
+timeouts are range-checked before any SQL, and the limit keeps the spelling it was given.
+
+What the script does not do: it doesn't change the app's chart or settings. Key names the chart
+reads beyond these five per database (for example a second journal database's name) belong in
+the app's own configuration.
 
 ## Order
 

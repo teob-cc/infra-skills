@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stand-in for perl in tests/postgres-credentials/run.sh: records its environment in
+# STUB_LOG.env (the test checks that no secret is in a child's environment), then runs the real
+# /usr/bin/perl with the same arguments and stdin.
+[[ -n "${STUB_LOG:-}" ]] && { echo "### perl $*"; env; } >> "${STUB_LOG}.env"
+exec /usr/bin/perl "$@"

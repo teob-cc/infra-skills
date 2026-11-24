@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for sleep in tests/postgres-credentials/run.sh: postgres.sh's Pooler wait polls 30 times
+# with sleep 2; the test does not wait. (run.sh itself calls /bin/sleep.)
+exit 0

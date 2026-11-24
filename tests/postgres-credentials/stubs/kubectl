@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/postgres-credentials/run.sh. The context matches the fake env and
+# postgres-cluster is healthy with primary postgres-cluster-1. Every call's argv goes to STUB_LOG;
+# the SQL a `kubectl exec -i ... psql` sends on stdin goes to STUB_LOG.sql; `apply -f <file>` keeps a
+# copy of the file under STUB_LOG.applied/ (`apply -f -` keeps stdin).
+#   psql answers, stub mode: the cnpg_pooler_pgbouncer probe prints 1 (nothing with
+#     STUB_NO_POOLER_ROLE=1); the script tagged `-- infra-skills:preflight` prints the rows in
+#     STUB_ROLES, STUB_NEED, STUB_LEDGER, STUB_INTENTS and STUB_DB_OWNERS (newline-separated rows,
+#     fields split by |, which the stub turns into \x1f, the separator postgres.sh asks psql for);
+#     the second preflight (`-- infra-skills:preflight-objects`, inside the databases to take over)
+#     prints STUB_OBJECTS; the tenant CONNECT check prints STUB_OPEN_DBS; the role verifier read
+#     (`-- infra-skills:verifier`) prints the verifier the file STUB_VERIFIERS lists for that role
+#     (lines "<role> <verifier>"), and from a role's second read on the one STUB_VERIFIERS_LATER
+#     lists, when set (a rotation between two reads); anything else prints nothing.
+#   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
+#     (unix socket directory), as `psql -h ... -p ... <the same arguments>`. STUB_CUT=<text>: a
+#     session whose SQL holds <text> gets only the lines up to the first one holding it (the
+#     connection is lost there), and the stub then fails; STUB_CUT_BEFORE=<text>: the same, but
+#     the line holding <text> is not sent either.
+#   STUB_NO_NS=1: `get ns` finds no namespace; STUB_NO_NS_CREATE=1: `create ns` fails; `create ns`
+#     of a namespace this run already created fails with AlreadyExists, as kubectl does.
+set -uo pipefail
+log="${STUB_LOG:?}"
+printf 'kubectl %s\n' "$*" >> "$log"
+{ echo "### kubectl"; env; } >> "$log.env"   # each call's environment (no secret may be in it)
+args=" $* "
+case "$args" in
+  *" config current-context "*) echo "stub-${STUB_CONTEXT_ENV:-fake}"; exit 0 ;;
+  *" get cluster postgres-cluster -o jsonpath="*) echo "Cluster in healthy state"; exit 0 ;;
+  *" get cluster postgres-cluster "*) exit 0 ;;
+  *" get pods "*) echo "postgres-cluster-1"; exit 0 ;;
+  *" get ns "*) [[ "${STUB_NO_NS:-}" == 1 ]] && exit 1; exit 0 ;;
+  *" create ns "*)
+    [[ "${STUB_NO_NS_CREATE:-}" == 1 ]] && { echo "kubectl stub: namespace cannot be created" >&2; exit 1; }
+    ns="${*: -1}"
+    if grep -qxF -- "$ns" "$log.ns" 2>/dev/null; then echo "Error from server (AlreadyExists): namespaces \"$ns\" already exists" >&2; exit 1; fi
+    echo "$ns" >> "$log.ns"; exit 0 ;;
+  *" apply -f - "*)
+    mkdir -p "$log.applied"; n=$(find "$log.applied" -type f | wc -l | tr -d " ")
+    cat > "$log.applied/stdin-$n.json"; exit 0 ;;
+  *" apply -f "*)
+    f=""; prev=""; for a in "$@"; do [[ "$prev" == -f ]] && f="$a"; prev="$a"; done
+    mkdir -p "$log.applied"; cp "$f" "$log.applied/$(basename "$f")"; exit 0 ;;
+  *" exec "*)
+    psql_args=(); seen=false; stdin=false
+    for a in "$@"; do
+      if $seen; then psql_args+=("$a"); continue; fi
+      [[ "$a" == -- ]] && seen=true
+      [[ "$a" == -i ]] && stdin=true
+    done
+    sql=""
+    if $stdin; then sql="$(cat)"; printf -- '-- ### psql %s\n%s\n' "${psql_args[*]:1}" "$sql" >> "$log.sql"; fi
+    if [[ -n "${STUB_PGHOST:-}" ]]; then
+      if $stdin; then
+        if [[ -n "${STUB_CUT:-}" && "$sql" == *"$STUB_CUT"* ]]; then
+          printf '%s\n' "$sql" | awk -v cut="$STUB_CUT" '{ print } index($0, cut) { exit }' \
+            | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+          echo "kubectl stub: connection lost (STUB_CUT)" >&2
+          exit 3
+        fi
+        if [[ -n "${STUB_CUT_BEFORE:-}" && "$sql" == *"$STUB_CUT_BEFORE"* ]]; then
+          printf '%s\n' "$sql" | awk -v cut="$STUB_CUT_BEFORE" 'index($0, cut) { exit } { print }' \
+            | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+          echo "kubectl stub: connection lost (STUB_CUT_BEFORE)" >&2
+          exit 3
+        fi
+        printf '%s\n' "$sql" | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+      else
+        psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}" </dev/null
+      fi
+      exit $?
+    fi
+    case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then [[ "${STUB_NO_POOLER_ROLE:-}" == 1 ]] || echo 1; exit 0; fi ;; esac
+    case "$sql" in
+      *"-- infra-skills:preflight-objects"*) printf '%s\n' "${STUB_OBJECTS:-}" | tr '|' '\037' ;;
+      *"-- infra-skills:preflight"*)
+        printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_LEDGER:-}" "${STUB_INTENTS:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
+      *"-- infra-skills:verifier"*)
+        r="$(sed -n "s/^\\\\set r '\\(.*\\)'$/\\1/p" <<<"$sql")"
+        n=$(( $(cat "$log.vread.$r" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$log.vread.$r"
+        vf="${STUB_VERIFIERS:-}"
+        [[ "$n" -ge 2 && -n "${STUB_VERIFIERS_LATER:-}" ]] && vf="$STUB_VERIFIERS_LATER"
+        [[ -n "$vf" ]] && awk -v r="$r" '$1 == r { print $2 }' "$vf" ;;
+      *"has_database_privilege("*) printf '%s\n' "${STUB_OPEN_DBS:-}" ;;
+    esac
+    exit 0 ;;
+esac
+echo "kubectl stub: unexpected call: $*" >&2
+exit 1
