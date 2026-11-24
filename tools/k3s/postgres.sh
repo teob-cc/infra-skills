@@ -1347,12 +1347,13 @@ pg_public_list_sql() {
 # database an earlier --create-missing run made and did not finish, to run with psql as the
 # superuser (database postgres) once the database is identified: one transaction that holds off a
 # rename or drop, checks it is still the database the preflight saw (its oid), grants CONNECT to its
-# owner and this run's roles (those that exist), revokes PUBLIC's CONNECT and TEMPORARY; then the
-# intent row is deleted. It changes no role's password and no Secret.
+# owner and this run's roles (those that exist), revokes PUBLIC's CONNECT and TEMPORARY and deletes
+# the intent row, all or nothing (it starts with \set ON_ERROR_STOP on: a failed check stops psql
+# before anything else runs). It changes no role's password and no Secret.
 pg_recovery_sql() {
   local db="${target_names[$1]}" oid="${t_datoid[$1]}" r
   printf '%s\n' "----- SQL: finish the ACL of ${db} by hand (psql as the superuser, database postgres) -----" \
-    'BEGIN;' 'LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;' >&2
+    '\set ON_ERROR_STOP on' 'BEGIN;' 'LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;' >&2
   printf "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE oid = %s AND datname = '%s') THEN RAISE EXCEPTION 'database %s is no longer oid %s; nothing changed'; END IF; END \$\$;\n" \
     "$oid" "$db" "$db" "$oid" >&2
   printf "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %%I TO %%I', datname, pg_get_userbyid(datdba)) FROM pg_database WHERE oid = %s \\\\gexec\n" "$oid" >&2
@@ -1364,8 +1365,8 @@ pg_recovery_sql() {
     [[ -n "$r" ]] || continue
     printf "SELECT format('GRANT CONNECT ON DATABASE %%I TO %%I', '%s', '%s') WHERE EXISTS (SELECT FROM pg_roles WHERE rolname = '%s') \\\\gexec\n" "$db" "$r" "$r" >&2
   done
-  printf '%s\n' "REVOKE CONNECT, TEMPORARY ON DATABASE \"${db}\" FROM PUBLIC;" 'COMMIT;' \
-    "DELETE FROM infra_skills.create_intent WHERE datname = '${db}' AND app = '${app_id}' AND done_at IS NULL;" \
+  printf '%s\n' "REVOKE CONNECT, TEMPORARY ON DATABASE \"${db}\" FROM PUBLIC;" \
+    "DELETE FROM infra_skills.create_intent WHERE datname = '${db}' AND app = '${app_id}' AND done_at IS NULL;" 'COMMIT;' \
     '----- end of SQL -----' >&2
 }
 
@@ -1432,16 +1433,16 @@ SELECT 'defacl', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
 HAVING count(*) > 0;
 WITH bad AS (
   -- the destination's default privileges in this database, entry by entry (by grantee oid; 0 =
-  -- PUBLIC), that are neither exactly a grant this script makes (to this run's app or migration
-  -- role, or to another role this script made, by its marker; no grant option: DML on tables;
-  -- USAGE, SELECT, UPDATE on sequences; USAGE on schemas) nor, on a global entry, the built-in
-  -- default; and on a global entry, each built-in default revoked
+  -- PUBLIC), that are neither, on a global entry (no per-schema one is ever exempt), exactly a
+  -- grant this script makes (to this run's app or migration role, or to another role this script
+  -- made, by its marker; no grant option: DML on tables; USAGE, SELECT, UPDATE on sequences;
+  -- USAGE on schemas) nor the built-in default; and on a global entry, each built-in default revoked
   SELECT a.defaclobjtype AS t, a.defaclnamespace AS ns,
          format('%s %s%s', CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(e.grantee)) END,
                 e.privilege_type, CASE WHEN e.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END) AS entry
     FROM pg_default_acl a CROSS JOIN LATERAL aclexplode(a.defaclacl) e
    WHERE a.defaclrole = coalesce((SELECT oid FROM pg_roles WHERE rolname = :'dst'), 0)
-     AND NOT (NOT e.is_grantable
+     AND NOT (a.defaclnamespace = 0 AND NOT e.is_grantable
               AND (e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (:'app_r', :'mig_r'))
                    OR coalesce(shobj_description(e.grantee, 'pg_authid'), '') ~ '^infra-skills:(app|migrate):')
               AND (a.defaclobjtype::text, e.privilege_type) IN (('r', 'SELECT'), ('r', 'INSERT'), ('r', 'UPDATE'), ('r', 'DELETE'), ('r', 'TRUNCATE'),

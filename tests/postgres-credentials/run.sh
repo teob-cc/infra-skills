@@ -270,6 +270,8 @@ check "--create-missing, existing role: and after every database's grants (round
 D="$d_refusal"
 check "--create-missing: that SQL checks the database by the preflight's oid, closes PUBLIC, deletes the intent (round 9 P2-a)" \
   bash -c 'grep -q "IF NOT EXISTS (SELECT FROM pg_database WHERE oid = 17700 AND datname = .manifest.)" "$1" && grep -q "^REVOKE CONNECT, TEMPORARY ON DATABASE \"manifest\" FROM PUBLIC;$" "$1" && grep -q "^DELETE FROM infra_skills.create_intent WHERE datname = .manifest. AND app = .evse-ts. AND done_at IS NULL;$" "$1"' _ "$D/out"
+check "--create-missing: the SQL stops at the first error and deletes the intent inside its transaction (round 10 P2-a)" \
+  bash -c 'sed -n "/^----- SQL: finish the ACL of manifest by hand/,/^----- end of SQL -----\$/p" "$1" | sed "1d;\$d" > "$1.sql"; [ "$(head -1 "$1.sql")" = "\\set ON_ERROR_STOP on" ] && [ "$(tail -2 "$1.sql" | head -1 | cut -c1-34)" = "DELETE FROM infra_skills.create_in" ] && [ "$(tail -1 "$1.sql")" = "COMMIT;" ]' _ "$D/out"
 check "--create-missing: the ACL step takes the recorded oid as authoritative, not the marker (round 8 P2-a)" \
   bash -c 'grep -q "creation recorded (its oid); its ACL is left as it is" "$1" && ! grep -q "shobj_description(x.oid, .pg_database.)" "$1"' _ "$WORK/create-missing/log.sql"
 # Round 7 P2-a: another app's pending creation of the same database name, made or not.
@@ -390,6 +392,8 @@ check "--take-ownership: the destination's default privileges are compared in th
   bash -c 'awk "/^-- infra-skills:preflight-objects/{p=1} /^-- ### /{p=0} p" "$1" | grep -q "SELECT .dstacl."' _ "$WORK/own-new/log.sql"
 check "--take-ownership: only the exact grants the script makes are exempt, revoked built-in defaults count (round 8 P2-b, round 9 P2-b: no comparison with the source)" \
   bash -c 'grep -q "AND (e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (:.app_r., :.mig_r.))" "$1" && grep -q "^SELECT .dstacl., current_database()," "$1" && ! grep -q "the copy from the old owner gives" "$1" && grep -q "revoked (a built-in default)., CASE WHEN d.grantee = 0" "$1"' _ "$WORK/own-new/log.sql"
+check "--take-ownership: no exemption for a per-schema default (round 10 P2-b)" \
+  bash -c 'grep -A1 "AND NOT (a.defaclnamespace = 0 AND NOT e.is_grantable$" "$1" | grep -q "AND (e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN"' _ "$WORK/own-new/log.sql"
 # --- 3. migration role --------------------------------------------------------------------
 echo "== 3. --migration-role"
 run mig evse-ts --tenant symbioen --pooler --database evse:JOURNAL_DB --database evse_ts:STATE_DB --migration-role \
@@ -780,6 +784,11 @@ CREATE ROLE o9src NOLOGIN;
 CREATE DATABASE o9db OWNER o9src;
 CREATE ROLE o9app NOLOGIN PASSWORD 'o9app-original-0123456789';
 COMMENT ON ROLE o9app IS 'infra-skills:app:o9app';
+-- round 10: a destination with a per-schema default for a marked role
+CREATE ROLE q10src NOLOGIN;
+CREATE DATABASE q10db OWNER q10src;
+CREATE ROLE q10app NOLOGIN PASSWORD 'q10app-original-0123456789';
+COMMENT ON ROLE q10app IS 'infra-skills:app:q10app';
 \c evse evse_ts
 CREATE SCHEMA journal;
 CREATE TABLE journal.events (ordering bigserial PRIMARY KEY, payload text);
@@ -1178,6 +1187,15 @@ SQL
   check "real round 9 P2-b: a destination with any default privilege the script does not make is refused, even one the copy would give" \
     bash -c '[ "$1" != 0 ] && grep -q "o9app already has default privileges this script does not make: tables in schema public: other_reader SELECT" "$2/out"' _ "$RC" "$D"
   check "real round 9 P2-b: o9db keeps its owner" [ "$(owner_of_db o9db)" = o9src ]
+  # Round 10 P2-b: q10app (the destination) has a per-schema default for the marked role p2c with
+  # exactly the script's table privileges. The script never makes a per-schema default: refused.
+  q postgres q10db "ALTER DEFAULT PRIVILEGES FOR ROLE q10app IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLES TO p2c" >/dev/null \
+    || fail "real round 10 P2-b: fixture"
+  q10_pw="$(pw_only q10app)"
+  run real-q10 q10app --database q10db --take-ownership
+  check "real round 10 P2-b: a per-schema default for a marked role with the exact privileges is refused" \
+    bash -c '[ "$1" != 0 ] && grep -q "q10app already has default privileges this script does not make: tables in schema public: p2c DELETE" "$2/out"' _ "$RC" "$D"
+  check "real round 10 P2-b: nothing changed (password, owner)" bash -c '[ "$1" = "$2" ] && [ "$3" = q10src ]' _ "$q10_pw" "$(pw_only q10app)" "$(owner_of_db q10db)"
   # Round 8 P2-c: l8app and l8app_migrate exist (grant mode first). During the move (stalled on a
   # table lock), the migration role gains CREATEDB; the late passwords go into one transaction with
   # both guards, so the migration role's guard refusing keeps the app role's password too.
@@ -1335,6 +1353,18 @@ SQL
   check "real round 9 P2-a: the app role (the owner) keeps CONNECT" can p2a2app p2a2_new "SELECT 1"
   check "real round 9 P2-a: the intent row is gone, the password unchanged" \
     bash -c '[ "$1" = 0 ] && [ "$2" = "$3" ]' _ "$(q postgres postgres "SELECT count(*) FROM infra_skills.create_intent WHERE datname = 'p2a2_new'")" "$p2a2_pw" "$(pw_only p2a2app)"
+  # Round 10 P2-a: the printed SQL, run as printed (psql -f, no ON_ERROR_STOP of the caller's), but
+  # with a wrong oid: it stops at the failed check; the intent row stays and PUBLIC is unchanged.
+  STUB_CUT='CREATE DATABASE' run real-p10 p10app --database p10db --create-missing
+  PRE_RUN="$D" run real-p10 p10app --database p10db --create-missing
+  check "real round 10 P2-a: the retry is refused with the SQL (sanity)" \
+    bash -c '[ "$1" != 0 ] && grep -q "^----- SQL: finish the ACL of p10db by hand" "$2/out"' _ "$RC" "$D"
+  sed -n '/^----- SQL: finish the ACL of p10db by hand/,/^----- end of SQL -----$/p' "$D/out" | sed '1d;$d' \
+    | sed -E 's/oid = [0-9]+/oid = 1/g' > "$WORK/p10-wrong-oid.sql"
+  p10_rc=0; psql -h "$PGDIR" -p "$STUB_PGPORT" -U postgres -d postgres -Xq -f "$WORK/p10-wrong-oid.sql" >/dev/null 2>&1 || p10_rc=$?
+  check "real round 10 P2-a: with a wrong oid the SQL fails" [ "$p10_rc" != 0 ]
+  check "real round 10 P2-a: the intent row stays" [ "$(q postgres postgres "SELECT count(*) FROM infra_skills.create_intent WHERE datname = 'p10db' AND done_at IS NULL")" = 1 ]
+  check "real round 10 P2-a: PUBLIC is unchanged" can stranger p10db "SELECT 1"
   # Round 7 P2-a: app p7a's creation of p7db is cut before CREATE DATABASE; app p7b then asks for a
   # database of the same name. It is refused, and p7a's pending intent stays exactly as it was.
   STUB_CUT_BEFORE='CREATE DATABASE' run real-p7a p7a --database p7db --create-missing
