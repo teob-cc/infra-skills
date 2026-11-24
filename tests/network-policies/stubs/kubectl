@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/network-policies/run.sh: answers the read calls network-policies.sh
+# makes in --print mode from the fixture directory STUB_DIR:
+#   nodes.json       `get nodes -o json`
+#   namespaces.txt   `get ns -o jsonpath=...` (one line, names separated by spaces)
+#   cnpg-clusters.json, cnpg-pods.json   CNPG Cluster objects / pods labelled cnpg.io/cluster
+#                    (missing file: an empty list). STUB_NO_CNPG_CRD=1: the Cluster CRD is absent.
+# Every call's argv goes to STUB_LOG. Anything not listed fails, so a new call shows up.
+set -uo pipefail
+dir="${STUB_DIR:?}"
+printf 'kubectl %s\n' "$*" >> "${STUB_LOG:?}"
+empty='{"apiVersion":"v1","kind":"List","items":[]}'
+args=" $* "
+case "$args" in
+  *" config current-context "*) echo "stub-fake"; exit 0 ;;
+  *" get nodes -o json "*) cat "$dir/nodes.json"; exit 0 ;;
+  *" get servicecidrs.networking.k8s.io kubernetes -o json "*) echo '{"spec":{"cidrs":["10.43.0.0/16"]}}'; exit 0 ;;
+  *" -n default get svc kubernetes "*) echo "10.43.0.1"; exit 0 ;;
+  *" -n kube-system get svc traefik -o json "*)
+    echo '{"spec":{"ports":[{"name":"web","port":80,"targetPort":"web"},{"name":"websecure","port":443,"targetPort":"websecure"}]}}'; exit 0 ;;
+  *" -n kube-system get pods -l app.kubernetes.io/name=traefik -o json "*)
+    echo '{"items":[{"spec":{"containers":[{"ports":[{"name":"web","containerPort":8000},{"name":"websecure","containerPort":8443}]}]}}]}'; exit 0 ;;
+  *" get ns -o jsonpath="*) cat "$dir/namespaces.txt"; exit 0 ;;
+  *" get clusters.postgresql.cnpg.io -A -o json "*)
+    [[ "${STUB_NO_CNPG_CRD:-}" == 1 ]] && { echo 'error: the server doesn'"'"'t have a resource type "clusters"' >&2; exit 1; }
+    cat "$dir/cnpg-clusters.json" 2>/dev/null || echo "$empty"; exit 0 ;;
+  *" get pods -A -l cnpg.io/cluster -o json "*) cat "$dir/cnpg-pods.json" 2>/dev/null || echo "$empty"; exit 0 ;;
+esac
+echo "kubectl stub: unexpected call: $*" >&2
+exit 1

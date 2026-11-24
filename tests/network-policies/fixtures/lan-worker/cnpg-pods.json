@@ -1,0 +1,36 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "metadata": {
+        "namespace": "postgres",
+        "name": "postgres-cluster-1",
+        "labels": {
+          "cnpg.io/cluster": "postgres-cluster",
+          "cnpg.io/podRole": "instance"
+        }
+      }
+    },
+    {
+      "metadata": {
+        "namespace": "memory",
+        "name": "memory-pg-1",
+        "labels": {
+          "cnpg.io/cluster": "memory-pg",
+          "cnpg.io/podRole": "instance"
+        }
+      }
+    },
+    {
+      "metadata": {
+        "namespace": "other-db",
+        "name": "other-pg-1",
+        "labels": {
+          "cnpg.io/cluster": "other-pg",
+          "cnpg.io/podRole": "instance"
+        }
+      }
+    }
+  ]
+}

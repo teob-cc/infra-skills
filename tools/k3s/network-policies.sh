@@ -11,7 +11,8 @@ set -euo pipefail
 #       - cluster DNS (kube-dns pods, 53/udp+tcp);
 #       - the ingress controller (Traefik and its k3s servicelb pods), i.e. Harbor, Nexus
 #         and every other public hostname of this cluster, through Traefik;
-#       - the node's public IP on 80/443;
+#       - the node's public IP on 80/443 (only a public address: an ExternalIP or
+#         EXTERNAL_IP inside one of the ranges below stays denied like every node address);
 #       - the internet: 0.0.0.0/0 except the pod and service CIDRs, RFC 1918, CGNAT
 #         100.64.0.0/10 (Tailscale), link-local 169.254.0.0/16 (cloud metadata), loopback,
 #         and every node address.
@@ -31,6 +32,10 @@ set -euo pipefail
 #         and MinIO only when the tenant is listed in NETPOL_TENANT_MINIO (docs/TENANTS.md).
 #   * NETPOL_APP_NAMESPACES (opt-in): application namespaces get the same default-deny ingress
 #     and the same allows as a platform namespace (same namespace, Traefik, Pomerium, Prometheus).
+#   * a fenced namespace other than the postgres one that runs a CNPG cluster (a Cluster object
+#     or pods labelled cnpg.io/cluster): the CNPG operator may reach that cluster's pods on
+#     8000 (instance manager status) and 5432, which the CNPG docs require (security.md "Network
+#     Policies", networking.md). Re-run the script after creating a CNPG cluster in a fenced namespace.
 #
 # Tenant workers (ops-owned nodes that run only a tenant's pods, docs/TENANTS.md: label
 # node-restriction.kubernetes.io/tenant, taint infra-skills/tenant, or a name <tenant>-* for a
@@ -182,6 +187,17 @@ while read -r ip; do [[ -n "$ip" ]] && is_ipv4 "$ip" && PUBLIC_IPS+=("$ip"); don
 for ip in ${PUBLIC_IPS[@]+"${PUBLIC_IPS[@]}"}; do
   [[ " ${NODE_IPS[*]-} " == *" $ip "* ]] || NODE_IPS+=("$ip")
 done
+# Ranges runners never reach: RFC 1918, CGNAT (Tailscale), link-local (cloud metadata), loopback.
+DENY_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8)
+in_deny_range() { local r; for r in "${DENY_RANGES[@]}"; do cidr_contains "$r" "$1" && return 0; done; return 1; }
+# An ExternalIP in one of those ranges (a LAN worker's address) is not public: runners would reach
+# it through the "public IP on 80/443" allow. It stays a node address, denied like the others.
+PRIVATE_EXTERNAL=()
+PUBLIC_ONLY=()
+for ip in ${PUBLIC_IPS[@]+"${PUBLIC_IPS[@]}"}; do
+  if in_deny_range "$ip"; then PRIVATE_EXTERNAL+=("$ip"); else PUBLIC_ONLY+=("$ip"); fi
+done
+PUBLIC_IPS=(${PUBLIC_ONLY[@]+"${PUBLIC_ONLY[@]}"})
 POD_CIDRS=()
 while read -r c; do [[ "$c" == */* ]] && is_ipv4 "${c%/*}" && POD_CIDRS+=("$c"); done < <(
   jq -r '.items[] | (.spec.podCIDRs // [.spec.podCIDR]) | .[]? // empty' <<<"$NODES_JSON")
@@ -228,7 +244,6 @@ NODE_SOURCES=()  # where host-network clients (API server, kubelet) come from
 for ip in "${NODE_IPS[@]}"; do NODE_SOURCES+=("$ip/32"); done
 for c in "${POD_CIDRS[@]}"; do NODE_SOURCES+=("$(gateway_block "$c")"); done
 
-DENY_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8)
 RUNNER_EXCEPT=("${DENY_RANGES[@]}")
 add_except() {
   local c=$1 r
@@ -246,6 +261,7 @@ for c in ${NETPOL_RUNNER_EGRESS_DENY//,/ }; do
 done
 
 log "env ${ENV_NAME}: nodes ${NODE_IPS[*]}; public ${PUBLIC_IPS[*]:-none}"
+(( ${#PRIVATE_EXTERNAL[@]} > 0 )) && log "private ExternalIPs, not public (runners stay denied): ${PRIVATE_EXTERNAL[*]}"
 log "cluster CIDR ${CLUSTER_CIDR}, service CIDR ${SERVICE_CIDR}, node podCIDRs ${POD_CIDRS[*]}"
 log "Traefik target ports ${TRAEFIK_TARGETS[*]}"
 TENANT_NODE_NAMES=$(jq -r '[.items[].metadata.name] | join(" ")' <<<"$TENANT_NODES_JSON")
@@ -264,6 +280,14 @@ for ns in "${ALL_NS[@]}"; do
   [[ -n "${SKIP// /}" ]] && in_list "$ns" "$SKIP" && { log "skip ${ns} (--skip)"; continue; }
   in_list "$ns" "$EXISTING_NS" || { log "skip ${ns} (namespace does not exist)"; continue; }
   TARGET_NS+=("$ns")
+done
+# Namespaces that run a CNPG cluster: a Cluster object (the CRD may be absent) or pods labelled
+# cnpg.io/cluster (instances, poolers, bootstrap and backup jobs).
+CNPG_NS=$({ kubectl get clusters.postgresql.cnpg.io -A -o json 2>/dev/null || echo '{"items":[]}'
+            kubectl get pods -A -l cnpg.io/cluster -o json 2>/dev/null || echo '{"items":[]}'; } \
+  | jq -rs '[.[].items[]?.metadata.namespace] | unique | join(" ")')
+for ns in ${TARGET_NS[@]+"${TARGET_NS[@]}"}; do
+  [[ "$ns" != "$NS_POSTGRES" ]] && in_list "$ns" "$CNPG_NS" && log "${ns} runs a CNPG cluster: the operator may reach its pods on 8000 and 5432"
 done
 
 # --- Render -------------------------------------------------------------------
@@ -304,6 +328,7 @@ needs_node_sources() { in_list "$1" "$NS_RUNNER $NS_CERT $NS_CNPG"; }
 TRAEFIK_PEER=$(from_ns_pods "$NS_INGRESS" app.kubernetes.io/name=traefik)
 POMERIUM_PEER=$(from_ns_pods "$NS_SSO" app.kubernetes.io/name=pomerium)
 PROMETHEUS_PEER=$(from_ns_pods "$NS_OBS" app.kubernetes.io/name=prometheus)
+CNPG_OPERATOR_PEER=$(from_ns_pods "$NS_CNPG" app.kubernetes.io/name=cloudnative-pg)
 # Postgres / S3 clients: every namespace that is not a tenant's, or only the listed ones.
 client_peer() { # client_peer <namespace list> -> a NetworkPolicyPeer
   jq -nc --arg l "$TENANT_NS_LABEL" --argjson names "$(words_json "${1:-}")" '
@@ -357,6 +382,14 @@ render_ns() {
         "$(jq -nc --argjson clients "$S3_CLIENTS" '{podSelector: {matchLabels: {app: "minio"}}, policyTypes: ["Ingress"], ingress: [{from: $clients, ports: [{port: 9000, protocol: "TCP"}]}]}')"
       ;;
   esac
+  # The postgres namespace admits the operator on every port (platform-allow-postgres-clients).
+  if [[ "$ns" != "$NS_POSTGRES" ]] && in_list "$ns" "$CNPG_NS"; then
+    policy "$ns" platform-allow-cnpg-operator "CNPG operator -> this namespace's CNPG cluster pods: instance manager status 8000, PostgreSQL 5432" \
+      "$(jq -nc --argjson op "$CNPG_OPERATOR_PEER" '{
+        podSelector: {matchExpressions: [{key: "cnpg.io/cluster", operator: "Exists"}]},
+        policyTypes: ["Ingress"],
+        ingress: [{from: [$op], ports: [{port: 8000, protocol: "TCP"}, {port: 5432, protocol: "TCP"}]}]}')"
+  fi
 }
 
 render_runner_egress() {

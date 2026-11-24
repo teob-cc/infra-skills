@@ -96,7 +96,9 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     `infra-skills/tenant=<tenant>`), and MinIO only when listed in `NETPOL_TENANT_MINIO`;
   - `NETPOL_APP_NAMESPACES` gives your own application namespaces default-deny ingress.
     **Set it before the tenant worker joins.** An application namespace without a
-    NetworkPolicy is open to a pod that escapes to the tenant worker;
+    NetworkPolicy is open to a pod that escapes to the tenant worker. An application namespace
+    that runs its own CNPG cluster gets an allow for the CNPG operator on 8000 and 5432, so it
+    can be fenced too (re-run the script after creating such a cluster);
   - it names every other policy in its namespaces that admits ingress from anywhere: such a
     policy overrides the default deny for its pods.
 - **`tools/k3s/tenant.sh <env> <tenant>`** builds the namespace scaffold:
