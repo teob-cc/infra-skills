@@ -105,7 +105,9 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     for ingress (an app chart's own policy), so it never widens that fence; `--plan` lists
     them. The allows select exactly the pods that no fence selects, by labels, so a pod created
     later is either fenced or allowed. A fence with two labels doubles the allow policies in its
-    namespace (`<name>`, `<name>-2`, ...); `NETPOL_MAX_ALLOW_SELECTORS` (16) caps them;
+    namespace (`<name>`, `<name>-2`, ...). `NETPOL_MAX_ALLOW_SELECTORS` (16, at most 256)
+    caps the product of the fences' label counts; above it the run stops before it changes
+    anything;
   - every cluster read stops the run before it changes anything when the API returns an error
     (Forbidden, a timeout, a failed discovery). NotFound reads as absent for three reads only,
     each by name: the CNPG Cluster CRD (then CNPG clusters are found from their pods), the

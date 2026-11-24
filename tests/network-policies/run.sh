@@ -27,7 +27,9 @@
 #      leaves out;
 #   5. the run stops before anything is applied or deleted (a run without --print, so the stub
 #      sees every apply) when: a fence's podSelector uses NotIn; the fences need more selectors
-#      than NETPOL_MAX_ALLOW_SELECTORS; the API refuses the NetworkPolicy list, the CNPG pod list or
+#      than NETPOL_MAX_ALLOW_SELECTORS (3 or 13 or 64 extra two-label fences against the default 16,
+#      with the managed allows in place, so a run that let it through would prune them; 2 extra
+#      fences, exactly 16, apply); NETPOL_MAX_ALLOW_SELECTORS is above 256; the API refuses the NetworkPolicy list, the CNPG pod list or
 #      a fenced namespace's pod list. The same run without a fault does apply;
 #   6. CNPG discovery: the Cluster CRD is absent only on NotFound for its raw path; a refused CRD
 #      read, a refused Cluster list, or a Cluster list that fails on a discovery timeout followed by
@@ -234,9 +236,47 @@ check "fences: a running pod that shares one label with a two-label fence does n
 check "fences: ... and the allows keep it (not in the left-out pods)" grep -qF "web: pods left out of the allows: evse-1 portal-1 gw-1 db-0" "$WORK/later-pod.err"
 run_apply cap fences NETPOL_MAX_ALLOW_SELECTORS=3
 check "stop: fences that need more selectors than NETPOL_MAX_ALLOW_SELECTORS stop the run, nothing applied" \
-  stopped cap "web: its fences need 4 selectors for the namespace-wide allows"
+  stopped cap "web: its fences need more than 3 selectors for the namespace-wide allows"
 run_apply cap-ok fences NETPOL_MAX_ALLOW_SELECTORS=4
 check "fences: at the cap the run applies" ran cap-ok
+# The cap with many fences (INFRA-216 round 5): fixtures/fences (4 selectors in 'web') plus <n> more
+# two-label fences in 'web', each with its own keys (nothing to absorb), and the managed allows of
+# 'web' already in place, so a run that let the overflow through would prune them.
+many_fences() { # many_fences <dir> <n>
+  mkdir -p "$1"
+  cp "$HERE/fixtures/fences/"* "$1/"
+  jq --argjson n "$2" '.items += [range($n) | {metadata: {namespace: "web", name: "multi-\(.)", labels: {}},
+    spec: {podSelector: {matchLabels: {"a\(.)": "x", "b\(.)": "x"}}, policyTypes: ["Ingress"], ingress: [{}]}}]' \
+    "$HERE/fixtures/fences/netpols.json" >"$1/netpols.json"
+  jq -n '{items: (["platform-default-deny-ingress"] + ("same-namespace from-prometheus from-ingress-controller from-pomerium"
+    | split(" ") | map("platform-allow-" + .)) | map({metadata: {namespace: "web", name: .,
+    labels: {"app.kubernetes.io/managed-by": "infra-skills-network-policies"}}}))}' >"$1/managed.json"
+}
+many_fences "$WORK/fences-64" 64
+run_apply fences-64 fences STUB_DIR="$WORK/fences-64"
+check "stop: 64 two-label fences (2^66 selectors) stop the run, nothing applied or pruned" \
+  stopped fences-64 "web: its fences need more than 16 selectors"
+many_fences "$WORK/fences-13" 13
+run_apply fences-13 fences STUB_DIR="$WORK/fences-13"
+check "stop: 13 two-label fences (2^15 selectors) stop the run, nothing applied or pruned" \
+  stopped fences-13 "web: its fences need more than 16 selectors"
+many_fences "$WORK/fences-3" 3
+run_apply fences-3 fences STUB_DIR="$WORK/fences-3"
+check "stop: just above the default cap (32 selectors > 16) stops the run, nothing applied or pruned" \
+  stopped fences-3 "web: its fences need more than 16 selectors"
+many_fences "$WORK/fences-2" 2
+run_apply fences-2 fences STUB_DIR="$WORK/fences-2"
+check "fences: at the default cap (16 selectors) the run applies, and prunes none of the managed allows of 'web'" \
+  bash -c '[[ "$(cat "$1.rc")" == 0 ]] && grep -q "^kubectl apply " "$1.log" && ! grep -q " delete " "$1.log"' _ "$WORK/fences-2"
+render fences-2-render fences STUB_DIR="$WORK/fences-2" || fail "render at the default cap ran"
+sixteen_each() { local p; for p in $GENERIC; do [[ "$(generic_sels fences-2-render web "$p" | jq length)" == 16 ]] || return 1; done; }
+check "fences: ... with 16 policies for each allow in 'web'" sixteen_each
+run_apply cap-huge fences NETPOL_MAX_ALLOW_SELECTORS=99999999999999999999
+check "stop: a NETPOL_MAX_ALLOW_SELECTORS that would overflow is refused, nothing applied" \
+  stopped cap-huge "NETPOL_MAX_ALLOW_SELECTORS: not a number from 1 to 256"
+run_apply cap-257 fences NETPOL_MAX_ALLOW_SELECTORS=257
+check "stop: NETPOL_MAX_ALLOW_SELECTORS above 256 is refused, nothing applied" \
+  stopped cap-257 "NETPOL_MAX_ALLOW_SELECTORS: not a number from 1 to 256"
 run_apply forbid-np fences STUB_FAIL="get networkpolicies -A"
 check "stop: a refused NetworkPolicy list stops the run, nothing applied" stopped forbid-np "could not read NetworkPolicies"
 run_apply forbid-cnpg-pods lan-worker STUB_FAIL="-l cnpg.io/cluster"

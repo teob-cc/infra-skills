@@ -96,7 +96,8 @@ set -euo pipefail
 #   NETPOL_POSTGRES_CLIENT_NAMESPACES, NETPOL_MINIO_CLIENT_NAMESPACES
 #                                restrict the Postgres / S3 client allows to these namespaces
 #   NETPOL_TENANT_MINIO          tenants whose namespaces may reach MinIO on 9000
-#   NETPOL_MAX_ALLOW_SELECTORS   most selectors per namespace for the allows around fences (16)
+#   NETPOL_MAX_ALLOW_SELECTORS   most selectors per namespace for the allows around fences: the product
+#                                of the fences' label counts, 1 to 256 (16); more stops the run
 #   TENANTS                      tenant names (tools/k3s/tenant-admission.sh)
 #   NAMESPACE_RUNNER, NAMESPACE_HARBOR, NAMESPACE_OBSERVABILITY, NAMESPACE_ARGOCD,
 #   NAMESPACE_SSO, NAMESPACE_CERT_MANAGER, NAMESPACE_NEXUS, NAMESPACE_MINIO,
@@ -412,7 +413,9 @@ done
 # such as nexus/vpn-allow-vpn-gateway); it is no per-pod fence and is left alone. pgweb (postgres)
 # and mcp-grafana (observability) are left out even before their own policies exist.
 MAX_ALLOW_SELECTORS="${NETPOL_MAX_ALLOW_SELECTORS:-16}"
-[[ "$MAX_ALLOW_SELECTORS" =~ ^[1-9][0-9]*$ ]] || { provision::error "NETPOL_MAX_ALLOW_SELECTORS: not a positive number: $MAX_ALLOW_SELECTORS"; exit 1; }
+if [[ ! "$MAX_ALLOW_SELECTORS" =~ ^[1-9][0-9]{0,2}$ ]] || (( MAX_ALLOW_SELECTORS > 256 )); then
+  provision::error "NETPOL_MAX_ALLOW_SELECTORS: not a number from 1 to 256: $MAX_ALLOW_SELECTORS"; exit 1
+fi
 NETPOLS_JSON=$(kget "NetworkPolicies" get networkpolicies -A -o json)
 TARGET_NS_J=$(printf '%s\n' ${TARGET_NS[@]+"${TARGET_NS[@]}"} | sed '/^$/d' | jq -R . | jq -sc .)
 FENCES_J=$(jq -c --arg m "$MANAGER" --argjson ns "$TARGET_NS_J" '[.items[]
@@ -439,9 +442,11 @@ if [[ -n "$UNSUPPORTED" ]]; then
   exit 1
 fi
 # Per namespace: the fences as requirement lists (built-in pgweb / mcp-grafana included), then the
-# selectors of the allows: {ns: {raw: <product of the fence sizes>, sels: [podSelector]}}. Past a raw
-# product of 4096 the expansion is not tried (the cap below stops the run).
-ALLOW_J=$(jq -c --arg obs "$NS_OBS" --arg pg "$NS_POSTGRES" '
+# selectors of the allows: {ns: {over: <bool>, sels: [podSelector]}}. The selectors before redundant
+# ones are dropped number the product of the fence sizes. That product is bounded while it is
+# computed: it stops growing once past NETPOL_MAX_ALLOW_SELECTORS, so it never overflows. Past the
+# cap the expansion is not tried, "over" is true and the check below stops the run.
+ALLOW_J=$(jq -c --arg obs "$NS_OBS" --arg pg "$NS_POSTGRES" --argjson max "$MAX_ALLOW_SELECTORS" '
   def neg: if .operator == "In" then {key, operator: "NotIn", values} else {key, operator: "DoesNotExist"} end;
   # one requirement per key: DoesNotExist absorbs NotIn, NotIn values add up
   def norm: group_by(.key) | map(if any(.[]; .operator == "DoesNotExist") then {key: .[0].key, operator: "DoesNotExist"}
@@ -457,19 +462,26 @@ ALLOW_J=$(jq -c --arg obs "$NS_OBS" --arg pg "$NS_POSTGRES" '
   + [{ns: $obs, reqs: [{key: "app", operator: "In", values: ["mcp-grafana"]}]},
      {ns: $pg, reqs: [{key: "app", operator: "In", values: ["pgweb"]}]}]
   | group_by(.ns) | map(.[0].ns as $ns | [.[].reqs] | unique as $fences
-    | ([$fences[] | length] | reduce .[] as $k (1; . * $k)) as $raw
-    | {key: $ns, value: {raw: $raw,
-        sels: (if $raw > 4096 then [] else
+    | ([$fences[] | length] | reduce .[] as $k (1; [. * $k, $max + 1] | min)) as $raw
+    | {key: $ns, value: {over: ($raw > $max),
+        sels: (if $raw > $max then [] else
           reduce $fences[] as $f ([[]]; [.[] as $t | $f[] as $r | $t + [$r | neg]])
           | map(norm) | unique
           | . as $all | map(. as $t | select(any($all[]; . != $t and within($t; .)) | not))
           | map(if length == 0 then {} else {matchExpressions: .} end) end)}})
   | from_entries' <<<"$FENCES_J")
 for ns in $(jq -r 'keys[]' <<<"$ALLOW_J"); do
-  read -r raw count < <(jq -r --arg ns "$ns" '.[$ns] | "\(.raw) \(.sels | length)"' <<<"$ALLOW_J")
-  if (( raw > 4096 || count > MAX_ALLOW_SELECTORS )); then
-    provision::error "${ns}: its fences need $( (( raw > 4096 )) && echo "up to ${raw}" || echo "${count}") selectors for the namespace-wide allows (each allow gets one policy per selector), more than NETPOL_MAX_ALLOW_SELECTORS=${MAX_ALLOW_SELECTORS}"
+  # over: true/false from jq, never a number; count: at most the cap (no expansion above it)
+  read -r over count < <(jq -r --arg ns "$ns" '.[$ns] | "\(.over) \(.sels | length)"' <<<"$ALLOW_J")
+  if [[ "$over" != false || ! "$count" =~ ^[0-9]{1,4}$ ]] || (( count > MAX_ALLOW_SELECTORS )); then
+    provision::error "${ns}: its fences need $([[ "$over" == false ]] && echo "${count}" || echo "more than ${MAX_ALLOW_SELECTORS}") selectors for the namespace-wide allows (each allow gets one policy per selector), more than NETPOL_MAX_ALLOW_SELECTORS=${MAX_ALLOW_SELECTORS}"
     provision::error "give those fences fewer labels (a fence with labels A and B needs a selector for 'not A' and one for 'not B'), raise NETPOL_MAX_ALLOW_SELECTORS, or --skip ${ns}; nothing was changed"
+    exit 1
+  fi
+  # Every namespace here has a fence, so its allows need at least one selector. None would render
+  # no allow at all and prune the existing ones: never let that through.
+  if (( count == 0 )); then
+    provision::error "${ns}: no selector for the namespace-wide allows was computed although it has fences; nothing was changed"
     exit 1
   fi
 done
