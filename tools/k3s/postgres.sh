@@ -904,10 +904,26 @@ pg_password() {
 # legacy (the default path): the Secret exactly as before INFRA-243, POSTGRES_* for one database.
 # Otherwise <PREFIX>_HOST/PORT/DATABASE/USERNAME/PASSWORD for each database, values quoted. Call
 # it through provision::without_xtrace: printf would trace the password.
+# pg_yaml_plain_ok <value>: true when <value> is safe as a plain (unquoted) YAML scalar that reads
+# back as the same string: a letter first, then only A-Z a-z 0-9 + / = . _ ~ -, and not a YAML
+# 1.1 boolean or null word. Anything else (all digits, a leading digit or special character, a
+# boolean, ': ' or ' #' inside) is written quoted. Call it through provision::without_xtrace.
+# shellcheck disable=SC2329  # invoked through provision::without_xtrace
+pg_yaml_plain_ok() {
+  local r=0
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+/=._~-]*$ ]] || return 1
+  shopt -s nocasematch
+  [[ "$1" =~ ^(true|false|yes|no|on|off|null|y|n)$ ]] && r=1
+  shopt -u nocasematch
+  return "$r"
+}
+
 # shellcheck disable=SC2329  # invoked through provision::without_xtrace
 pg_write_secret() {
   local file="$1" name="$2" ns="$3" host="$4" port="$5" user="$6" pw_var="$7" note="$8" legacy="$9"; shift 9
   local entry db prefix sep=""
+  local pw_plain=false
+  pg_yaml_plain_ok "${!pw_var}" && pw_plain=true
   (umask 077
    {
      printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: Opaque\nstringData:\n' "$name" "$ns"
@@ -917,7 +933,13 @@ pg_write_secret() {
        printf '  # PostgreSQL port\n  POSTGRES_PORT: "%s"\n\n' "$port"
        printf '  # PostgreSQL database name\n  POSTGRES_DATABASE: %s\n\n' "$db"
        printf '  # PostgreSQL username\n  POSTGRES_USERNAME: %s\n\n' "$user"
-       printf '  # PostgreSQL password\n  POSTGRES_PASSWORD: %s\n' "${!pw_var}"
+       # quoted only when the value is not a safe plain scalar (pg_yaml_plain_ok), generated or kept;
+       # a password that is one is written exactly as before INFRA-243
+       if [[ "$pw_plain" == "true" ]]; then
+         printf '  # PostgreSQL password\n  POSTGRES_PASSWORD: %s\n' "${!pw_var}"
+       else
+         printf '  # PostgreSQL password\n  POSTGRES_PASSWORD: "%s"\n' "${!pw_var}"
+       fi
      else
        for entry in "$@"; do
          db="${entry%%:*}"; prefix="${entry#*:}"
@@ -1353,7 +1375,7 @@ pg_public_list_sql() {
 pg_recovery_sql() {
   local db="${target_names[$1]}" oid="${t_datoid[$1]}" r
   printf '%s\n' "----- SQL: finish the ACL of ${db} by hand (psql as the superuser, database postgres) -----" \
-    '\set ON_ERROR_STOP on' 'BEGIN;' 'LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;' >&2
+    '\set ON_ERROR_STOP on' 'BEGIN;' "SET LOCAL lock_timeout = '5s';" 'LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;' >&2
   printf "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_database WHERE oid = %s AND datname = '%s') THEN RAISE EXCEPTION 'database %s is no longer oid %s; nothing changed'; END IF; END \$\$;\n" \
     "$oid" "$db" "$db" "$oid" >&2
   printf "SELECT format('GRANT CONNECT, TEMPORARY ON DATABASE %%I TO %%I', datname, pg_get_userbyid(datdba)) FROM pg_database WHERE oid = %s \\\\gexec\n" "$oid" >&2
@@ -2036,6 +2058,14 @@ provision_credentials() {
       esac
     done <<<"$pre_out"
     [[ "$refused" == "true" ]] && exit 1
+  fi
+
+  # --database: the Secret's namespace must exist before any credential changes (read-only; a
+  # tenant's comes from tools/k3s/tenant.sh, another is created further down). The default path
+  # keeps origin/main's order (its kubectl calls are the argv golden) and checks it at the end.
+  if [[ "$existing_mode" == "true" && -n "$tenant" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+    err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first. Nothing changed."
+    exit 1
   fi
 
   # Passwords (with --keep-password: the ones the Secret files hold, and only for a new role)

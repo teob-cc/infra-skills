@@ -272,6 +272,8 @@ check "--create-missing: that SQL checks the database by the preflight's oid, cl
   bash -c 'grep -q "IF NOT EXISTS (SELECT FROM pg_database WHERE oid = 17700 AND datname = .manifest.)" "$1" && grep -q "^REVOKE CONNECT, TEMPORARY ON DATABASE \"manifest\" FROM PUBLIC;$" "$1" && grep -q "^DELETE FROM infra_skills.create_intent WHERE datname = .manifest. AND app = .evse-ts. AND done_at IS NULL;$" "$1"' _ "$D/out"
 check "--create-missing: the SQL stops at the first error and deletes the intent inside its transaction (round 10 P2-a)" \
   bash -c 'sed -n "/^----- SQL: finish the ACL of manifest by hand/,/^----- end of SQL -----\$/p" "$1" | sed "1d;\$d" > "$1.sql"; [ "$(head -1 "$1.sql")" = "\\set ON_ERROR_STOP on" ] && [ "$(tail -2 "$1.sql" | head -1 | cut -c1-34)" = "DELETE FROM infra_skills.create_in" ] && [ "$(tail -1 "$1.sql")" = "COMMIT;" ]' _ "$D/out"
+check "--create-missing: the SQL sets lock_timeout right after BEGIN (round 11 P3-b)" \
+  bash -c '[ "$(sed -n 2,3p "$1.sql" | tr "\n" " ")" = "BEGIN; SET LOCAL lock_timeout = '"'"'5s'"'"'; " ]' _ "$D/out"
 check "--create-missing: the ACL step takes the recorded oid as authoritative, not the marker (round 8 P2-a)" \
   bash -c 'grep -q "creation recorded (its oid); its ACL is left as it is" "$1" && ! grep -q "shobj_description(x.oid, .pg_database.)" "$1"' _ "$WORK/create-missing/log.sql"
 # Round 7 P2-a: another app's pending creation of the same database name, made or not.
@@ -587,6 +589,21 @@ STUB_VERIFIERS="$WORK/live-default" STUB_ROLES="$(rolerow app my-app t f '' '' '
 check "--keep-password, default path, role exists: exit 0" [ "$RC" = 0 ]
 check "--keep-password, default path, role exists: no password sent" bash -c '! grep -q "PASSWORD" "$1"' _ "$D/log.sql"
 check "--keep-password, default path: legacy Secret rendering" grep -q '^  POSTGRES_PASSWORD: Pw0Stub' "$D/fake/secrets.plain/my-app-db.secret.yaml"
+# Round 11 P2-b: a kept password that YAML would read as something else (all digits) is written
+# quoted by the legacy writer, so it reads back as the same string.
+digits_pw="12345678901234567890123456"
+yq -i ".stringData.POSTGRES_PASSWORD = \"$digits_pw\"" "$D/fake/secrets.plain/my-app-db.secret.yaml" || fail "round 11 P2-b: fixture"
+echo "my-app $(verifier_of "$digits_pw")" > "$WORK/live-digits"
+STUB_VERIFIERS="$WORK/live-digits" STUB_ROLES="$(rolerow app my-app t f '' '' '' t)" PRE_RUN="$D" run keep-default my-app --keep-password
+check "--keep-password, an all-digit password: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+check "--keep-password, an all-digit password: the Secret's value is that string (round 11 P2-b)" \
+  bash -c '[ "$(yq ".stringData.POSTGRES_PASSWORD | type" "$1")" = "!!str" ] && [ "$(yq -r ".stringData.POSTGRES_PASSWORD" "$1")" = "$2" ]' _ "$D/fake/secrets.plain/my-app-db.secret.yaml" "$digits_pw"
+check "--keep-password, an all-digit password: written quoted, the rest of the legacy rendering as before" \
+  bash -c 'grep -q "^  POSTGRES_PASSWORD: \"$2\"\$" "$1" && grep -q "^  POSTGRES_HOST: postgres-cluster-rw" "$1"' _ "$D/fake/secrets.plain/my-app-db.secret.yaml" "$digits_pw"
+# Round 11 P2-a: a --database run for a tenant whose namespace is missing stops before any SQL that
+# changes credentials (the default path keeps origin/main's order and checks at the end).
+STUB_NO_NS=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
+  bad "--database, the tenant's namespace is missing (round 11 P2-a)" "Namespace symbioen does not exist: run tools/k3s/tenant.sh fake symbioen first. Nothing changed." evse-ts --tenant symbioen --database evse:JOURNAL_DB
 
 # --- 6. openssl failures (P2-b) -----------------------------------------------------------
 echo "== 6. password generation failures"
@@ -789,6 +806,8 @@ CREATE ROLE q10src NOLOGIN;
 CREATE DATABASE q10db OWNER q10src;
 CREATE ROLE q10app NOLOGIN PASSWORD 'q10app-original-0123456789';
 COMMENT ON ROLE q10app IS 'infra-skills:app:q10app';
+-- round 11: a tenant database whose namespace goes missing
+CREATE DATABASE n11db;
 \c evse evse_ts
 CREATE SCHEMA journal;
 CREATE TABLE journal.events (ordering bigserial PRIMARY KEY, payload text);
@@ -1421,6 +1440,18 @@ SQL
     bash -c '[ "$1" = 0 ]' _ "$RC"
   check "real round 9 P2-c: PUBLIC closed on c9new" not can stranger c9new "SELECT 1"
   check "real round 9 P2-c: the new Secret logs in" scram_login c9app "$(key "$D/fake/secrets.plain/c9app-db.secret.yaml" C9NEW_PASSWORD)"
+  # Round 11 P2-a: n11app (tenant symbioen) on n11db; the rerun finds the tenant namespace gone.
+  # It stops before any SQL that changes credentials: password and Secret stay as they were.
+  run real-n11 n11app --tenant symbioen --database n11db
+  check "real round 11 P2-a: first run (sanity)" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  n11_pw="$(pw_only n11app)"; n11_secret="$(cat "$D/fake/secrets.plain/n11app-db.secret.yaml")"
+  STUB_NO_NS=1 PRE_RUN="$D" run real-n11 n11app --tenant symbioen --database n11db
+  check "real round 11 P2-a: a missing tenant namespace stops the rerun" \
+    bash -c '[ "$1" != 0 ] && grep -q "Namespace symbioen does not exist" "$2/out"' _ "$RC" "$D"
+  check "real round 11 P2-a: the password is unchanged" [ "$n11_pw" = "$(pw_only n11app)" ]
+  check "real round 11 P2-a: the Secret is unchanged, and still logs in" \
+    bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/n11app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$n11_secret" "$D"
+  check "real round 11 P2-a: (its password logs in)" scram_login n11app "$(key "$D/fake/secrets.plain/n11app-db.secret.yaml" POSTGRES_PASSWORD)"
   # Round 5 P2-b: --keep-password, and the app role's password is rotated elsewhere while the run
   # waits (a held intent row stalls it after its first check); the Secret is not applied.
   rc_dir="$WORK/real-create"

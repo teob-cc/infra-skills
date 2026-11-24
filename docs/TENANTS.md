@@ -256,8 +256,10 @@ the preflight saw it, that owner, and the destination role as its transaction gu
 the same name since stops the run there. That table lives
 in the `postgres` database, PUBLIC cannot read it, and the script makes it on first use. The
 preflight first checks, from the catalogs alone, that the schema and its tables belong to the
-superuser the script runs as, that they are plain tables and have the expected columns; only
-`--take-ownership` then reads `ownership_transfer`. Then, per database, in one transaction inside
+superuser the script runs as, that they are plain tables and have the expected columns; in the
+preflight only `--take-ownership` then reads `ownership_transfer`. (A plain `--revoke-public` run
+also reads it, in its main session, to give a database's former owner CONNECT before PUBLIC's is
+revoked; the preflight has checked the table by then.) Then, per database, in one transaction inside
 that database, with `lock_timeout` 5 s and `statement_timeout` 60 s (a lock another session holds
 fails the move fast, with nothing changed):
 
