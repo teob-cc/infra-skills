@@ -43,7 +43,9 @@
 #      replacement of a created database, a move that times out with an existing role's password
 #      kept, a destination with default privileges of its own (a grant option, a revoked default),
 #      a created database whose comment changed (its recorded oid decides), late passwords refused
-#      by one role's guard (neither changes), PUBLIC lists cut at 20 (the full query works).
+#      by one role's guard (neither changes), PUBLIC lists cut at 20 (the full query works, only
+#      where PUBLIC holds CONNECT), the printed recovery SQL run as is, a create ACL step that
+#      times out with an existing role's password kept, a role named "PUBLIC".
 #
 # Usage: tests/postgres-credentials/run.sh [--real-postgres]   (needs bash, jq, yq; --real-postgres
 #        also initdb, pg_ctl and psql on PATH). PG_SCRIPT=<path> runs another postgres.sh (for
@@ -169,7 +171,7 @@ d_grant="$D"
 STUB_DB_OWNERS="$(dbrow evse scala_owner f f scala_owner f t 'a, b' 'a, b, c (+3 more)')" run pub-cut x --database evse
 check "a cut PUBLIC list: exit 0" [ "$RC" = 0 ]
 check "a cut PUBLIC list: says so and prints the full read-only query (round 8 P3-b)" \
-  bash -c 'grep -q "evse: the lists above are cut at 20" "$1" && grep -q "SELECT r.rolname, EXISTS (SELECT FROM pg_stat_activity a .* WHERE d.datname = .evse. AND NOT EXISTS" "$1"' _ "$D/out"
+  bash -c 'grep -q "evse: the lists above are cut at 20" "$1" && grep -q "SELECT r.rolname, EXISTS (SELECT FROM pg_stat_activity a .* WHERE d.datname = .evse. AND has_database_privilege(.public., d.oid, .CONNECT.) AND NOT EXISTS" "$1"' _ "$D/out"
 D="$d_grant"
 check "grant: who relies on PUBLIC counts only privileges a role can use, NOINHERIT aside (round 5 P3)" contains "$sql" "pg_has_role(r.oid, e.grantee, 'USAGE')"
 check "grant: the app role gets CONNECT explicitly" contains "$sql" 'GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"role";'
@@ -255,10 +257,19 @@ check "--create-missing: the ACL runs in a transaction that checks the database'
   bash -c 'awk "/its ACL is left as it is/{c=NR} /ON DATABASE :\"db\" FROM PUBLIC;/{ if (c && !r) r=NR } /^COMMIT;/{ if (r && !m) m=NR } END{exit !(c && r > c && m > r)}" "$1"' _ "$WORK/create-missing/log.sql"
 check "--create-missing: intents are claimed and finished by (app, name) (round 7 P2-a)" \
   bash -c 'grep -q "belongs to another app; nothing created" "$1" && grep -q "SET done_at = now() WHERE datname = :.db. AND app = :.app. AND done_at IS NULL" "$1"' _ "$WORK/create-missing/log.sql"
-check "--create-missing: the refusal says how to finish the ACL by hand (round 7 P3)" \
-  grep -q "fake --provision-credentials evse-ts --database manifest:MANIFEST_DB --revoke-public --keep-connect none$" "$D/out"
-check "--create-missing: the recovery command names that database and no --create-missing (round 8 P3-a)" \
-  bash -c 'grep "tools/k3s/postgres.sh fake --provision-credentials" "$1" | grep -q -- "--create-missing" && exit 1; grep -q -- "--database manifest:MANIFEST_DB --revoke-public" "$1"' _ "$D/out"
+check "--create-missing: the refusal prints plain SQL to finish the ACL, no script command (round 9 P2-a)" \
+  bash -c '! grep -q "tools/k3s/postgres.sh .*--provision-credentials" "$1" && grep -q "^----- SQL: finish the ACL of manifest by hand" "$1" && grep -q "^----- end of SQL -----$" "$1"' _ "$D/out"
+d_refusal="$D"
+STUB_ROLES="$(rolerow app evse-ts)" STUB_DB_OWNERS="$(dbrow evse scala_owner; nodb manifest)" \
+  run create-late evse-ts --database evse:JOURNAL_DB --database manifest:MANIFEST_DB --create-missing
+check "--create-missing, existing role: exit 0" [ "$RC" = 0 ]
+check "--create-missing, existing role: its password only after the new database's ACL (round 9 P2-c)" \
+  before "$D/log.sql" 'ON DATABASE :"db" FROM PUBLIC;' "PASSWORD :'pw'"
+check "--create-missing, existing role: and after every database's grants (round 9 P2-c)" \
+  bash -c 'awk "/PASSWORD :.pw./{p=NR} /ALTER DEFAULT PRIVILEGES FOR ROLE/{a=NR} END{exit !(p > a)}" "$1"' _ "$D/log.sql"
+D="$d_refusal"
+check "--create-missing: that SQL checks the database by the preflight's oid, closes PUBLIC, deletes the intent (round 9 P2-a)" \
+  bash -c 'grep -q "IF NOT EXISTS (SELECT FROM pg_database WHERE oid = 17700 AND datname = .manifest.)" "$1" && grep -q "^REVOKE CONNECT, TEMPORARY ON DATABASE \"manifest\" FROM PUBLIC;$" "$1" && grep -q "^DELETE FROM infra_skills.create_intent WHERE datname = .manifest. AND app = .evse-ts. AND done_at IS NULL;$" "$1"' _ "$D/out"
 check "--create-missing: the ACL step takes the recorded oid as authoritative, not the marker (round 8 P2-a)" \
   bash -c 'grep -q "creation recorded (its oid); its ACL is left as it is" "$1" && ! grep -q "shobj_description(x.oid, .pg_database.)" "$1"' _ "$WORK/create-missing/log.sql"
 # Round 7 P2-a: another app's pending creation of the same database name, made or not.
@@ -373,12 +384,12 @@ check "--take-ownership, existing roles: both late passwords in one transaction 
 STUB_DB_OWNERS="$(dbrow evse scala_owner)" run own-new x --database evse --take-ownership
 check "--take-ownership, a role made in this run: its password at creation, before the move (round 7 P2-c)" before "$D/log.sql" "PASSWORD :'pw'" "ALTER DATABASE %I OWNER TO"
 # Round 7 P2-d: the destination already has other default privileges in the database.
-STUB_OBJECTS='dstacl|evse|tables: x has PUBLIC SELECT, the copy from the old owner gives nothing' STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
-  bad "--take-ownership, the destination's own default privileges differ (round 7 P2-d)" "x already has default privileges that differ from what the copy would give: tables: x has PUBLIC SELECT, the copy from the old owner gives nothing" x --database evse --take-ownership
+STUB_OBJECTS='dstacl|evse|tables: PUBLIC SELECT' STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
+  bad "--take-ownership, the destination has default privileges the script does not make (round 7 P2-d, round 9 P2-b)" "x already has default privileges this script does not make: tables: PUBLIC SELECT" x --database evse --take-ownership
 check "--take-ownership: the destination's default privileges are compared in the second preflight (round 7 P2-d)" \
   bash -c 'awk "/^-- infra-skills:preflight-objects/{p=1} /^-- ### /{p=0} p" "$1" | grep -q "SELECT .dstacl."' _ "$WORK/own-new/log.sql"
-check "--take-ownership: only the exact grants the script makes are exempt, revoked built-in defaults count (round 8 P2-b)" \
-  bash -c 'grep -q "AND NOT (NOT e.is_grantable AND e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (:.app_r., :.mig_r.))" "$1" && grep -q "revoked (a built-in default)., CASE WHEN d.grantee = 0" "$1"' _ "$WORK/own-new/log.sql"
+check "--take-ownership: only the exact grants the script makes are exempt, revoked built-in defaults count (round 8 P2-b, round 9 P2-b: no comparison with the source)" \
+  bash -c 'grep -q "AND (e.grantee IN (SELECT oid FROM pg_roles WHERE rolname IN (:.app_r., :.mig_r.))" "$1" && grep -q "^SELECT .dstacl., current_database()," "$1" && ! grep -q "the copy from the old owner gives" "$1" && grep -q "revoked (a built-in default)., CASE WHEN d.grantee = 0" "$1"' _ "$WORK/own-new/log.sql"
 # --- 3. migration role --------------------------------------------------------------------
 echo "== 3. --migration-role"
 run mig evse-ts --tenant symbioen --pooler --database evse:JOURNAL_DB --database evse_ts:STATE_DB --migration-role \
@@ -757,6 +768,18 @@ CREATE ROLE d9app NOLOGIN PASSWORD 'd9app-original-0123456789';
 COMMENT ON ROLE d9app IS 'infra-skills:app:d9app';
 CREATE ROLE l8src NOLOGIN;
 CREATE DATABASE l8db OWNER l8src;
+-- round 9: a database for an existing app role whose next run creates another database
+CREATE DATABASE c9base;
+-- round 9: a role literally named "PUBLIC"; destinations with default privileges the script does not make
+CREATE ROLE "PUBLIC" NOLOGIN;
+CREATE ROLE p9src NOLOGIN;
+CREATE DATABASE p9db OWNER p9src;
+CREATE ROLE p9app NOLOGIN PASSWORD 'p9app-original-0123456789';
+COMMENT ON ROLE p9app IS 'infra-skills:app:p9app';
+CREATE ROLE o9src NOLOGIN;
+CREATE DATABASE o9db OWNER o9src;
+CREATE ROLE o9app NOLOGIN PASSWORD 'o9app-original-0123456789';
+COMMENT ON ROLE o9app IS 'infra-skills:app:o9app';
 \c evse evse_ts
 CREATE SCHEMA journal;
 CREATE TABLE journal.events (ordering bigserial PRIMARY KEY, payload text);
@@ -1120,7 +1143,7 @@ SQL
   run real-d7 d7app --database d7db --take-ownership
   check "real round 7 P2-d: a destination with its own PUBLIC SELECT default is refused" [ "$RC" != 0 ]
   check "real round 7 P2-d: both sides printed" \
-    grep -q "d7app already has default privileges that differ from what the copy would give: tables: d7app has PUBLIC SELECT, the copy from the old owner gives nothing" "$D/out"
+    grep -q "d7app already has default privileges this script does not make: tables: PUBLIC SELECT" "$D/out"
   check "real round 7 P2-d: nothing changed (password, owners)" \
     bash -c '[ "$1" = "$2" ] && [ "$3" = d7src ] && [ "$4" = d7src ]' _ "$d7_pw" "$(pw_only d7app)" "$(owner_of_db d7db)" "$(q postgres d7db "SELECT tableowner FROM pg_tables WHERE tablename='d7t'")"
   # Round 8 P2-b: destinations whose own default privileges are not exactly what the script grants:
@@ -1130,14 +1153,31 @@ SQL
   d8_pw="$(pw_only d8app)"
   run real-d8 d8app --database d8db --take-ownership --migration-role
   check "real round 8 P2-b: a destination granting the app role SELECT WITH GRANT OPTION is refused" \
-    bash -c '[ "$1" != 0 ] && grep -q "tables: d8app_migrate has d8app SELECT WITH GRANT OPTION, the copy from the old owner gives nothing" "$2/out"' _ "$RC" "$D"
+    bash -c '[ "$1" != 0 ] && grep -q "d8app_migrate already has default privileges this script does not make: tables: d8app SELECT WITH GRANT OPTION" "$2/out"' _ "$RC" "$D"
   check "real round 8 P2-b: nothing changed (password, owner)" bash -c '[ "$1" = "$2" ] && [ "$3" = d8src ]' _ "$d8_pw" "$(pw_only d8app)" "$(owner_of_db d8db)"
   q postgres d9db "ALTER DEFAULT PRIVILEGES FOR ROLE d9app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC" >/dev/null || fail "real round 8 P2-b: fixture d9"
   d9_pw="$(pw_only d9app)"
   run real-d9 d9app --database d9db --take-ownership
   check "real round 8 P2-b: a destination that revoked a built-in default is refused" \
-    bash -c '[ "$1" != 0 ] && grep -q "functions: d9app has PUBLIC EXECUTE revoked (a built-in default), the copy from the old owner gives nothing" "$2/out"' _ "$RC" "$D"
+    bash -c '[ "$1" != 0 ] && grep -q "d9app already has default privileges this script does not make: functions: PUBLIC EXECUTE revoked (a built-in default)" "$2/out"' _ "$RC" "$D"
   check "real round 8 P2-b: nothing changed (password, owner)" bash -c '[ "$1" = "$2" ] && [ "$3" = d9src ]' _ "$d9_pw" "$(pw_only d9app)" "$(owner_of_db d9db)"
+  # Round 9 P2-b: default privileges are compared by grantee oid. p9app (the destination) grants
+  # SELECT to PUBLIC; p9src grants SELECT to a role literally named "PUBLIC". They are not the same
+  # grant, and the destination's row is not one this script makes: refused. o9app has the same
+  # schema grant as its source o9src: any destination row the script did not make is refused too.
+  q postgres p9db "ALTER DEFAULT PRIVILEGES FOR ROLE p9app GRANT SELECT ON TABLES TO PUBLIC" >/dev/null || fail "real round 9 P2-b: fixture p9app"
+  q postgres p9db "ALTER DEFAULT PRIVILEGES FOR ROLE p9src GRANT SELECT ON TABLES TO \"PUBLIC\"" >/dev/null || fail "real round 9 P2-b: fixture p9src"
+  p9_pw="$(pw_only p9app)"
+  run real-p9 p9app --database p9db --take-ownership
+  check "real round 9 P2-b: a role named \"PUBLIC\" does not pass as PUBLIC: refused" \
+    bash -c '[ "$1" != 0 ] && grep -q "p9app already has default privileges this script does not make: tables: PUBLIC SELECT\.\$" "$2/out"' _ "$RC" "$D"
+  check "real round 9 P2-b: nothing changed (password, owner)" bash -c '[ "$1" = "$2" ] && [ "$3" = p9src ]' _ "$p9_pw" "$(pw_only p9app)" "$(owner_of_db p9db)"
+  q postgres o9db "ALTER DEFAULT PRIVILEGES FOR ROLE o9app IN SCHEMA public GRANT SELECT ON TABLES TO other_reader" >/dev/null || fail "real round 9 P2-b: fixture o9app"
+  q postgres o9db "ALTER DEFAULT PRIVILEGES FOR ROLE o9src IN SCHEMA public GRANT SELECT ON TABLES TO other_reader" >/dev/null || fail "real round 9 P2-b: fixture o9src"
+  run real-o9 o9app --database o9db --take-ownership
+  check "real round 9 P2-b: a destination with any default privilege the script does not make is refused, even one the copy would give" \
+    bash -c '[ "$1" != 0 ] && grep -q "o9app already has default privileges this script does not make: tables in schema public: other_reader SELECT" "$2/out"' _ "$RC" "$D"
+  check "real round 9 P2-b: o9db keeps its owner" [ "$(owner_of_db o9db)" = o9src ]
   # Round 8 P2-c: l8app and l8app_migrate exist (grant mode first). During the move (stalled on a
   # table lock), the migration role gains CREATEDB; the late passwords go into one transaction with
   # both guards, so the migration role's guard refusing keeps the app role's password too.
@@ -1283,8 +1323,18 @@ SQL
   check "real round 6 P2-a: a database cut off before its marker is not finished blindly either" \
     bash -c '[ "$1" != 0 ] && grep -q "nothing shows it is the one" "$2/out"' _ "$RC" "$D"
   check "real round 6 P2-a: PUBLIC is untouched on it" can stranger p2a2_new "SELECT 1"
-  check "real round 7 P3: the refusal spells out the ACL step (--revoke-public --keep-connect)" \
-    grep -q "fake --provision-credentials p2a2app --database p2a2_new --revoke-public --keep-connect none$" "$D/out"
+  check "real round 9 P2-a: the refusal prints plain SQL, no script command" \
+    bash -c '! grep -q "tools/k3s/postgres.sh .*--provision-credentials" "$1" && grep -q "^----- SQL: finish the ACL of p2a2_new by hand" "$1"' _ "$D/out"
+  # Round 9 P2-a: run the printed SQL with psql: PUBLIC is closed, the owner and the app role keep
+  # CONNECT, the intent row is gone, and no password changed.
+  p2a2_pw="$(pw_only p2a2app)"
+  sed -n '/^----- SQL: finish the ACL of p2a2_new by hand/,/^----- end of SQL -----$/p' "$D/out" | sed '1d;$d' > "$WORK/p2a2-recovery.sql"
+  check "real round 9 P2-a: the printed SQL runs" \
+    psql -h "$PGDIR" -p "$STUB_PGPORT" -U postgres -d postgres -Xq -v ON_ERROR_STOP=1 -f "$WORK/p2a2-recovery.sql"
+  check "real round 9 P2-a: PUBLIC is closed" not can stranger p2a2_new "SELECT 1"
+  check "real round 9 P2-a: the app role (the owner) keeps CONNECT" can p2a2app p2a2_new "SELECT 1"
+  check "real round 9 P2-a: the intent row is gone, the password unchanged" \
+    bash -c '[ "$1" = 0 ] && [ "$2" = "$3" ]' _ "$(q postgres postgres "SELECT count(*) FROM infra_skills.create_intent WHERE datname = 'p2a2_new'")" "$p2a2_pw" "$(pw_only p2a2app)"
   # Round 7 P2-a: app p7a's creation of p7db is cut before CREATE DATABASE; app p7b then asks for a
   # database of the same name. It is refused, and p7a's pending intent stays exactly as it was.
   STUB_CUT_BEFORE='CREATE DATABASE' run real-p7a p7a --database p7db --create-missing
@@ -1320,6 +1370,27 @@ SQL
   check "real round 8 P2-a: the retry finishes the ACL by the recorded oid" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
   check "real round 8 P2-a: PUBLIC can no longer connect" not can stranger p8db "SELECT 1"
   check "real round 8 P2-a: the Secret matches the role (no stale Secret)" scram_login p8app "$(key "$D/fake/secrets.plain/p8app-db.secret.yaml" POSTGRES_PASSWORD)"
+  # Round 9 P2-c: c9app exists with its Secret (grant mode on c9base). Its run that also creates
+  # c9new is cut after the oid is recorded; the retry finishes c9new, but a session holds c9new's
+  # pg_database row (FOR UPDATE), so the ACL step times out. The existing role's password changes
+  # only after every other step, so password and Secret stay as they were. Then the retry completes.
+  run real-c9 c9app --database c9base
+  check "real round 9 P2-c: grant mode first (sanity)" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  STUB_CUT='UPDATE infra_skills.create_intent SET datoid' PRE_RUN="$D" run real-c9 c9app --database c9base --database c9new:C9NEW --create-missing
+  c9_pw="$(pw_only c9app)"; c9_secret="$(cat "$D/fake/secrets.plain/c9app-db.secret.yaml")"
+  hold postgres "SELECT 1 FROM pg_database WHERE datname = 'c9new' FOR UPDATE;" || fail "real round 9 P2-c: row lock holder did not start"
+  PRE_RUN="$D" run real-c9 c9app --database c9base --database c9new:C9NEW --create-missing
+  release
+  check "real round 9 P2-c: the create ACL step times out on the lock" bash -c '[ "$1" != 0 ] && grep -q "canceling statement due to lock timeout" "$2/out"' _ "$RC" "$D"
+  check "real round 9 P2-c: the existing role's password is unchanged" [ "$c9_pw" = "$(pw_only c9app)" ]
+  check "real round 9 P2-c: its Secret is unchanged, not applied, and still logs in" \
+    bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/c9app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$c9_secret" "$D"
+  check "real round 9 P2-c: (the old Secret's password logs in)" scram_login c9app "$(key "$D/fake/secrets.plain/c9app-db.secret.yaml" POSTGRES_PASSWORD)"
+  PRE_RUN="$D" run real-c9 c9app --database c9base --database c9new:C9NEW --create-missing; collect
+  check "real round 9 P2-c: the retry completes (PUBLIC closed on c9new, new Secret logs in)" \
+    bash -c '[ "$1" = 0 ]' _ "$RC"
+  check "real round 9 P2-c: PUBLIC closed on c9new" not can stranger c9new "SELECT 1"
+  check "real round 9 P2-c: the new Secret logs in" scram_login c9app "$(key "$D/fake/secrets.plain/c9app-db.secret.yaml" C9NEW_PASSWORD)"
   # Round 5 P2-b: --keep-password, and the app role's password is rotated elsewhere while the run
   # waits (a held intent row stalls it after its first check); the Secret is not applied.
   rc_dir="$WORK/real-create"
@@ -1352,6 +1423,9 @@ SQL
   full_sql="$(grep -o "SELECT r.rolname, EXISTS .*ORDER BY 1;" "$D/out" | head -1 || true)"
   check "real round 8 P3-b: the printed query lists every role relying on PUBLIC, stranger included" \
     bash -c '[[ -n "$1" ]] && grep -qx "stranger|f" <<<"$2"' _ "$full_sql" "$(q postgres postgres "$full_sql")"
+  from_db="'p3db'"; to_db="'p2a2_new'"; closed_sql="${full_sql/$from_db/$to_db}"   # the same query for p2a2_new, closed above
+  check "real round 9 P3: the full query has the preflight's PUBLIC CONNECT predicate (nothing on a closed database)" \
+    bash -c '[[ "$1" == *p2a2_new* ]] && [ -z "$2" ]' _ "$closed_sql" "$(q postgres postgres "$closed_sql")"
   run real-default my-app --migration-role --migration-schema my-app.flyway; collect
   check "real default + migration role: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
   check "real default: my-app owns database my-app" [ "$(owner_of_db my-app)" = my-app ]
