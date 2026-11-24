@@ -154,24 +154,49 @@ five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. Th
 | Flag | What it does |
 | --- | --- |
 | `--database <name>[:<PREFIX>]` | Repeatable. Use these databases instead of creating `<app>`. With a prefix, the Secret gets `<PREFIX>_HOST`, `_PORT`, `_DATABASE`, `_USERNAME` and `_PASSWORD` for that database; without one, `POSTGRES_*` (at most one database can go without). A database that does not exist is an error. |
-| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. |
-| `--take-ownership` | Move each named database to the migration role (or the app role): `REASSIGN OWNED BY` its old owner in it, then `ALTER DATABASE ... OWNER`. Off by default. |
+| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. |
+| `--revoke-public` | Revoke PUBLIC's CONNECT and TEMPORARY on the named databases. Needs `--keep-connect`. Off by default. |
+| `--keep-connect <role>[,<role>]` | With `--revoke-public`: the roles, besides the owner, that keep CONNECT (`none` for no other role). |
+| `--take-ownership` | Move each named database to the migration role (or the app role): `ALTER DATABASE ... OWNER`, then `REASSIGN OWNED BY` its old owner inside it, then a check. Off by default. |
 | `--migration-role [name]` | A second login role, `<app>_migrate` unless named, with its own Secret `<app>-db-migrate`. |
+| `--migration-schema <db>.<schema>` | Repeatable. A schema the migration role owns (created if missing, its owner changed if not). The role gets CREATE on that database. |
 | `--migration-connection-limit N` | That role's connection limit (default 2, or `PG_MIGRATION_CONNECTION_LIMIT`). |
-| `--connection-limit N` | The app role's connection limit (tenant default 20). |
-| `--keep-password` | Reuse the passwords in `secrets.plain/<app>-db.secret.yaml` and `<app>-db-migrate.secret.yaml` instead of setting new ones. |
+| `--connection-limit N` | The app role's connection limit (tenant default 20); -1 to 2147483647. |
+| `--keep-password` | Keep the passwords in `secrets.plain/<app>-db.secret.yaml` and `<app>-db-migrate.secret.yaml`. A role that exists keeps its password untouched. A missing role is created with the password from the file. |
+
+**Which roles the script uses.** It reuses an existing role only when it made that role for
+this app: `COMMENT ON ROLE` holds the marker `infra-skills:app:<app>` or
+`infra-skills:migrate:<app>`. The default path adds no marker. In `--database` mode an unmarked
+app role that owns the database `<app>` (made by the default path) is adopted and marked. The
+script refuses:
+
+- reserved names: `postgres`, `app` (CNPG's owner), `streaming_replica`,
+  `cnpg_pooler_pgbouncer`, `PG_READONLY_ROLE`, `public`, `none` and every `pg_*` name. This also
+  applies to the app id on the default path;
+- an existing role that is a superuser, has CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS, or
+  belongs to a role that does or to a `pg_*` role;
+- an existing role without this app's marker. If it really is the app's role, mark it by hand
+  with the `COMMENT ON ROLE` the error message prints.
+
+Nothing changes before these checks pass.
 
 **Grant mode** is the default for `--database`. Each database keeps its owner, and the app role
 gets:
 
-- CONNECT and TEMPORARY on the database. The owner, the pooler role and (not for a tenant)
-  `PG_READONLY_ROLE` get CONNECT explicitly, then PUBLIC's CONNECT and TEMPORARY are revoked.
-  Any other role that reached the database through PUBLIC needs a `GRANT CONNECT` of its own.
+- CONNECT and TEMPORARY on the database. The pooler role and (not for a tenant)
+  `PG_READONLY_ROLE` get CONNECT. PUBLIC keeps its CONNECT. The run prints a warning that
+  lists the login roles that reach the database only through PUBLIC, and those connected now.
 - In every schema except `pg_*` and `information_schema`: USAGE and CREATE on the schema;
   SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES and TRIGGER on all tables; USAGE, SELECT
   and UPDATE on all sequences.
 - Default privileges for the database owner and each schema owner (superusers aside), so the
   tables and sequences they create later are the app role's too.
+
+**`--revoke-public --keep-connect <roles>`** closes the database. First, CONNECT goes to the
+owner, the former owner (after `--take-ownership`), the `--keep-connect` roles,
+`PG_READONLY_ROLE` and the pooler role. Then PUBLIC's CONNECT and TEMPORARY are revoked. If a
+kept role, the read-only role or (with `--pooler`) `cnpg_pooler_pgbouncer` does not exist, the
+run stops before anything is revoked. The warning names the roles that lose CONNECT.
 
 Grant mode never changes the existing tables' owner, so DDL on those tables (ALTER, an index,
 DROP) still needs their owner. When the migrations must change existing tables, use
@@ -180,26 +205,43 @@ DROP) still needs their owner. When the migrations must change existing tables, 
 **`--take-ownership`** moves ownership instead. `REASSIGN OWNED BY` moves *every* database and
 tablespace the old owner has, in the whole cluster, not only the one it runs in. The script
 therefore refuses the move when the old owner is a superuser or a `pg_*` role, owns a database
-not named with `--database`, or owns a tablespace. Objects in the database owned by other roles
-keep their owner.
+not named with `--database`, or owns a tablespace. Before anything moves, the original owner of
+each database is recorded in `infra_skills.ownership_transfer`, a table in the `postgres`
+database that PUBLIC cannot read. Then, per database:
+
+1. `ALTER DATABASE ... OWNER`;
+2. `REASSIGN OWNED BY` the recorded owner, inside that database;
+3. a check that no object in the database still belongs to the old owner (default privileges
+   aside), otherwise the run fails;
+4. the ledger row is marked done.
+
+If a run stops halfway, the next run reads the recorded owner and completes the move, even when
+the database already shows the new owner. Objects owned by other roles keep their owner.
 
 **The migration role** has:
 
 - no `statement_timeout` and no `idle_in_transaction_session_timeout`, while the app role keeps
   60s and 5min;
 - its own small connection limit, on top of the app role's;
-- membership in the app role. It inherits the app role's rights, and it may alter whatever the
-  app role owns (in the default path the app role owns its database and its tables).
+- explicit grants in the named databases only: CONNECT and TEMPORARY, and the same schema,
+  table and sequence rights as the app role, plus default privileges from the database owner,
+  the schema owners and the app role. It is not a member of the app role (a membership from an
+  earlier run is revoked), so the app role's rights in other databases don't reach it;
+- the schemas named with `--migration-schema`: it owns them, and it has CREATE on their
+  database, so it can create more schemas there. The app role gets USAGE, CREATE and DML on them.
 
 Whatever the migration role creates is its own. Default privileges
 (`ALTER DEFAULT PRIVILEGES FOR ROLE <app>_migrate ... TO <app>` in each database: DML on tables;
 USAGE, SELECT and UPDATE on sequences; USAGE on schemas) give the app role its rights on those
 objects the moment they exist, so a migrate Job needs no grants of its own. The app role cannot
 alter or drop them. Default privileges cover only objects the migration role creates itself;
-after a `SET ROLE` to another role, objects belong to that role.
+after a `SET ROLE` to another role, objects belong to that role. The migration role cannot
+alter tables the app role owns, for example on the default path, where the app role owns its
+database.
 
-The app must then stop migrating on its runtime pool: run migrations from the migrate Job with
-the `-db-migrate` Secret.
+The app role keeps CREATE on its schemas, so an app that still runs migrations on its runtime
+pool keeps working (owner decision 2026-11-23, INFRA-243). Moving them to a migrate Job with the
+`-db-migrate` Secret is the goal.
 
 **The connection limit counts per role**, across all its databases and through the Pooler. In
 session mode every client connection holds a server connection. Add up the pool sizes of every
@@ -208,10 +250,18 @@ process that uses the role (one pool per database, plus LISTEN connections and l
 
 **Re-runs** are safe: every statement is guarded or idempotent, and nothing that exists is
 dropped. A re-run sets new passwords and rewrites the Secrets, so the app's pods need a restart
-afterwards. With `--keep-password` the passwords in `secrets.plain/` stay, and the run stops if a
-file has none (decrypt it from `secrets.sops` first). The passwords go to `psql` on stdin, with
-`log_statement` off for the password statement. They are never on a command line, and with
-`bash -x` they are not in the trace either.
+afterwards. With `--keep-password` an existing role's password is not touched and the Secrets get
+the stored one. The run stops if a file has no usable password (decrypt it from `secrets.sops`
+first) or if its `*_PASSWORD` values differ. A password is at least 24 characters. If openssl
+fails, the run stops before any SQL.
+
+The passwords go to `psql` on stdin, never on a command line, and with `bash -x` they are not
+in the trace either. The password statement runs with `log_statement` off. On the `--database`,
+migration role and `--keep-password` paths it also runs with `log_min_error_statement = panic`
+and `log_min_duration_statement = -1`, so the server logs neither a failing nor a slow statement
+with its text. Connection limits and timeouts are range-checked before any SQL. The default
+path's statement is unchanged from before INFRA-243, so a server with
+`log_min_duration_statement` set still logs it with the password.
 
 What the script does not do: it doesn't change the app's chart or settings. Key names the chart
 reads beyond these five per database (for example a second journal database's name) belong in

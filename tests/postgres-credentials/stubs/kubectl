@@ -3,9 +3,11 @@
 # postgres-cluster is healthy with primary postgres-cluster-1. Every call's argv goes to STUB_LOG;
 # the SQL a `kubectl exec -i ... psql` sends on stdin goes to STUB_LOG.sql; `apply -f <file>` keeps a
 # copy of the file under STUB_LOG.applied/ (`apply -f -` keeps stdin).
-#   psql answers, stub mode: the cnpg_pooler_pgbouncer probe prints 1; a script tagged
-#     `-- infra-skills:db-owners` prints STUB_DB_OWNERS (rows db|owner|super|other-dbs|tablespaces);
-#     the tenant CONNECT check prints STUB_OPEN_DBS; anything else prints nothing.
+#   psql answers, stub mode: the cnpg_pooler_pgbouncer probe prints 1 (nothing with
+#     STUB_NO_POOLER_ROLE=1); the script tagged `-- infra-skills:preflight` prints the rows in
+#     STUB_ROLES, STUB_NEED and STUB_DB_OWNERS (newline-separated rows, fields split by |, which the
+#     stub turns into \x1f, the separator postgres.sh asks psql for); the tenant CONNECT check prints
+#     STUB_OPEN_DBS; anything else prints nothing.
 #   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
 #     (unix socket directory), as `psql -h ... -p ... <the same arguments>`.
 #   STUB_NO_NS=1: `get ns` finds no namespace.
@@ -43,9 +45,9 @@ case "$args" in
       fi
       exit $?
     fi
-    case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then echo 1; exit 0; fi ;; esac
+    case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then [[ "${STUB_NO_POOLER_ROLE:-}" == 1 ]] || echo 1; exit 0; fi ;; esac
     case "$sql" in
-      *"-- infra-skills:db-owners"*) printf '%s' "${STUB_DB_OWNERS:-}"; [[ -n "${STUB_DB_OWNERS:-}" ]] && echo ;;
+      *"-- infra-skills:preflight"*) printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
       *"has_database_privilege("*) printf '%s\n' "${STUB_OPEN_DBS:-}" ;;
     esac
     exit 0 ;;
