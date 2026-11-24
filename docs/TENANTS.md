@@ -96,9 +96,25 @@ Root on a k3s agent holds the following. Each row is closed by a primitive descr
     `infra-skills/tenant=<tenant>`), and MinIO only when listed in `NETPOL_TENANT_MINIO`;
   - `NETPOL_APP_NAMESPACES` gives your own application namespaces default-deny ingress.
     **Set it before the tenant worker joins.** An application namespace without a
-    NetworkPolicy is open to a pod that escapes to the tenant worker;
+    NetworkPolicy is open to a pod that escapes to the tenant worker. An application namespace
+    that runs its own CNPG cluster gets an allow for the CNPG operator on 8000 and 5432, so it
+    can be fenced too (re-run the script after creating such a cluster);
   - it names every other policy in its namespaces that admits ingress from anywhere: such a
-    policy overrides the default deny for its pods.
+    policy overrides the default deny for its pods;
+  - it leaves out of its namespace-wide allows every pod that another policy already fences
+    for ingress (an app chart's own policy), so it never widens that fence; `--plan` lists
+    them. The allows select exactly the pods that no fence selects, by labels, so a pod created
+    later is either fenced or allowed. A fence with two labels doubles the allow policies in its
+    namespace (`<name>`, `<name>-2`, ...). `NETPOL_MAX_ALLOW_SELECTORS` (16, at most 256)
+    caps the product of the fences' label counts; above it the run stops before it changes
+    anything;
+  - every cluster read stops the run before it changes anything when the API returns an error
+    (Forbidden, a timeout, a failed discovery). NotFound reads as absent for three reads only,
+    each by name: the CNPG Cluster CRD (then CNPG clusters are found from their pods), the
+    ServiceCIDR `kubernetes` (then `--service-cidr` in the k3s node-args, else 10.43.0.0/16)
+    and the Service `kube-system/traefik` (then Traefik ports 8000/8443);
+  - `--remove` reads only the policies it manages and deletes them; no other read or check
+    can block the rollback.
 - **`tools/k3s/tenant.sh <env> <tenant>`** builds the namespace scaffold:
   - Pod Security `restricted`;
   - a ResourceQuota (no LoadBalancer or NodePort) and a LimitRange;

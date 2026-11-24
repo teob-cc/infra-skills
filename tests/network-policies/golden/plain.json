@@ -1,0 +1,2508 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "actions-runner-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "actions-runner-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "actions-runner-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-nodes",
+        "namespace": "actions-runner-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "API server -> admission webhooks, from the host network of any node"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.1/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "203.0.113.10/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.2/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "198.51.100.20/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.0.0/31"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.1.0/31"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-runner-egress",
+        "namespace": "actions-runner-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "CI runners: DNS, Traefik (Harbor/Nexus by public hostname) and the internet only"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "actions-runner",
+              "operator": "Exists"
+            }
+          ]
+        },
+        "policyTypes": [
+          "Egress"
+        ],
+        "egress": [
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "k8s-app": "kube-dns"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 53,
+                "protocol": "UDP"
+              },
+              {
+                "port": 53,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 8000,
+                "protocol": "TCP"
+              },
+              {
+                "port": 8443,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "svccontroller.k3s.cattle.io/svcname": "traefik"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 80,
+                "protocol": "TCP"
+              },
+              {
+                "port": 443,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "198.51.100.20/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "203.0.113.10/32"
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 80,
+                "protocol": "TCP"
+              },
+              {
+                "port": 443,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "to": [
+              {
+                "ipBlock": {
+                  "cidr": "0.0.0.0/0",
+                  "except": [
+                    "10.0.0.0/8",
+                    "172.16.0.0/12",
+                    "192.168.0.0/16",
+                    "100.64.0.0/10",
+                    "169.254.0.0/16",
+                    "127.0.0.0/8",
+                    "203.0.113.10/32",
+                    "198.51.100.20/32"
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "harbor",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "harbor",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "harbor",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "harbor",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "harbor",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "observability",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "observability",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "mcp-grafana"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "observability",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "mcp-grafana"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "observability",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "mcp-grafana"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "observability",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "mcp-grafana"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "argocd",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "argocd",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "argocd",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "argocd",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "argocd",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "sso",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "sso",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "sso",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "sso",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "sso",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-nodes",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "API server -> admission webhooks, from the host network of any node"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.1/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "203.0.113.10/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.2/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "198.51.100.20/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.0.0/31"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.1.0/31"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "cert-manager",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "nexus",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "nexus",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "nexus",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "nexus",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "nexus",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-s3-clients",
+        "namespace": "minio",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "apps in every non-tenant namespace (and NETPOL_TENANT_MINIO tenants) -> the S3 API on 9000"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchLabels": {
+            "app": "minio"
+          }
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchExpressions": [
+                    {
+                      "key": "infra-skills/tenant",
+                      "operator": "DoesNotExist"
+                    }
+                  ]
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 9000,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-nodes",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "API server -> admission webhooks, from the host network of any node"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.1/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "203.0.113.10/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "100.64.0.2/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "198.51.100.20/32"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.0.0/31"
+                }
+              },
+              {
+                "ipBlock": {
+                  "cidr": "10.42.1.0/31"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "cnpg-system",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "pgweb"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "pgweb"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "pgweb"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "app",
+              "operator": "NotIn",
+              "values": [
+                "pgweb"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-postgres-clients",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "apps in every non-tenant namespace -> CNPG instances/poolers on 5432; CNPG operator -> instances"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchExpressions": [
+            {
+              "key": "cnpg.io/podRole",
+              "operator": "In",
+              "values": [
+                "instance",
+                "pooler"
+              ]
+            }
+          ]
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchExpressions": [
+                    {
+                      "key": "infra-skills/tenant",
+                      "operator": "DoesNotExist"
+                    }
+                  ]
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432,
+                "protocol": "TCP"
+              }
+            ]
+          },
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "cnpg-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-postgres-tenant-acme",
+        "namespace": "postgres",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "tenant acme -> only its own CNPG poolers (labelled infra-skills/tenant=acme) on 5432"
+        }
+      },
+      "spec": {
+        "podSelector": {
+          "matchLabels": {
+            "cnpg.io/podRole": "pooler",
+            "infra-skills/tenant": "acme"
+          }
+        },
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "infra-skills/tenant": "acme"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 5432,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "web",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "web",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "web",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "web",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "web",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-default-deny-ingress",
+        "namespace": "memory",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "deny all ingress that no other policy allows"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-same-namespace",
+        "namespace": "memory",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "pods of this namespace talk to each other"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "podSelector": {}
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-prometheus",
+        "namespace": "memory",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Prometheus scrapes metrics"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "observability"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "prometheus"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-ingress-controller",
+        "namespace": "memory",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Traefik -> Ingress backends and ACME solver pods"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "kube-system"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "traefik"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "name": "platform-allow-from-pomerium",
+        "namespace": "memory",
+        "labels": {
+          "app.kubernetes.io/managed-by": "infra-skills-network-policies",
+          "app.kubernetes.io/part-of": "platform-network-policies"
+        },
+        "annotations": {
+          "infra-skills/purpose": "Pomerium -> the backends it proxies"
+        }
+      },
+      "spec": {
+        "podSelector": {},
+        "policyTypes": [
+          "Ingress"
+        ],
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "sso"
+                  }
+                },
+                "podSelector": {
+                  "matchLabels": {
+                    "app.kubernetes.io/name": "pomerium"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

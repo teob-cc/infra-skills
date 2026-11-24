@@ -1,0 +1,30 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "postgresql.cnpg.io/v1",
+      "kind": "Cluster",
+      "metadata": {
+        "namespace": "postgres",
+        "name": "postgres-cluster"
+      }
+    },
+    {
+      "apiVersion": "postgresql.cnpg.io/v1",
+      "kind": "Cluster",
+      "metadata": {
+        "namespace": "memory",
+        "name": "memory-pg"
+      }
+    },
+    {
+      "apiVersion": "postgresql.cnpg.io/v1",
+      "kind": "Cluster",
+      "metadata": {
+        "namespace": "other-db",
+        "name": "other-pg"
+      }
+    }
+  ]
+}
