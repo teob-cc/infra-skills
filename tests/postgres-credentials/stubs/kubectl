@@ -5,12 +5,16 @@
 # copy of the file under STUB_LOG.applied/ (`apply -f -` keeps stdin).
 #   psql answers, stub mode: the cnpg_pooler_pgbouncer probe prints 1 (nothing with
 #     STUB_NO_POOLER_ROLE=1); the script tagged `-- infra-skills:preflight` prints the rows in
-#     STUB_ROLES, STUB_NEED and STUB_DB_OWNERS (newline-separated rows, fields split by |, which the
-#     stub turns into \x1f, the separator postgres.sh asks psql for); the tenant CONNECT check prints
-#     STUB_OPEN_DBS; the role verifier read (`-- infra-skills:verifier`) prints the verifier the file
-#     STUB_VERIFIERS lists for that role (lines "<role> <verifier>"); anything else prints nothing.
+#     STUB_ROLES, STUB_NEED, STUB_LEDGER, STUB_INTENTS and STUB_DB_OWNERS (newline-separated rows,
+#     fields split by |, which the stub turns into \x1f, the separator postgres.sh asks psql for);
+#     the tenant CONNECT check prints STUB_OPEN_DBS; the role verifier read (`-- infra-skills:verifier`)
+#     prints the verifier the file STUB_VERIFIERS lists for that role (lines "<role> <verifier>"),
+#     and from a role's second read on the one STUB_VERIFIERS_LATER lists, when set (a rotation
+#     between two reads); anything else prints nothing.
 #   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
-#     (unix socket directory), as `psql -h ... -p ... <the same arguments>`.
+#     (unix socket directory), as `psql -h ... -p ... <the same arguments>`. STUB_CUT=<text>: a
+#     session whose SQL holds <text> gets only the lines up to the first one holding it (the
+#     connection is lost there), and the stub then fails.
 #   STUB_NO_NS=1: `get ns` finds no namespace.
 set -uo pipefail
 log="${STUB_LOG:?}"
@@ -41,6 +45,12 @@ case "$args" in
     if $stdin; then sql="$(cat)"; printf -- '-- ### psql %s\n%s\n' "${psql_args[*]:1}" "$sql" >> "$log.sql"; fi
     if [[ -n "${STUB_PGHOST:-}" ]]; then
       if $stdin; then
+        if [[ -n "${STUB_CUT:-}" && "$sql" == *"$STUB_CUT"* ]]; then
+          printf '%s\n' "$sql" | awk -v cut="$STUB_CUT" '{ print } index($0, cut) { exit }' \
+            | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+          echo "kubectl stub: connection lost (STUB_CUT)" >&2
+          exit 3
+        fi
         printf '%s\n' "$sql" | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
       else
         psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}" </dev/null
@@ -49,10 +59,14 @@ case "$args" in
     fi
     case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then [[ "${STUB_NO_POOLER_ROLE:-}" == 1 ]] || echo 1; exit 0; fi ;; esac
     case "$sql" in
-      *"-- infra-skills:preflight"*) printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_LEDGER:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
+      *"-- infra-skills:preflight"*)
+        printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_LEDGER:-}" "${STUB_INTENTS:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
       *"-- infra-skills:verifier"*)
         r="$(sed -n "s/^\\\\set r '\\(.*\\)'$/\\1/p" <<<"$sql")"
-        [[ -n "${STUB_VERIFIERS:-}" ]] && awk -v r="$r" '$1 == r { print $2 }' "$STUB_VERIFIERS" ;;
+        n=$(( $(cat "$log.vread.$r" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$log.vread.$r"
+        vf="${STUB_VERIFIERS:-}"
+        [[ "$n" -ge 2 && -n "${STUB_VERIFIERS_LATER:-}" ]] && vf="$STUB_VERIFIERS_LATER"
+        [[ -n "$vf" ]] && awk -v r="$r" '$1 == r { print $2 }' "$vf" ;;
       *"has_database_privilege("*) printf '%s\n' "${STUB_OPEN_DBS:-}" ;;
     esac
     exit 0 ;;

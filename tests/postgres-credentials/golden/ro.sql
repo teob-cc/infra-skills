@@ -18,8 +18,14 @@ SELECT 'role', k.kind, k.name, (r.oid IS NOT NULL),
        coalesce((SELECT string_agg(regexp_replace(g.rolname, '[[:cntrl:]]', '?', 'g'), ',' ORDER BY g.rolname)
                    FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')
                     AND (g.rolname ~ '^pg_' OR g.rolsuper OR g.rolcreaterole OR g.rolcreatedb OR g.rolreplication OR g.rolbypassrls)), ''),
-       coalesce(k.kind = 'app' AND EXISTS (SELECT FROM pg_database d WHERE d.datname = k.name AND d.datdba = r.oid), false)
-  FROM (VALUES (1, 'app', :'app_role', :'app_marker'), (2, 'migrate', :'mig_role', :'mig_marker')) k(ord, kind, name, marker)
+       coalesce(k.kind = 'app' AND EXISTS (SELECT FROM pg_database d WHERE d.datname = k.name AND d.datdba = r.oid), false),
+       coalesce(r.oid::text, ''), coalesce(r.rolcanlogin, false),
+       coalesce((SELECT string_agg(CASE WHEN m.member = r.oid THEN 'member of ' ELSE 'has member ' END
+                                   || regexp_replace(g.rolname, '[[:cntrl:]]', '?', 'g'), ', ' ORDER BY g.rolname)
+                   FROM pg_auth_members m JOIN pg_roles g ON g.oid = CASE WHEN m.member = r.oid THEN m.roleid ELSE m.member END
+                  WHERE m.member = r.oid OR m.roleid = r.oid), ''),
+       coalesce((SELECT pg_has_role(r.oid, o.oid, 'MEMBER') OR pg_has_role(o.oid, r.oid, 'MEMBER') FROM pg_roles o WHERE o.rolname = k.other), false)
+  FROM (VALUES (1, 'app', :'app_role', :'app_marker', :'mig_role'), (2, 'migrate', :'mig_role', :'mig_marker', :'app_role')) k(ord, kind, name, marker, other)
   LEFT JOIN pg_roles r ON r.rolname = k.name
  WHERE k.name <> ''
  ORDER BY k.ord;
@@ -29,9 +35,54 @@ SELECT 'need', k, EXISTS (SELECT FROM pg_roles WHERE rolname = k) FROM unnest(st
 \set db 'app2'
 \set pw '<SCRAM>'
 \set ro 'claude_ro'
+BEGIN;
+SET LOCAL lock_timeout = '5s';
+LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+SELECT set_config('infra_skills.g_role', 'app2', true) AS g_role, set_config('infra_skills.g_kind', 'app', true) AS g_kind,
+       set_config('infra_skills.g_oid', '', true) AS g_oid, set_config('infra_skills.g_other', '', true) AS g_other,
+       set_config('infra_skills.g_marker', 'infra-skills:app:app2', true) AS g_marker \gset
+DO $$
+DECLARE
+  nm text := current_setting('infra_skills.g_role');
+  kind text := current_setting('infra_skills.g_kind');
+  want text := current_setting('infra_skills.g_oid');
+  other text := current_setting('infra_skills.g_other');
+  mk text := current_setting('infra_skills.g_marker');
+  r record;
+  c text;
+BEGIN
+  SELECT oid, rolcanlogin, (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls) AS elevated
+    INTO r FROM pg_roles WHERE rolname = nm;
+  IF NOT FOUND THEN
+    IF want <> '' THEN RAISE EXCEPTION 'infra-skills: role % was dropped after the preflight; nothing changed', nm; END IF;
+    RETURN;
+  END IF;
+  IF want = '' THEN RAISE EXCEPTION 'infra-skills: role % was made by someone else after the preflight; nothing changed', nm; END IF;
+  IF r.oid::text <> want THEN RAISE EXCEPTION 'infra-skills: role % was dropped and made again after the preflight; nothing changed', nm; END IF;
+  IF r.elevated THEN
+    RAISE EXCEPTION 'infra-skills: role % gained SUPERUSER, CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS after the preflight; nothing changed', nm;
+  END IF;
+  IF EXISTS (SELECT FROM pg_roles g WHERE g.oid <> r.oid AND pg_has_role(r.oid, g.oid, 'MEMBER')
+               AND (g.rolname ~ '^pg_' OR g.rolsuper OR g.rolcreaterole OR g.rolcreatedb OR g.rolreplication OR g.rolbypassrls)) THEN
+    RAISE EXCEPTION 'infra-skills: role % joined a privileged or pg_* role after the preflight; nothing changed', nm;
+  END IF;
+  IF other <> '' AND EXISTS (SELECT FROM pg_roles o WHERE o.rolname = other
+                               AND (pg_has_role(r.oid, o.oid, 'MEMBER') OR pg_has_role(o.oid, r.oid, 'MEMBER'))) THEN
+    RAISE EXCEPTION 'infra-skills: roles % and % are members of one another (directly or through a group); nothing changed', nm, other;
+  END IF;
+  c := shobj_description(r.oid, 'pg_authid');
+  IF c IS NOT DISTINCT FROM mk THEN RETURN; END IF;
+  IF kind = 'app' AND c IS NULL AND r.rolcanlogin
+     AND EXISTS (SELECT FROM pg_database d WHERE d.datname = nm AND d.datdba = r.oid)
+     AND NOT EXISTS (SELECT FROM pg_auth_members m WHERE m.member = r.oid OR m.roleid = r.oid) THEN
+    RETURN;
+  END IF;
+  RAISE EXCEPTION 'infra-skills: role % changed after the preflight (marker, LOGIN, owner of its database or memberships); nothing changed', nm;
+END
+$$;
 SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') \gexec
 SELECT format('COMMENT ON ROLE %I IS %L', :'role', 'infra-skills:app:app2') WHERE shobj_description((SELECT oid FROM pg_roles WHERE rolname = :'role'), 'pg_authid') IS DISTINCT FROM 'infra-skills:app:app2' \gexec
-BEGIN;
 SET LOCAL log_statement = 'none';
 ALTER ROLE :"role" WITH LOGIN PASSWORD :'pw' CONNECTION LIMIT 50;
 COMMIT;
