@@ -2302,8 +2302,9 @@ SQL
     info "  The postgres database stays open to every role (the exporter and CNPG use it); it holds no app data."
   fi
 
-  # Ensure namespace exists (a tenant namespace comes from tools/k3s/tenant.sh)
-  if ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
+  # Ensure namespace exists (a tenant namespace comes from tools/k3s/tenant.sh). The default path
+  # only: a --database run made it ready before any credential SQL, and does not look again.
+  if [[ "$existing_mode" == "false" ]] && ! kubectl get ns "$app_namespace" >/dev/null 2>&1; then
     if [[ -n "$tenant" ]]; then
       err "Namespace ${app_namespace} does not exist: run tools/k3s/tenant.sh ${ENV_NAME} ${tenant} first"
       exit 1

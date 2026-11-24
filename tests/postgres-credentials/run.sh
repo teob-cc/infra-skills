@@ -92,7 +92,7 @@ run() {
   local name="$1"; shift
   D="${PRE_RUN:-$WORK/$name}"
   if [[ -z "${PRE_RUN:-}" ]]; then rm -rf "$D"; mkdir -p "$D"; cp -R "$HERE/envs/." "$D/"; fi
-  : > "$D/log"; rm -rf "$D/log.sql" "$D/log.applied" "$D/log.env" "$D"/log.vread.*
+  : > "$D/log"; rm -rf "$D/log.sql" "$D/log.applied" "$D/log.env" "$D"/log.vread.* "$D/log.ns"
   RC=0
   RUN_SEQ=$((RUN_SEQ + 1))
   STUB_PW_PREFIX="Pw0Stub$(printf '%03d' "$RUN_SEQ")" STUB_LOG="$D/log" INFRA_ENVS_ROOT="$D" ${TRACE:-} "$SCRIPT" fake --provision-credentials "$@" >"$D/out" 2>&1 || RC=$?
@@ -610,6 +610,9 @@ STUB_NO_NS=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" run ns-early x --databas
 check "--database, not a tenant, namespace missing: created, exit 0 (round 12 P2)" [ "$RC" = 0 ]
 check "--database, not a tenant: the namespace is created before any credential SQL (round 12 P2)" \
   bash -c 'awk "/^kubectl create ns default\$/{ if (!c) c=NR } /^kubectl .* exec -i /{ n++; if (n == 2 && !e) e=NR } END{exit !(c && e && c < e)}" "$1"' _ "$D/log"
+check "--database, not a tenant: the namespace is created exactly once, and no late lookup (round 13 P2)" \
+  bash -c '[ "$(grep -c "^kubectl create ns default\$" "$1")" = 1 ] && [ "$(grep -c "^kubectl get ns default\$" "$1")" = 1 ]' _ "$D/log"
+check "--database, not a tenant: the Secret is published (round 13 P2)" [ -f "$D/log.applied/x-db.secret.yaml" ]
 STUB_NO_NS=1 STUB_NO_NS_CREATE=1 STUB_DB_OWNERS="$(dbrow evse scala_owner)" \
   bad "--database, not a tenant, the namespace can be neither found nor created (round 12 P2)" "Namespace default does not exist and cannot be created. Nothing changed." x --database evse
 
@@ -1473,6 +1476,14 @@ SQL
   check "real round 12 P2: the Secret is unchanged, not applied" \
     bash -c '[ "$1" = "$(cat "$2/fake/secrets.plain/n12app-db.secret.yaml")" ] && [ ! -e "$2/log.applied" ]' _ "$n12_secret" "$D"
   check "real round 12 P2: (its password logs in)" scram_login n12app "$(key "$D/fake/secrets.plain/n12app-db.secret.yaml" POSTGRES_PASSWORD)"
+  # Round 13 P2: the namespace is missing (and every lookup fails): the run creates it once, early,
+  # does not look again after the password commit, and publishes a Secret that logs in.
+  STUB_NO_NS=1 PRE_RUN="$D" run real-n12 n12app --database n12db
+  check "real round 13 P2: a non-tenant --database run with the namespace missing: exit 0" [ "$RC" = 0 ] || sed 's/^/      /' "$D/out"
+  check "real round 13 P2: the namespace is created exactly once" [ "$(grep -c "^kubectl create ns default\$" "$D/log")" = 1 ]
+  check "real round 13 P2: the Secret is published, and its password logs in" \
+    bash -c '[ -f "$1/log.applied/n12app-db.secret.yaml" ]' _ "$D"
+  check "real round 13 P2: (the published password logs in)" scram_login n12app "$(key "$D/fake/secrets.plain/n12app-db.secret.yaml" POSTGRES_PASSWORD)"
   # Round 5 P2-b: --keep-password, and the app role's password is rotated elsewhere while the run
   # waits (a held intent row stalls it after its first check); the Secret is not applied.
   rc_dir="$WORK/real-create"
