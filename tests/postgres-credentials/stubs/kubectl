@@ -7,7 +7,8 @@
 #     STUB_NO_POOLER_ROLE=1); the script tagged `-- infra-skills:preflight` prints the rows in
 #     STUB_ROLES, STUB_NEED and STUB_DB_OWNERS (newline-separated rows, fields split by |, which the
 #     stub turns into \x1f, the separator postgres.sh asks psql for); the tenant CONNECT check prints
-#     STUB_OPEN_DBS; anything else prints nothing.
+#     STUB_OPEN_DBS; the role verifier read (`-- infra-skills:verifier`) prints the verifier the file
+#     STUB_VERIFIERS lists for that role (lines "<role> <verifier>"); anything else prints nothing.
 #   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
 #     (unix socket directory), as `psql -h ... -p ... <the same arguments>`.
 #   STUB_NO_NS=1: `get ns` finds no namespace.
@@ -47,7 +48,10 @@ case "$args" in
     fi
     case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then [[ "${STUB_NO_POOLER_ROLE:-}" == 1 ]] || echo 1; exit 0; fi ;; esac
     case "$sql" in
-      *"-- infra-skills:preflight"*) printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
+      *"-- infra-skills:preflight"*) printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_LEDGER:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
+      *"-- infra-skills:verifier"*)
+        r="$(sed -n "s/^\\\\set r '\\(.*\\)'$/\\1/p" <<<"$sql")"
+        [[ -n "${STUB_VERIFIERS:-}" ]] && awk -v r="$r" '$1 == r { print $2 }' "$STUB_VERIFIERS" ;;
       *"has_database_privilege("*) printf '%s\n' "${STUB_OPEN_DBS:-}" ;;
     esac
     exit 0 ;;

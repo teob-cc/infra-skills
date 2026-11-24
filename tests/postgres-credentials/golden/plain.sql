@@ -1,7 +1,7 @@
 -- ### psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q
 \set role 'my-app'
 \set db 'my-app'
-\set pw '<PW>'
+\set pw '<SCRAM>'
 \set ro ''
 SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role') \gexec
 BEGIN;
