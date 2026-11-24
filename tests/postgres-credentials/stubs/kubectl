@@ -7,14 +7,16 @@
 #     STUB_NO_POOLER_ROLE=1); the script tagged `-- infra-skills:preflight` prints the rows in
 #     STUB_ROLES, STUB_NEED, STUB_LEDGER, STUB_INTENTS and STUB_DB_OWNERS (newline-separated rows,
 #     fields split by |, which the stub turns into \x1f, the separator postgres.sh asks psql for);
-#     the tenant CONNECT check prints STUB_OPEN_DBS; the role verifier read (`-- infra-skills:verifier`)
-#     prints the verifier the file STUB_VERIFIERS lists for that role (lines "<role> <verifier>"),
-#     and from a role's second read on the one STUB_VERIFIERS_LATER lists, when set (a rotation
-#     between two reads); anything else prints nothing.
+#     the second preflight (`-- infra-skills:preflight-objects`, inside the databases to take over)
+#     prints STUB_OBJECTS; the tenant CONNECT check prints STUB_OPEN_DBS; the role verifier read
+#     (`-- infra-skills:verifier`) prints the verifier the file STUB_VERIFIERS lists for that role
+#     (lines "<role> <verifier>"), and from a role's second read on the one STUB_VERIFIERS_LATER
+#     lists, when set (a rotation between two reads); anything else prints nothing.
 #   STUB_PGHOST set: psql runs for real against the local server at STUB_PGHOST:STUB_PGPORT
 #     (unix socket directory), as `psql -h ... -p ... <the same arguments>`. STUB_CUT=<text>: a
 #     session whose SQL holds <text> gets only the lines up to the first one holding it (the
-#     connection is lost there), and the stub then fails.
+#     connection is lost there), and the stub then fails; STUB_CUT_BEFORE=<text>: the same, but
+#     the line holding <text> is not sent either.
 #   STUB_NO_NS=1: `get ns` finds no namespace.
 set -uo pipefail
 log="${STUB_LOG:?}"
@@ -51,6 +53,12 @@ case "$args" in
           echo "kubectl stub: connection lost (STUB_CUT)" >&2
           exit 3
         fi
+        if [[ -n "${STUB_CUT_BEFORE:-}" && "$sql" == *"$STUB_CUT_BEFORE"* ]]; then
+          printf '%s\n' "$sql" | awk -v cut="$STUB_CUT_BEFORE" 'index($0, cut) { exit } { print }' \
+            | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
+          echo "kubectl stub: connection lost (STUB_CUT_BEFORE)" >&2
+          exit 3
+        fi
         printf '%s\n' "$sql" | psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}"
       else
         psql -h "$STUB_PGHOST" -p "${STUB_PGPORT:-5432}" "${psql_args[@]:1}" </dev/null
@@ -59,6 +67,7 @@ case "$args" in
     fi
     case "$args" in *cnpg_pooler_pgbouncer*) if ! $stdin; then [[ "${STUB_NO_POOLER_ROLE:-}" == 1 ]] || echo 1; exit 0; fi ;; esac
     case "$sql" in
+      *"-- infra-skills:preflight-objects"*) printf '%s\n' "${STUB_OBJECTS:-}" | tr '|' '\037' ;;
       *"-- infra-skills:preflight"*)
         printf '%s\n' "${STUB_ROLES:-}" "${STUB_NEED:-}" "${STUB_LEDGER:-}" "${STUB_INTENTS:-}" "${STUB_DB_OWNERS:-}" | tr '|' '\037' ;;
       *"-- infra-skills:verifier"*)

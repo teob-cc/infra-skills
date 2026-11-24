@@ -154,7 +154,7 @@ five keys under `STATE_DB_` and under `MANIFEST_DB_`. The host is the Pooler. Th
 | Flag | What it does |
 | --- | --- |
 | `--database <name>[:<PREFIX>]` | Repeatable. Use these databases instead of creating `<app>`. With a prefix, the Secret gets `<PREFIX>_HOST`, `_PORT`, `_DATABASE`, `_USERNAME` and `_PASSWORD` for that database; without one, `POSTGRES_*` (at most one database can go without). A database that does not exist is an error. |
-| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. The intent is recorded in `infra_skills.create_intent` first: if the run stops after creating the database, the next run with `--create-missing` finishes it (PUBLIC's CONNECT revoked, grants) instead of taking it for an existing one. |
+| `--create-missing` | Create a named database that does not exist yet, owned by the migration role if there is one, else by the app role. PUBLIC's CONNECT is revoked on it, as on the default path. The intent is recorded in `infra_skills.create_intent` first: if the run stops after creating the database, the next run with `--create-missing` finishes it (PUBLIC's CONNECT revoked, grants) instead of taking it for an existing one. Right after `CREATE DATABASE` the database gets the marker `COMMENT ON DATABASE ... IS 'infra-skills:created:<app>'` and the intent its oid; a retry finishes only a database that one of the two names, and refuses a same-named database someone else made (PUBLIC untouched). |
 | `--revoke-public` | Revoke PUBLIC's CONNECT and TEMPORARY on the named databases. Needs `--keep-connect`. Off by default. |
 | `--keep-connect <role>[,<role>]` | With `--revoke-public`: the roles, besides the owner, that keep CONNECT (`none` for no other role). |
 | `--take-ownership` | Move each named database to the migration role (or the app role): the old owner's objects in it, then the database, in one transaction, then a check. Never its other databases or tablespaces. Off by default. |
@@ -183,10 +183,13 @@ default one (no new flags) included. The script refuses:
   app's role, mark it by hand with the `COMMENT ON ROLE` the error message prints.
 
 Nothing changes before these checks pass. Then each role is written in one transaction: it locks
-`pg_authid` and `pg_auth_members` (no role can be created, altered or granted until it commits;
-it waits at most 5 s for that lock), checks all of the above again against the role's oid from the
-preflight, and only then creates the role if missing, writes its marker and sets its password. A
-role that changed in between (dropped, made again, elevated, given a membership) stops the run
+`pg_authid` and `pg_auth_members` (no role can be created, altered or granted until it commits),
+`pg_database` (no database changes owner, so an adopted role still owns its database) and
+`pg_shdescription` (no `COMMENT ON ROLE`, so the marker stays as checked), each in SHARE ROW
+EXCLUSIVE mode, waiting at most 5 s; logins only read these catalogs and go on. Then it checks all
+of the above again against the role's oid from the preflight, and only then creates the role if
+missing, writes its marker and sets its password. A role that changed in between (dropped, made
+again, elevated, given a membership, its database given away, its comment changed) stops the run
 with its password untouched.
 
 **Grant mode** is the default for `--database`. Each database keeps its owner, and the app role
@@ -220,9 +223,20 @@ DROP) still needs their owner. When the migrations must change existing tables, 
 **`--take-ownership`** moves ownership instead, database by database, and only inside the named
 databases. It does not use `REASSIGN OWNED BY`, which moves *every* database and tablespace the
 old owner has, in the whole cluster: the old owner's other databases and its tablespaces are
-never touched. The move is refused when the old owner is a superuser or a `pg_*` role. Once the
-preflight has passed, and before anything moves, the run records each database's oid, the owner
-the preflight saw and the destination role in `infra_skills.ownership_transfer`. That table lives
+never touched. The move is refused when the old owner is a superuser or a `pg_*` role.
+
+Before any password is made or set, a second, read-only part of the preflight looks inside each
+database to move. It refuses the run when the old owner owns objects there that the move does
+not handle (operators, collations, text search objects and the like: the message names their
+catalogs, to move by hand first), or has default privileges that `GRANT` cannot copy exactly (a
+grant option, or a privilege revoked from the built-in defaults, such as PUBLIC's EXECUTE on
+functions): the message prints them. It warns about what stays with the old owner: extensions it
+owns, and its objects inside any extension, its own or another role's.
+
+Once the preflight has passed, and before anything moves, the run records each database's oid as
+the preflight saw it, that owner, and the destination role as its transaction guarded it, in
+`infra_skills.ownership_transfer`; a database or destination role dropped and made again under
+the same name since stops the run there. That table lives
 in the `postgres` database, PUBLIC cannot read it, and the script makes it on first use. The
 preflight first checks, from the catalogs alone, that the schema and its tables belong to the
 superuser the script runs as, that they are plain tables and have the expected columns; only
@@ -234,8 +248,8 @@ fails the move fast, with nothing changed):
    partitions, views, materialized views, sequences (those of a column follow their table),
    foreign tables and composite types; functions, procedures and aggregates; types, domains,
    enums, ranges and multiranges (array types follow); large objects. Its default privileges are
-   copied to the new owner (its own entries stay). Extensions stay with the old owner, with a
-   warning: Postgres has no `ALTER EXTENSION ... OWNER`;
+   copied to the new owner (its own entries stay). Extensions and the old owner's objects inside
+   extensions stay with it (Postgres has no `ALTER EXTENSION ... OWNER`; the preflight warned);
 2. `LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE`, as late as possible: until
    the move commits, no other session can run `ALTER DATABASE ... OWNER` or `CREATE DATABASE`
    (they need ROW EXCLUSIVE on `pg_database`; checked on PG14);
@@ -246,8 +260,8 @@ fails the move fast, with nothing changed):
 4. `ALTER DATABASE ... OWNER`, then CONNECT and TEMPORARY again for the old owner and the app
    role (`ALTER DATABASE ... OWNER` hands the old owner's own ACL entries to the new owner);
 5. a check that no object in the database still belongs to the old owner (default privileges
-   and extensions aside; the message names the kinds left, to move by hand), else the whole move
-   rolls back;
+   and extension objects aside), else the whole move rolls back: a last guard, since the
+   preflight already refused the kinds the move does not handle;
 6. commit, and the ledger row is marked done.
 
 If a run stops halfway, the next run with the same destination reads the recorded owner and

@@ -39,6 +39,8 @@ BEGIN;
 SET LOCAL lock_timeout = '5s';
 LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_shdescription IN SHARE ROW EXCLUSIVE MODE;
 SELECT set_config('infra_skills.g_role', 'my-app', true) AS g_role, set_config('infra_skills.g_kind', 'app', true) AS g_kind,
        set_config('infra_skills.g_oid', '', true) AS g_oid, set_config('infra_skills.g_other', '', true) AS g_other,
        set_config('infra_skills.g_marker', 'infra-skills:app:my-app', true) AS g_marker \gset

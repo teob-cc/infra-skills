@@ -935,8 +935,11 @@ pg_write_secret() {
 
 # pg_sql_role_guard <role> <kind: app|migrate> <oid the preflight saw, '' = no such role> <the
 # other role of this run, or ''>: inside the caller's transaction, lock the role catalogs
-# (pg_authid, pg_auth_members: no role can be created, altered or granted until it commits)
-# and check again what the preflight checked; any change raises and rolls the transaction back,
+# (pg_authid, pg_auth_members: no role can be created, altered or granted until it commits),
+# pg_database (no ALTER DATABASE OWNER: an adopted role keeps owning its database) and
+# pg_shdescription (no COMMENT ON ROLE: the marker stays as checked), all SHARE ROW EXCLUSIVE,
+# waiting at most 5 s; logins only read them and are not held off. Then check again what the
+# preflight checked; any change raises and rolls the transaction back,
 # before the role's marker or password is written. Names are validated (a closed character set),
 # the oid is digits. Prints SQL.
 pg_sql_role_guard() {
@@ -944,6 +947,8 @@ pg_sql_role_guard() {
 SET LOCAL lock_timeout = '5s';
 LOCK TABLE pg_catalog.pg_authid IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE pg_catalog.pg_auth_members IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE pg_catalog.pg_shdescription IN SHARE ROW EXCLUSIVE MODE;
 SELECT set_config('infra_skills.g_role', '$1', true) AS g_role, set_config('infra_skills.g_kind', '$2', true) AS g_kind,
        set_config('infra_skills.g_oid', '$3', true) AS g_oid, set_config('infra_skills.g_other', '$4', true) AS g_other,
        set_config('infra_skills.g_marker', '${PG_ROLE_MARKER}:$2:${app_id}', true) AS g_marker \\gset
@@ -1035,6 +1040,11 @@ SQL
   else
     printf 'ALTER ROLE :"%s" WITH LOGIN CONNECTION LIMIT %s;\n' "$v" "$limit"
   fi
+  if [[ "$guarded" == "true" ]]; then
+    # The role's oid as guarded (the catalogs are still locked): :app_goid / :migrate_goid, the
+    # identity a later ledger row and ownership move are bound to.
+    printf 'SELECT oid AS %s_goid FROM pg_roles WHERE rolname = :'"'"'%s'"'"' \\gset\n' "$kind" "$v"
+  fi
   echo 'COMMIT;'
   if [[ "$guarded" == "true" && "$pw_set" == "true" ]]; then
     printf '\\unset pw\n\\set VERBOSITY default\n'
@@ -1087,12 +1097,14 @@ SQL
 #        role of this run, or it of this one, by any path>
 #   need <role> <exists>
 #   ledger <schema owner ok> <tables' owner and kind ok> <columns ok>   (--take-ownership, --revoke-public, --create-missing)
-#   intent <database>   (--create-missing: an earlier run recorded it and did not finish)
+#   intent <database> <bound: the intent is this app's and names this database (its oid, or its
+#          COMMENT ON DATABASE marker infra-skills:created:<app-id>)>   (--create-missing: an earlier
+#          run recorded it and did not finish)
 #   db <name> <exists> <owner> <owner is the new owner> <transfer pending> <old owner> <old owner is
 #      the new owner> <old owner privileged> <PUBLIC has CONNECT> <roles connected now only
 #      through PUBLIC> <login roles relying on PUBLIC> <pending transfer's destination> <that
 #      destination is the new owner> <the owner is the pending transfer's source or destination>
-#      <the owner's oid>
+#      <the owner's oid> <the database's oid> <the move's source oid (the pending row's, else the owner)>
 # The ledger (postgres database, schema infra_skills, no PUBLIC access; the main session makes it
 # once the preflight has passed): ownership_transfer holds, per database oid, the original owner
 # and the destination role of an ownership move (an interrupted move is completed by the next run
@@ -1149,7 +1161,7 @@ SELECT to_regclass('infra_skills.ownership_transfer') IS NOT NULL AS l_exists,
          OR (SELECT count(*) = 6 AND count(*) FILTER (WHERE attname IN ('datoid', 'datname', 'from_role', 'to_role', 'started_at', 'done_at')) = 6
                FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.ownership_transfer') AND attnum > 0 AND NOT attisdropped))
        AND (to_regclass('infra_skills.create_intent') IS NULL
-         OR (SELECT count(*) = 5 AND count(*) FILTER (WHERE attname IN ('datname', 'app', 'revoke_public', 'started_at', 'done_at')) = 5
+         OR (SELECT count(*) = 6 AND count(*) FILTER (WHERE attname IN ('datname', 'app', 'revoke_public', 'started_at', 'done_at', 'datoid')) = 6
                FROM pg_attribute WHERE attrelid = to_regclass('infra_skills.create_intent') AND attnum > 0 AND NOT attisdropped)) AS l_cols_ok \gset
 SELECT 'ledger', :'l_schema_ok', :'l_table_ok', :'l_cols_ok';
 SELECT (:'l_schema_ok'::boolean AND :'l_table_ok'::boolean AND :'l_cols_ok'::boolean) AS l_trusted \gset
@@ -1158,10 +1170,13 @@ SQL
   # Only --create-missing reads create_intent, and only --take-ownership ownership_transfer; each
   # only once the checks above passed.
   if [[ "$PG_CREATE_MISSING" == "true" ]]; then
+    printf '\\set app_id %s\n\\set db_marker %s\n' "'${app_id}'" "'${PG_ROLE_MARKER}:created:${app_id}'"
     cat <<'SQL'
 SELECT (:'l_trusted'::boolean AND :'i_exists'::boolean) AS use_intent \gset
 \if :use_intent
-SELECT 'intent', i.datname FROM infra_skills.create_intent i
+SELECT 'intent', i.datname,
+       coalesce(i.app = :'app_id' AND (i.datoid = d.oid OR shobj_description(d.oid, 'pg_database') = :'db_marker'), false)
+  FROM infra_skills.create_intent i LEFT JOIN pg_database d ON d.datname = i.datname
  WHERE i.done_at IS NULL AND i.datname = ANY (string_to_array(:'targets', ' '));
 \endif
 SQL
@@ -1195,7 +1210,8 @@ SELECT 'db', t.name, (d.oid IS NOT NULL),
        coalesce(regexp_replace(pg_get_userbyid(l.to_role), '[[:cntrl:]]', '?', 'g'), ''),
        coalesce(l.to_role = n.oid, false),
        coalesce(d.datdba IN (l.from_role, l.to_role), true),
-       coalesce(d.datdba::text, '')
+       coalesce(d.datdba::text, ''),
+       coalesce(d.oid::text, ''), coalesce(eo.oid::text, '')
   FROM unnest(string_to_array(:'targets', ' ')) WITH ORDINALITY t(name, ord)
   LEFT JOIN pg_database d ON d.datname = t.name
   LEFT JOIN pg_roles o ON o.oid = d.datdba
@@ -1313,6 +1329,79 @@ pg_migration_schemas() {
   printf '%s' "$out"
 }
 
+# pg_sql_preflight_objects: the second, read-only part of the preflight, for --take-ownership: in
+# each database to move (\c), with the source role the first part found (:src). It runs before any
+# password is made or set, so whatever would make the move fail stops the run with nothing changed.
+# Rows (fields split by \x1f):
+#   objects <database> <catalogs>   objects of the source that the move does not handle (operators,
+#                                   collations, text search objects, ...): the run refuses;
+#   defacl <database> <entries>     default privileges of the source that GRANT cannot reproduce
+#                                   exactly (a grant option, or a privilege revoked from the
+#                                   built-in default): the run refuses and prints them;
+#   extskip <database> <what>       extensions of the source, and the source's members of any
+#                                   extension: they stay with the source (a warning).
+pg_sql_preflight_objects() {
+  local i
+  printf '%s\n' '-- infra-skills:preflight-objects' 'SET client_min_messages = warning;'
+  for i in "${!target_names[@]}"; do
+    [[ "${t_transfer[$i]}" == "true" ]] || continue
+    printf '\\set db %s\n\\set src %s\n\\c :"db"\n' "'${target_names[$i]}'" "${t_src_oid[$i]}"
+    cat <<'SQL'
+SELECT 'objects', current_database(), string_agg(DISTINCT s.classid::regclass::text, ', ')
+  FROM pg_shdepend s
+ WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+   AND s.refclassid = 'pg_authid'::regclass AND s.refobjid = :src AND s.deptype = 'o'
+   AND s.classid NOT IN ('pg_default_acl'::regclass, 'pg_extension'::regclass, 'pg_namespace'::regclass,
+                         'pg_proc'::regclass, 'pg_largeobject'::regclass)
+   AND NOT EXISTS (SELECT FROM pg_depend e WHERE e.classid = s.classid AND e.objid = s.objid AND e.deptype = 'e')
+   AND NOT (s.classid = 'pg_class'::regclass AND EXISTS (
+         SELECT FROM pg_class c WHERE c.oid = s.objid AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c')
+            AND NOT (c.relkind = 'S' AND EXISTS (SELECT FROM pg_depend a JOIN pg_class o ON o.oid = a.refobjid
+                                                  WHERE a.classid = 'pg_class'::regclass AND a.objid = c.oid AND a.refclassid = 'pg_class'::regclass
+                                                    AND a.deptype IN ('a', 'i') AND o.relowner <> :src))))
+   AND NOT (s.classid = 'pg_type'::regclass AND EXISTS (
+         SELECT FROM pg_type t WHERE t.oid = s.objid
+            AND ((t.typrelid = 0 AND t.typtype IN ('b', 'd', 'e', 'r', 'm') AND NOT EXISTS (SELECT FROM pg_type a WHERE a.typarray = t.oid))
+                 -- a standalone composite type: moved with its pg_class row (relkind c)
+                 OR (t.typtype = 'c' AND EXISTS (SELECT FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c')))))
+HAVING count(*) > 0;
+SELECT 'defacl', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
+  FROM (SELECT format('%s%s: %s to %s WITH GRANT OPTION', k.w, k.s, e.privilege_type,
+                      CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE regexp_replace(pg_get_userbyid(e.grantee), '[[:cntrl:]]', '?', 'g') END) AS d
+          FROM pg_default_acl a
+          CROSS JOIN LATERAL (SELECT CASE a.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions'
+                                                          WHEN 'T' THEN 'types' ELSE 'schemas' END AS w,
+                                     CASE WHEN a.defaclnamespace <> 0 THEN ' in schema ' || quote_ident((SELECT nspname FROM pg_namespace WHERE oid = a.defaclnamespace))
+                                          ELSE '' END AS s) k
+          CROSS JOIN LATERAL aclexplode(a.defaclacl) e
+         WHERE a.defaclrole = :src AND e.is_grantable AND e.grantee <> a.defaclrole
+        UNION ALL
+        SELECT format('%s: %s revoked from %s (a built-in default)', k.w, d.privilege_type,
+                      CASE WHEN d.grantee = 0 THEN 'PUBLIC' ELSE regexp_replace(pg_get_userbyid(d.grantee), '[[:cntrl:]]', '?', 'g') END)
+          FROM pg_default_acl a
+          CROSS JOIN LATERAL (SELECT CASE a.defaclobjtype WHEN 'r' THEN 'tables' WHEN 'S' THEN 'sequences' WHEN 'f' THEN 'functions'
+                                                          WHEN 'T' THEN 'types' ELSE 'schemas' END AS w) k
+          CROSS JOIN LATERAL aclexplode(acldefault((CASE a.defaclobjtype WHEN 'S' THEN 's' ELSE a.defaclobjtype::text END)::"char", a.defaclrole)) d
+         WHERE a.defaclrole = :src AND a.defaclnamespace = 0
+           AND NOT EXISTS (SELECT FROM aclexplode(a.defaclacl) e WHERE e.grantee = d.grantee AND e.privilege_type = d.privilege_type)) x
+HAVING count(*) > 0;
+SELECT 'extskip', current_database(), string_agg(x.d, '; ' ORDER BY x.d)
+  FROM (SELECT format('extension %s (its own)', regexp_replace(x.extname, '[[:cntrl:]]', '?', 'g')) AS d
+          FROM pg_extension x WHERE x.extowner = :src
+        UNION ALL
+        SELECT format('%s object(s) in extension %s (owned by %s)', count(*), regexp_replace(x.extname, '[[:cntrl:]]', '?', 'g'),
+                      regexp_replace(pg_get_userbyid(x.extowner), '[[:cntrl:]]', '?', 'g'))
+          FROM pg_shdepend s
+          JOIN pg_depend e ON e.classid = s.classid AND e.objid = s.objid AND e.deptype = 'e' AND e.refclassid = 'pg_extension'::regclass
+          JOIN pg_extension x ON x.oid = e.refobjid
+         WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+           AND s.refclassid = 'pg_authid'::regclass AND s.refobjid = :src AND s.deptype = 'o' AND x.extowner <> :src
+         GROUP BY x.extname, x.extowner) x
+HAVING count(*) > 0;
+SQL
+  done
+}
+
 # pg_sql_existing_db <index>: one --database target, from the postgres database: create it
 # (--create-missing, after recording the intent; or finish one an earlier run created), move its
 # ownership (--take-ownership, through the ledger), CONNECT for the roles, PUBLIC's CONNECT
@@ -1327,23 +1416,34 @@ pg_sql_existing_db() {
     # The intent first: a run that stops after CREATE DATABASE leaves it pending, and the next run
     # with --create-missing finishes the database (PUBLIC's CONNECT revoked) instead of taking it
     # for an existing one. CREATE DATABASE is not conditional: a database someone else made since
-    # the preflight stops the run.
-    printf '\\set app %s\n' "'${app_id}'"
+    # the preflight stops the run. Right after it, the database gets this app's marker (COMMENT ON
+    # DATABASE infra-skills:created:<app-id>) and the intent its oid: a retry finishes only the
+    # database one of these two names, never a same-named one made by someone else.
+    printf '\\set app %s\n\\set db_marker %s\n' "'${app_id}'" "'${PG_ROLE_MARKER}:created:${app_id}'"
     cat <<'SQL'
 INSERT INTO infra_skills.create_intent AS t (datname, app, revoke_public) VALUES (:'db', :'app', true)
-ON CONFLICT (datname) DO UPDATE SET app = excluded.app, revoke_public = true, started_at = now(), done_at = NULL
+ON CONFLICT (datname) DO UPDATE SET app = excluded.app, revoke_public = true, started_at = now(), done_at = NULL, datoid = NULL
  WHERE t.done_at IS NOT NULL;
 SQL
-    [[ "${t_finish[$i]}" == "true" ]] || echo 'CREATE DATABASE :"db" OWNER :"owner";'
+    if [[ "${t_finish[$i]}" != "true" ]]; then
+      echo 'CREATE DATABASE :"db" OWNER :"owner";'
+      echo "COMMENT ON DATABASE :\"db\" IS :'db_marker';"
+    fi
+    cat <<'SQL'
+UPDATE infra_skills.create_intent SET datoid = (SELECT oid FROM pg_database WHERE datname = :'db' AND shobj_description(oid, 'pg_database') = :'db_marker')
+ WHERE datname = :'db' AND done_at IS NULL AND datoid IS NULL;
+SQL
   fi
   if [[ "${t_transfer[$i]}" == "true" ]]; then
-    # The pending ledger row (0 when there is none: the transaction below then refuses).
+    # The pending ledger row of this database, by the oid the preflight saw (0 when there is none:
+    # the transaction below then refuses); the destination is the role as its transaction guarded it.
+    printf '\\set datoid %s\n' "${t_datoid[$i]}"
     cat <<'SQL'
 SELECT coalesce(l.datoid, 0) AS l_datoid, coalesce(l.from_role, 0) AS from_oid, coalesce(l.to_role, 0) AS to_oid,
-       coalesce((SELECT oid FROM pg_roles WHERE rolname = :'owner'), 0) AS owner_oid
+       :dest_goid AS owner_oid
   FROM (SELECT 1) one
   LEFT JOIN LATERAL (SELECT t.datoid, t.from_role, t.to_role FROM infra_skills.ownership_transfer t
-                      WHERE t.datname = :'db' AND t.done_at IS NULL ORDER BY t.started_at DESC LIMIT 1) l ON true \gset
+                      WHERE t.datoid = :datoid AND t.done_at IS NULL) l ON true \gset
 SQL
   fi
   echo 'GRANT CONNECT, TEMPORARY ON DATABASE :"db" TO :"role";'
@@ -1395,9 +1495,10 @@ SQL
 #   1. ALTER ... OWNER for each object of the source in this database: schemas; tables,
 #      partitions, views, materialized views, sequences (those of a column follow their table),
 #      foreign tables, composite types; functions, procedures, aggregates; types, domains, ranges
-#      and multiranges (array types follow); large objects. Extensions and their member objects
-#      stay with the source (Postgres has no ALTER EXTENSION ... OWNER), with a warning. The
-#      source's default privileges are copied to the destination (the source's own stay);
+#      and multiranges (array types follow); large objects. Extensions and the source's members of
+#      any extension stay with the source (Postgres has no ALTER EXTENSION ... OWNER; the preflight
+#      warns about them). The source's default privileges are copied to the destination (the
+#      source's own stay); the preflight refused any it cannot copy exactly;
 #   2. LOCK pg_database (SHARE ROW EXCLUSIVE, held until commit, no concurrent ALTER DATABASE
 #      OWNER), then check the database oid, the role oids and the live owner against the ledger
 #      row: the owner must be the source (or already the destination, when an earlier run's move
@@ -1442,17 +1543,6 @@ SELECT format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s GRANT %s ON %s TO %s', pg_
               CASE WHEN e.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(e.grantee)) END)
   FROM pg_default_acl a LEFT JOIN pg_namespace n ON n.oid = a.defaclnamespace, aclexplode(a.defaclacl) e
  WHERE a.defaclrole = :from_oid AND e.grantee NOT IN (a.defaclrole, :to_oid) \gexec
-DO $$
-DECLARE x text;
-BEGIN
-  SELECT string_agg(extname, ', ' ORDER BY extname) INTO x FROM pg_extension
-   WHERE extowner = current_setting('infra_skills.from_oid')::oid;
-  IF x IS NOT NULL THEN
-    RAISE WARNING 'infra-skills: in %, extension(s) % stay owned by % (Postgres has no ALTER EXTENSION ... OWNER)', current_database(), x,
-      pg_get_userbyid(current_setting('infra_skills.from_oid')::oid);
-  END IF;
-END
-$$;
 LOCK TABLE pg_catalog.pg_database IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 DECLARE
@@ -1667,7 +1757,7 @@ provision_credentials() {
   # --- Preflight (every path, the plain default one included): the roles, the databases and
   # their owners, the ledger, the roles that need to exist; nothing changes before it passes.
   local new_owner="${mig_role:-$app_username}" pg_ledger=false
-  local t_creates=() t_finish=() t_transfer=() t_owner=() t_owner_oid=() t_public=() t_pub_now=() t_pub_may=() intents=" "
+  local t_creates=() t_finish=() t_transfer=() t_owner=() t_owner_oid=() t_public=() t_pub_now=() t_pub_may=() t_datoid=() t_src_oid=() intents=" " intents_bound=" "
   [[ "$PG_TAKE_OWNERSHIP" == "true" || "$PG_REVOKE_PUBLIC" == "true" || "$PG_CREATE_MISSING" == "true" ]] && pg_ledger=true
   if [[ "$PG_REVOKE_PUBLIC" == "true" ]]; then
     need_roles="$keep_roles"
@@ -1726,14 +1816,17 @@ provision_credentials() {
         fi
         ;;
       intent)
+        # intent <database> <bound to this app and this database>
         intents+="${f[1]} "
+        [[ "${f[2]:-f}" == t ]] && intents_bound+="${f[1]} "
         ;;
       db)
         # db <name> <exists> <owner> <owner is new> <pending> <old owner> <old is new> <old privileged> <public> <now> <may>
         #    <pending to> <pending to is new> <owner is the pending move's source or destination> <owner oid>
+        #    <database oid> <source oid>
         for i in "${!target_names[@]}"; do
           [[ "${target_names[$i]}" == "${f[1]}" ]] || continue
-          t_owner[i]="${f[3]:-}"; t_owner_oid[i]="${f[15]:-}"; t_public[i]="${f[9]:-f}"; t_pub_now[i]="${f[10]:-}"; t_pub_may[i]="${f[11]:-}"
+          t_owner[i]="${f[3]:-}"; t_owner_oid[i]="${f[15]:-}"; t_datoid[i]="${f[16]:-}"; t_src_oid[i]="${f[17]:-}"; t_public[i]="${f[9]:-f}"; t_pub_now[i]="${f[10]:-}"; t_pub_may[i]="${f[11]:-}"
           if [[ "${f[2]}" != t ]]; then
             t_creates[i]=true
             if [[ "$PG_CREATE_MISSING" == "true" ]]; then
@@ -1742,8 +1835,14 @@ provision_credentials() {
               missing+=("${f[1]}")
             fi
           elif [[ "$intents" == *" ${f[1]} "* ]]; then
-            # --create-missing: an earlier run created it and stopped before its ACL was done.
-            if [[ "${f[4]}" == t ]]; then
+            # --create-missing: an earlier run recorded it and stopped before its ACL was done. Only a
+            # database that run made (its oid in the intent, or its marker) is finished.
+            if [[ "$intents_bound" != *" ${f[1]} "* ]]; then
+              err "Database ${f[1]} exists, but nothing shows it is the one an earlier run for ${app_id} created: neither the oid"
+              err "  recorded in infra_skills.create_intent nor the marker COMMENT ON DATABASE '${PG_ROLE_MARKER}:created:${app_id}' matches."
+              err "  Nothing changed (PUBLIC keeps its CONNECT). Check it by hand; then delete its row in infra_skills.create_intent (postgres database)."
+              refused=true
+            elif [[ "${f[4]}" == t ]]; then
               t_creates[i]=true; t_finish[i]=true
               info "Database ${f[1]} was created by an earlier run that did not finish: finishing it (PUBLIC's CONNECT revoked, grants)"
             else
@@ -1764,7 +1863,8 @@ provision_credentials() {
               err "--take-ownership: ${f[1]} is owned by ${f[6]}, a superuser or system role; moving its objects is refused"; refused=true
             else
               t_transfer[i]=true
-              [[ "${t_owner_oid[i]}" =~ ^[0-9]+$ ]] || { err "The preflight returned no owner oid for ${f[1]}"; exit 1; }
+              [[ "${t_owner_oid[i]}" =~ ^[0-9]+$ && "${t_datoid[i]}" =~ ^[0-9]+$ && "${t_src_oid[i]}" =~ ^[0-9]+$ ]] \
+                || { err "The preflight returned no owner, database or source oid for ${f[1]}"; exit 1; }
               if [[ "${f[5]}" == t ]]; then
                 info "Ownership of ${f[1]}: an earlier run left the move from ${f[6]} unfinished; completing it to ${new_owner}"
               else
@@ -1781,6 +1881,32 @@ provision_credentials() {
     exit 1
   fi
   [[ "$refused" == "true" ]] && exit 1
+
+  # --- Preflight, part 2 (--take-ownership): read-only, inside each database to move. Objects
+  # the move cannot handle and default privileges it cannot copy exactly stop the run here,
+  # before any password is made or set; what stays with the source is named.
+  if [[ " ${t_transfer[*]:-} " == *" true "* ]]; then
+    pre_out=$(pg_sql_preflight_objects | kubectl -n "$namespace" exec -i "$pg_pod" -c postgres -- psql -U "$superuser" -d postgres \
+                -v ON_ERROR_STOP=1 -q -tA -F "$PG_US") \
+      || { err "The preflight read inside the databases to take over failed"; exit 1; }
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      IFS="$PG_US" read -r -a f <<<"$line"
+      case "${f[0]}" in
+        objects)
+          err "--take-ownership: in ${f[1]}, the old owner also owns objects this script does not move (${f[2]:-?})."
+          err "  Move them by hand first (ALTER ... OWNER TO ${new_owner}), then re-run; nothing changed."
+          refused=true ;;
+        defacl)
+          err "--take-ownership: in ${f[1]}, the old owner has default privileges that cannot be copied exactly: ${f[2]:-?}."
+          err "  Set them for ${new_owner} by hand (ALTER DEFAULT PRIVILEGES FOR ROLE ...) and reset the old owner's, then re-run; nothing changed."
+          refused=true ;;
+        extskip)
+          warn "--take-ownership: in ${f[1]}, these stay with the old owner (Postgres has no ALTER EXTENSION ... OWNER): ${f[2]:-?}" ;;
+      esac
+    done <<<"$pre_out"
+    [[ "$refused" == "true" ]] && exit 1
+  fi
 
   # Passwords (with --keep-password: the ones the Secret files hold, and only for a new role)
   pg_password app_password "$secret_file" "$app_username" "$app_exists" app_pw_set app_verifier
@@ -1884,7 +2010,7 @@ CREATE TABLE IF NOT EXISTS infra_skills.ownership_transfer (
 REVOKE ALL ON infra_skills.ownership_transfer FROM PUBLIC;
 CREATE TABLE IF NOT EXISTS infra_skills.create_intent (
   datname name PRIMARY KEY, app text NOT NULL, revoke_public boolean NOT NULL,
-  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz);
+  started_at timestamptz NOT NULL DEFAULT now(), done_at timestamptz, datoid oid);
 REVOKE ALL ON infra_skills.create_intent FROM PUBLIC;
 SQL
       fi
@@ -1892,17 +2018,32 @@ SQL
       # The migration role first: a database created or taken over below may be its own.
       [[ -n "$mig_role" ]] && pg_sql_migration_role
       # The ledger: each database's original owner, recorded before anything moves. It records
-      # the owner the preflight saw (not the one at this moment): an owner changed in between
-      # then fails the move's check under the lock, instead of becoming its source.
+      # the owner and the database the preflight saw (by oid) and the destination role as its
+      # transaction above guarded it (:dest_goid), not whatever carries those names at this
+      # moment; a database or destination role dropped and made again since is refused here, and
+      # an owner changed in between fails the move's check under the lock.
+      printf '\\set dest_goid :%s\n' "$([[ -n "$mig_role" ]] && echo migrate_goid || echo app_goid)"
       for i in "${!targets[@]}"; do
         [[ "${t_transfer[$i]}" == "true" ]] || continue
-        printf '\\set db %s\n\\set seen_owner %s\n' "'${target_names[$i]}'" "${t_owner_oid[$i]}"
+        printf '\\set db %s\n\\set seen_owner %s\n\\set datoid %s\n' "'${target_names[$i]}'" "${t_owner_oid[$i]}" "${t_datoid[$i]}"
         cat <<'SQL'
 INSERT INTO infra_skills.ownership_transfer AS t (datoid, datname, from_role, to_role)
-SELECT d.oid, d.datname, :seen_owner, n.oid FROM pg_database d, pg_roles n WHERE d.datname = :'db' AND n.rolname = :'owner' AND :seen_owner <> n.oid
+SELECT d.oid, d.datname, :seen_owner, n.oid FROM pg_database d, pg_roles n
+ WHERE d.oid = :datoid AND d.datname = :'db' AND n.oid = :dest_goid AND n.rolname = :'owner' AND :seen_owner <> n.oid
 ON CONFLICT (datoid) DO UPDATE
    SET datname = excluded.datname, from_role = excluded.from_role, to_role = excluded.to_role, started_at = now(), done_at = NULL
  WHERE t.done_at IS NOT NULL;
+SELECT set_config('infra_skills.i_db', :'db', false) AS i_db,
+       set_config('infra_skills.i_ok', (EXISTS (SELECT FROM pg_database WHERE oid = :datoid AND datname = :'db')
+                                        AND EXISTS (SELECT FROM pg_roles WHERE oid = :dest_goid AND rolname = :'owner'))::text, false) AS i_ok \gset
+DO $$
+BEGIN
+  IF NOT current_setting('infra_skills.i_ok')::boolean THEN
+    RAISE EXCEPTION 'infra-skills: database % or the destination role was dropped and made again since the preflight (another oid under the same name); nothing moved',
+      current_setting('infra_skills.i_db');
+  END IF;
+END
+$$;
 SQL
       done
       for i in "${!targets[@]}"; do pg_sql_existing_db "$i"; done
