@@ -710,7 +710,8 @@ grafana_remote_prometheus_blocks() {
 # argocd.sh): an ingress in the sso namespace hands the whole host to pomerium-proxy, and a
 # route lets users through: GRAFANA_ALLOWED_GROUPS when set; else the access the route already
 # has in pomerium-routes.yaml; a new route admits any signed-in user. A run that leaves the
-# routes file as it was does not reload Pomerium. Grafana's own Dex SSO and GitHub role mapping still
+# routes file as it was does not reload Pomerium. A failed reload fails the run and leaves the
+# file as it was (the rerun retries). Grafana's own Dex SSO and GitHub role mapping still
 # apply behind it; its password login and basic-auth API are no longer reachable from
 # outside. In-cluster callers (provision::grafana_api, mcp-grafana) use the Service and are
 # unaffected. The host's path routes (grafana-mcp's /mcp) are kept by pomerium_routes_add.
@@ -762,11 +763,13 @@ YAML
     provision::pomerium_routes_add "$from_url" "$to_url" "${NAMESPACE_SSO}" true true true \
       "$route_extra" && route_ok=true
   fi
-  if $route_ok; then
-    info "✓ Pomerium route ensured: ${from_url} -> grafana${GRAFANA_ALLOWED_GROUPS:+ (groups: ${GRAFANA_ALLOWED_GROUPS})}"
-  else
-    warn "Failed to ensure the Pomerium route for ${from_url}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
+  if ! $route_ok; then
+    # Not a warning: the access in front of Grafana may still be the old one. The routes file is
+    # left as it was when Pomerium was not reloaded, so a rerun retries the update.
+    err "Failed to ensure the Pomerium route for ${from_url} (see above); fix it and rerun"
+    return 1
   fi
+  info "✓ Pomerium route ensured: ${from_url} -> grafana${GRAFANA_ALLOWED_GROUPS:+ (groups: ${GRAFANA_ALLOWED_GROUPS})}"
 }
 
 # --- Export this Prometheus to another cluster's Grafana (PROMETHEUS_EXPORT_ALLOWED_CIDRS) ---
@@ -4782,7 +4785,7 @@ EOF
   ensure_grafana_admin_login || true
 
   if $GRAFANA_VIA_POMERIUM; then
-    ensure_grafana_pomerium
+    ensure_grafana_pomerium || exit 1
   fi
 
   # mcp-grafana (envs/<env>/apps/observability/mcp-grafana.yaml, behind a Pomerium MCP

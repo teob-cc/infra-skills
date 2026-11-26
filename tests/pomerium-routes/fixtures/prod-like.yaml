@@ -30,7 +30,8 @@ config:
       pass_identity_headers: true
       timeout: 60s
       set_response_headers:
-        X-Robots-Tag: noindex
+        # keep crawlers out (comment on a sibling header)
+        X-Robots-Tag: noindex # inline comment
       policy:
         - allow:
             or:

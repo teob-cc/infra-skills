@@ -91,7 +91,9 @@ CSP header. Browsers obey `frame-ancestors` over the `X-Frame-Options: SAMEORIGI
 by default, so only `'self'` and the listed origins can frame Grafana. Every run sets the
 header on the route in `envs/<env>/pomerium-routes.yaml` (and takes it off when the property is
 unset), so editing that header by hand does not last. The route's other fields stay as they are,
-and a run that changes nothing in the file does not reload Pomerium.
+and a run that changes nothing in the file does not reload Pomerium. When the reload fails (the
+Secret cannot be read or written, or the restart fails) the run fails and the file is left as it
+was, so the next run tries the same update again.
 
 `grafana.ini` is written only together with the Dex SSO block. A run that skips that block
 (`--skip-sso`, no Dex client, no GitHub org) cannot apply `allow_embedding` and says so; the

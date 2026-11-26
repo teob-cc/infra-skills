@@ -1,17 +1,46 @@
 #!/usr/bin/env bash
 # Stand-in for kubectl in tests/pomerium-routes/run.sh: no cluster is contacted. Every call is
-# logged to STUB_LOG; the reads provision::pomerium_reload_routes makes get canned answers, and
-# writes (apply, create --dry-run=client, rollout restart) succeed without doing anything.
+# logged to STUB_LOG. The secret pomerium-config is kept in ${STUB_LOG}.secret (its config.yaml):
+# a read returns it (or a canned config when there is none yet), `create secret generic
+# --from-file=config.yaml=<file> --dry-run=client` stages <file>, and `apply -f -` makes the staged
+# one live. Failures to inject (1 = fail):
+#   STUB_FAIL_SECRET_READ  the read of pomerium-config
+#   STUB_FAIL_APPLY        `apply -f -`
+#   STUB_FAIL_ROLLOUT      `rollout restart`
 set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_LOG:?}"
+secret="${STUB_LOG}.secret"
 args=" $* "
 case "$args" in
   *" get secret pomerium-config "*)
-    # A live config.yaml with settings besides the routes, base64 like the jsonpath read.
-    printf 'authenticate_service_url: https://auth.example.test\nroutes: []\n' | base64
+    [[ "${STUB_FAIL_SECRET_READ:-0}" == 1 ]] && { echo "stub: connection refused" >&2; exit 1; }
+    if [[ -f "$secret" ]]; then
+      base64 < "$secret"
+    else
+      # A live config.yaml with settings besides the routes, base64 like the jsonpath read.
+      printf 'authenticate_service_url: https://auth.example.test\nroutes: []\n' | base64
+    fi
     exit 0 ;;
-  *" create secret generic "*) printf 'apiVersion: v1\nkind: Secret\n'; exit 0 ;;
-  *" apply -f - "*|*" apply -f -") cat >/dev/null; exit 0 ;;
+  *" create secret generic "*)
+    for a in "$@"; do
+      [[ "$a" == --from-file=config.yaml=* ]] && cp "${a#--from-file=config.yaml=}" "${secret}.staged"
+    done
+    printf 'apiVersion: v1\nkind: Secret\n'
+    exit 0 ;;
+  *" apply -f - "*|*" apply -f -")
+    cat >/dev/null
+    # Only the Secret's apply (the one a staged config.yaml belongs to) is made to fail, not the
+    # Ingress apply of ensure_grafana_pomerium.
+    if [[ -f "${secret}.staged" ]]; then
+      if [[ "${STUB_FAIL_APPLY:-0}" == 1 ]]; then
+        rm -f "${secret}.staged"; echo "stub: apply refused" >&2; exit 1
+      fi
+      mv "${secret}.staged" "$secret"
+    fi
+    exit 0 ;;
+  *" rollout restart "*)
+    [[ "${STUB_FAIL_ROLLOUT:-0}" == 1 ]] && { echo "stub: rollout refused" >&2; exit 1; }
+    exit 0 ;;
   *" get deploy pomerium-proxy "*) exit 0 ;;
   # observability.sh checks its context first (provision::check_context)
   *" config current-context "*|*" config get-contexts "*) echo fake; exit 0 ;;

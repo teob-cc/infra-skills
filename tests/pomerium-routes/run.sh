@@ -25,6 +25,17 @@
 #      headers stay;
 #   7. pomerium_routes_add_for_groups (pgweb, amneziawg) still replaces the access of an existing
 #      route (a changed PGWEB_ALLOWED_GROUPS lands) and now keeps its other keys.
+#   R1. a refused Secret apply, a refused rollout or an unreadable Secret: the caller fails
+#       (ensure_grafana_pomerium, pomerium_routes_add, pomerium_routes_remove), the routes file
+#       stays as it was, and the identical rerun applies and restarts (the live routes are then
+#       the file's); an unreadable Secret is never overwritten;
+#   R2. a failed or silently short write of the routes file (a stand-in cat) leaves the file as it
+#       was (bytes, mode, no temp file), the caller fails, the rerun writes it; the file is
+#       replaced by a rename;
+#   R3. GRAFANA_ALLOWED_GROUPS with glob characters is refused even when the cwd has matching
+#       files, and the validator checks the entries the renderer makes;
+#   R4. a CSP change keeps the head and inline comments of the sibling header; set then unset
+#       gives the fixture back byte for byte.
 #
 # Usage: tests/pomerium-routes/run.sh        (needs bash, jq, yq v4, git for check 1)
 # The helpers run in subshells on purpose (each case its own PATH, STUB_LOG and envs root), and the
@@ -61,12 +72,15 @@ setup() {
 }
 routes_file() { echo "$WORK/$1/envs/fake/pomerium-routes.yaml"; }
 
-# run_common <case> <common.sh> <function> <args...>: one helper call against the stand-ins
+# run_common <case> <common.sh> <function> <args...>: one helper call against the stand-ins; its
+# exit status is the helper's (callers that expect a failure take it with || rc=$?). PRELUDE, when
+# set, is evaluated after sourcing (case-local stand-in functions).
 run_common() {
   local dir="$WORK/$1" common="$2"; shift 2
   ( export PATH="$HERE/stubs:$PATH" STUB_LOG="$dir/kubectl.log" INFRA_ENVS_ROOT="$dir/envs" ENV_NAME=fake
     # shellcheck disable=SC1090
     source "$common"
+    eval "${PRELUDE:-}"   # a stand-in function for one case (e.g. a failing cat)
     "$@" ) >>"$dir/output.txt" 2>&1
 }
 run_new() { local c="$1"; shift; run_common "$c" "$REPO/tools/provision-common.sh" "$@"; }
@@ -86,6 +100,8 @@ grafana() {
     log() { echo "[observability] $*"; }
     info() { echo "[observability:info] $*"; }
     warn() { echo "[observability:warn] $*" >&2; }
+    err() { echo "[observability:error] $*" >&2; }
+    eval "${PRELUDE:-}"
     GRAFANA_HOST=grafana.fake.example.test NAMESPACE_SSO=sso NAMESPACE_OBSERVABILITY=observability
     CLUSTER_ISSUER=letsencrypt INGRESS_CLASS=traefik
     GRAFANA_ALLOWED_GROUPS="$2" grafana_frame_csp="$3"
@@ -287,6 +303,124 @@ run_new remove-one provision::pomerium_routes_remove https://nexus.fake.example.
 check "remove of an existing route: gone, Pomerium reloaded" \
   bash -c "[ \"\$(yq '[.config.routes[] | select(.from == \"https://nexus.fake.example.test\")] | length' '$(routes_file remove-one)')\" = 0 ] && grep -q rollout '$WORK/remove-one/kubectl.log'"
 
+
+# ===== Round 2 (validator findings on 5507145, INFRA-253 comment 17340) ============================
+live_routes() { # <case>: the routes of the stand-in's live pomerium-config, as compact JSON
+  local s="$WORK/$1/kubectl.log.secret"
+  if [[ -f "$s" ]]; then yq -o=json -I=0 '.routes // []' "$s"; else echo '[]'; fi
+}
+file_routes() { yq -o=json -I=0 '.config.routes // []' "$(routes_file "$1")"; }
+no_stray_temp() { [ -z "$(find "$WORK/$1/envs/fake" -name '.pomerium-routes.yaml.*')" ]; }
+
+# --- R1. a failed reload fails the caller, leaves the file, and the rerun retries ----------------
+# Secret apply refused: open route, GRAFANA_ALLOWED_GROUPS set
+setup r1-apply open-grafana.yaml
+cp "$(routes_file r1-apply)" "$WORK/r1-apply/before.yaml"
+rc=0; STUB_FAIL_APPLY=1 grafana r1-apply "fake-org:admins" "" || rc=$?
+check "R1 apply refused: ensure_grafana_pomerium fails (exit $rc)" [ "$rc" -ne 0 ]
+check "R1 apply refused: an error, no 'route ensured'" \
+  bash -c "grep -q 'Failed to ensure the Pomerium route' '$WORK/r1-apply/output.txt' && ! grep -q 'route ensured' '$WORK/r1-apply/output.txt'"
+check "R1 apply refused: routes file byte for byte as before" cmp -s "$WORK/r1-apply/before.yaml" "$(routes_file r1-apply)"
+check "R1 apply refused: no rollout after the failed apply" bash -c "! grep -q 'rollout restart' '$WORK/r1-apply/kubectl.log'"
+check "R1 apply refused: no temp file left next to the routes file" no_stray_temp r1-apply
+: > "$WORK/r1-apply/kubectl.log"
+rc=0; grafana r1-apply "fake-org:admins" "" || rc=$?
+check "R1 identical rerun: succeeds (exit $rc)" [ "$rc" -eq 0 ]
+check "R1 identical rerun: applies the Secret and restarts Pomerium (retried)" \
+  bash -c "grep -q 'create secret generic pomerium-config' '$WORK/r1-apply/kubectl.log' && grep -q 'rollout restart' '$WORK/r1-apply/kubectl.log'"
+check "R1 identical rerun: the file now has the groups policy, no allow_any" \
+  jqe '(has("allow_any_authenticated_user") | not) and .policy == [{"allow":{"or":[{"claim/groups":"fake-org:admins"}]}}]' <<<"$(catch_all r1-apply "$G")"
+check "R1 identical rerun: the live routes are the file's routes" json_eq "$(live_routes r1-apply)" "$(file_routes r1-apply)"
+check "R1 live config keeps its other settings" \
+  [ "$(yq '.authenticate_service_url' "$WORK/r1-apply/kubectl.log.secret")" = "https://auth.example.test" ]
+: > "$WORK/r1-apply/kubectl.log"
+grafana r1-apply "fake-org:admins" ""
+check "R1 third run: nothing to do, no reload" no_reload_calls r1-apply
+
+# rollout restart refused: the Secret is live, the file is not written; the rerun restarts again
+setup r1-rollout open-grafana.yaml
+cp "$(routes_file r1-rollout)" "$WORK/r1-rollout/before.yaml"
+rc=0; STUB_FAIL_ROLLOUT=1 grafana r1-rollout "fake-org:admins" "" || rc=$?
+check "R1 rollout refused: fails, file as before" bash -c "[ $rc -ne 0 ] && cmp -s '$WORK/r1-rollout/before.yaml' '$(routes_file r1-rollout)'"
+: > "$WORK/r1-rollout/kubectl.log"
+rc=0; grafana r1-rollout "fake-org:admins" "" || rc=$?
+check "R1 rollout refused, rerun: restarts and writes the file" \
+  bash -c "[ $rc -eq 0 ] && grep -q 'rollout restart' '$WORK/r1-rollout/kubectl.log' && ! cmp -s '$WORK/r1-rollout/before.yaml' '$(routes_file r1-rollout)'"
+
+# the Secret cannot be read: no routes-only config is applied over the live one
+setup r1-read open-grafana.yaml
+cp "$(routes_file r1-read)" "$WORK/r1-read/before.yaml"
+rc=0; STUB_FAIL_SECRET_READ=1 grafana r1-read "fake-org:admins" "" || rc=$?
+check "R1 Secret read fails: fails, no Secret written, no rollout, file as before" \
+  bash -c "[ $rc -ne 0 ] && ! grep -qE 'create secret|rollout' '$WORK/r1-read/kubectl.log' && cmp -s '$WORK/r1-read/before.yaml' '$(routes_file r1-read)'"
+
+# the other callers get the failure too (argocd.sh-style, and remove)
+setup r1-argocd none
+rc=0; STUB_FAIL_APPLY=1 run_new r1-argocd provision::pomerium_routes_add https://argocd.fake.example.test http://argocd-server.argocd.svc.cluster.local:80 sso true true true || rc=$?
+check "R1 pomerium_routes_add returns the failure (exit $rc) and creates no routes file" \
+  bash -c "[ $rc -ne 0 ] && [ ! -e '$(routes_file r1-argocd)' ]"
+setup r1-remove prod-like.yaml
+cp "$(routes_file r1-remove)" "$WORK/r1-remove/before.yaml"
+rc=0; STUB_FAIL_APPLY=1 run_new r1-remove provision::pomerium_routes_remove https://nexus.fake.example.test sso || rc=$?
+check "R1 pomerium_routes_remove returns the failure, file as before" \
+  bash -c "[ $rc -ne 0 ] && cmp -s '$WORK/r1-remove/before.yaml' '$(routes_file r1-remove)'"
+check "R1 observability.sh stops when ensure_grafana_pomerium fails" \
+  grep -qE '^ +ensure_grafana_pomerium \|\| exit 1$' "$REPO/tools/k3s/observability.sh"
+
+# --- R2. the routes file is replaced atomically; a failed or short write leaves it alone ---------
+for variant in "fails:1" "silent:0"; do
+  name=${variant%%:*} code=${variant##*:}
+  setup "r2-$name" open-grafana.yaml
+  chmod 640 "$(routes_file "r2-$name")"
+  cp "$(routes_file "r2-$name")" "$WORK/r2-$name/before.yaml"
+  # the write of the staged routes emits only "config:" (and exits $code)
+  rc=0; PRELUDE="cat() { printf 'config:\n'; return $code; }" grafana "r2-$name" "fake-org:admins" "" || rc=$?
+  check "R2 short write ($name, cat exit $code): ensure_grafana_pomerium fails" [ "$rc" -ne 0 ]
+  check "R2 short write ($name): routes file byte for byte as before, mode 640" \
+    bash -c "cmp -s '$WORK/r2-$name/before.yaml' '$(routes_file "r2-$name")' && [ \"\$(stat -f %Lp '$(routes_file "r2-$name")' 2>/dev/null || stat -c %a '$(routes_file "r2-$name")')\" = 640 ]"
+  check "R2 short write ($name): says the file was not written" grep -q "was not written" "$WORK/r2-$name/output.txt"
+  check "R2 short write ($name): no temp file left next to the routes file" no_stray_temp "r2-$name"
+  : > "$WORK/r2-$name/kubectl.log"
+  rc=0; grafana "r2-$name" "fake-org:admins" "" || rc=$?
+  check "R2 short write ($name), rerun: writes the whole file (mode 640 kept) and reloads" \
+    bash -c "[ $rc -eq 0 ] && grep -q 'rollout restart' '$WORK/r2-$name/kubectl.log' && [ \"\$(stat -f %Lp '$(routes_file "r2-$name")' 2>/dev/null || stat -c %a '$(routes_file "r2-$name")')\" = 640 ]"
+  check "R2 short write ($name), rerun: the file parses and has the policy" \
+    jqe '.policy | length == 1' <<<"$(catch_all "r2-$name" "$G")"
+done
+setup r2-atomic open-grafana.yaml
+ino_before=$(stat -f %i "$(routes_file r2-atomic)" 2>/dev/null || stat -c %i "$(routes_file r2-atomic)")
+grafana r2-atomic "fake-org:admins" ""
+ino_after=$(stat -f %i "$(routes_file r2-atomic)" 2>/dev/null || stat -c %i "$(routes_file r2-atomic)")
+check "R2 the file is replaced by a rename (new inode), not truncated in place" [ "$ino_before" != "$ino_after" ]
+
+# --- R3. GRAFANA_ALLOWED_GROUPS: no pathname expansion; the validated entries are the rendered ones
+GLOBDIR="$WORK/r3-globdir"
+mkdir -p "$GLOBDIR" && touch "$GLOBDIR/fake-org:admins" "$GLOBDIR/fake-org:uce"
+for v in "fake-org:*" "fake-org:adm?ns" "fake-org:[a]dmins" "*" "fake-org:admins,fake-org:*"; do
+  check "R3 refused with a matching file in the cwd: '$v'" \
+    bash -c "cd '$GLOBDIR' && ! ( source '$REPO/tools/provision-common.sh'; provision::pomerium_groups_valid '$v' )"
+done
+check "R3 an entry with a newline inside is refused (the renderer would keep it)" \
+  bash -c "! ( source '$REPO/tools/provision-common.sh'; provision::pomerium_groups_valid \$'fake-org:a\nfake-org:b' )"
+check "R3 validator and renderer share one split (PROVISION_POMERIUM_GROUPS_JQ)" \
+  bash -c "[ \"\$(grep -c 'PROVISION_POMERIUM_GROUPS_JQ\"' '$REPO/tools/provision-common.sh')\" -ge 2 ]"
+setup r3-obs none
+printf 'HOSTNAME=fake.example.test\nEXTERNAL_IP=192.0.2.10\nACME_EMAIL=ops@example.test\nGRAFANA_ALLOWED_GROUPS="fake-org:*"\n' \
+  > "$WORK/r3-obs/envs/fake/env.properties"
+obs_rc=0
+( cd "$GLOBDIR" && STUB_LOG="$WORK/r3-obs/kubectl.log" INFRA_ENVS_ROOT="$WORK/r3-obs/envs" KUBECONFIG=/dev/null \
+    PATH="$HERE/stubs:$PATH" "$REPO/tools/k3s/observability.sh" fake ) >"$WORK/r3-obs/output.txt" 2>&1 || obs_rc=$?
+check "R3 observability.sh refuses GRAFANA_ALLOWED_GROUPS=fake-org:* run from a dir with fake-org:admins" \
+  bash -c "[ $obs_rc = 1 ] && grep -q 'GRAFANA_ALLOWED_GROUPS: .* is not a comma-separated list' '$WORK/r3-obs/output.txt'"
+
+# --- R4. a CSP change keeps the comments of its sibling headers -----------------------------------
+setup r4 prod-like.yaml
+grafana r4 "" "frame-ancestors 'self' https://portal.example.test"
+check "R4 CSP set: the sibling header's head comment stays" grep -q "# keep crawlers out (comment on a sibling header)" "$(routes_file r4)"
+check "R4 CSP set: the sibling header's inline comment stays" grep -q "X-Robots-Tag: noindex # inline comment" "$(routes_file r4)"
+check "R4 CSP set: the header is there" jqe '.set_response_headers["Content-Security-Policy"] | startswith("frame-ancestors")' <<<"$(catch_all r4 "$G")"
+grafana r4 "" ""
+check "R4 CSP set then unset: the file is byte for byte the fixture again" cmp -s "$HERE/fixtures/prod-like.yaml" "$(routes_file r4)"
 echo
 if (( failures > 0 )); then
   echo "$failures check(s) failed (work dir kept: $WORK)"
