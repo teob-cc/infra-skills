@@ -60,6 +60,11 @@ set -euo pipefail
 #                        in an iframe: grafana.ini security.allow_embedding, and the Pomerium
 #                        route answers Content-Security-Policy: frame-ancestors 'self' <origins>.
 #                        allow_embedding needs the SSO block of grafana.ini (a warning says so)
+#   GRAFANA_ALLOWED_GROUPS="<github-org>:<team>,..."  Who may pass the Pomerium route of
+#                        GRAFANA_HOST: a policy on the Dex groups claim, written over the access
+#                        fields of the route on every run. Unset: a route already in
+#                        pomerium-routes.yaml keeps its access (policy, allowed_*, ...); a new route
+#                        admits any signed-in user
 #   GRAFANA_POMERIUM_JWT=true  Sign users in from the JWT Pomerium passes on every request
 #                        (grafana.ini auth.jwt, keys from https://<AUTH_HOST>/.well-known/pomerium/jwks.json,
 #                        audience pinned to GRAFANA_HOST, the same role mapping as Dex SSO).
@@ -346,9 +351,10 @@ GRAFANA_REMOTE_PROMETHEUS_SECRET="grafana-remote-prometheus"
 # GRAFANA_FRAME_ANCESTORS="<origin> ..." (scheme://host[:port], a leading *. allowed). Grafana
 # gets security.allow_embedding, and the Pomerium route of its host answers
 # Content-Security-Policy: frame-ancestors 'self' <origins>, which browsers obey over the
-# X-Frame-Options: SAMEORIGIN Pomerium sends by default. The route is rewritten on every run
-# (provision::_pomerium_routes_upsert), so the header has to come from here. Unset: the route
-# and the values are what they were without it.
+# X-Frame-Options: SAMEORIGIN Pomerium sends by default. Every run sets that header on the route
+# (provision::_pomerium_routes_upsert), so it has to come from here. Unset: a run takes the
+# header back off the route (other response headers stay), and the values are what they were
+# without it.
 GRAFANA_FRAME_ANCESTORS="${GRAFANA_FRAME_ANCESTORS:-}"
 grafana_frame_csp=""
 if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
@@ -360,6 +366,16 @@ if [[ -n "$GRAFANA_FRAME_ANCESTORS" ]]; then
   done
   grafana_frame_csp="frame-ancestors 'self'${grafana_frame_csp}"
   unset frame_origin
+fi
+
+# --- Who may pass the Grafana route (GRAFANA_ALLOWED_GROUPS) ---
+# GRAFANA_ALLOWED_GROUPS="<github-org>:<team>,..." (the Dex groups claim): the route of
+# GRAFANA_HOST gets a Pomerium policy on those groups, over whatever access it had. Unset: a route
+# already in envs/<env>/pomerium-routes.yaml keeps its access fields (e.g. a hand-written policy);
+# a new route admits any signed-in user, as before.
+GRAFANA_ALLOWED_GROUPS="${GRAFANA_ALLOWED_GROUPS:-}"
+if [[ -n "$GRAFANA_ALLOWED_GROUPS" ]] && ! provision::pomerium_groups_valid "$GRAFANA_ALLOWED_GROUPS"; then
+  err "GRAFANA_ALLOWED_GROUPS: '${GRAFANA_ALLOWED_GROUPS}' is not a comma-separated list of <github-org>:<team>"; exit 1
 fi
 
 # --- Sign-in from Pomerium's JWT (GRAFANA_POMERIUM_JWT=true, off by default) ---
@@ -692,7 +708,9 @@ grafana_remote_prometheus_blocks() {
 #
 # Grafana's UI sits behind Pomerium like the other back-office tools (same pattern as
 # argocd.sh): an ingress in the sso namespace hands the whole host to pomerium-proxy, and a
-# route lets signed-in users through. Grafana's own Dex SSO and GitHub role mapping still
+# route lets users through: GRAFANA_ALLOWED_GROUPS when set; else the access the route already
+# has in pomerium-routes.yaml; a new route admits any signed-in user. A run that leaves the
+# routes file as it was does not reload Pomerium. Grafana's own Dex SSO and GitHub role mapping still
 # apply behind it; its password login and basic-auth API are no longer reachable from
 # outside. In-cluster callers (provision::grafana_api, mcp-grafana) use the Service and are
 # unaffected. The host's path routes (grafana-mcp's /mcp) are kept by pomerium_routes_add.
@@ -726,18 +744,28 @@ spec:
       secretName: grafana-pomerium-tls
 YAML
   # GRAFANA_FRAME_ANCESTORS: the route answers with the CSP that lets those origins frame
-  # Grafana. Without it the extra options are {} and the route is what it always was.
-  local route_extra="{}"
+  # Grafana. Without it the CSP header is taken off the route (a null removes the key; other
+  # response headers stay) and a new route is what it always was.
+  local route_extra='{"set_response_headers":{"Content-Security-Policy":null}}'
   if [[ -n "$grafana_frame_csp" ]]; then
     route_extra=$(jq -cn --arg csp "$grafana_frame_csp" '{set_response_headers: {"Content-Security-Policy": $csp}}')
     info "Pomerium route for ${GRAFANA_HOST} answers Content-Security-Policy: ${grafana_frame_csp}"
   fi
-  if provision::pomerium_routes_add "https://${GRAFANA_HOST}" \
-       "http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80" "${NAMESPACE_SSO}" true true true \
-       "$route_extra"; then
-    info "✓ Pomerium route ensured: https://${GRAFANA_HOST} -> grafana"
+  local from_url="https://${GRAFANA_HOST}" to_url="http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80"
+  local route_ok=false
+  if [[ -n "$GRAFANA_ALLOWED_GROUPS" ]]; then
+    # The groups are the route's access: they replace its policy / allow_* fields.
+    provision::pomerium_routes_add_for_groups "$from_url" "$to_url" "$GRAFANA_ALLOWED_GROUPS" \
+      "${NAMESPACE_SSO}" true true "$route_extra" && route_ok=true
   else
-    warn "Failed to ensure the Pomerium route for https://${GRAFANA_HOST}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
+    # ALLOW_ANY=true is the access of a new route only: an existing route keeps its own.
+    provision::pomerium_routes_add "$from_url" "$to_url" "${NAMESPACE_SSO}" true true true \
+      "$route_extra" && route_ok=true
+  fi
+  if $route_ok; then
+    info "✓ Pomerium route ensured: ${from_url} -> grafana${GRAFANA_ALLOWED_GROUPS:+ (groups: ${GRAFANA_ALLOWED_GROUPS})}"
+  else
+    warn "Failed to ensure the Pomerium route for ${from_url}; add it to envs/<env>/pomerium-routes.yaml and run tools/k3s/apply-pomerium-routes.sh"
   fi
 }
 

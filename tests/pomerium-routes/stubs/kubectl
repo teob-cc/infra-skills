@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Stand-in for kubectl in tests/pomerium-routes/run.sh: no cluster is contacted. Every call is
+# logged to STUB_LOG; the reads provision::pomerium_reload_routes makes get canned answers, and
+# writes (apply, create --dry-run=client, rollout restart) succeed without doing anything.
+set -uo pipefail
+printf '%s\n' "$*" >> "${STUB_LOG:?}"
+args=" $* "
+case "$args" in
+  *" get secret pomerium-config "*)
+    # A live config.yaml with settings besides the routes, base64 like the jsonpath read.
+    printf 'authenticate_service_url: https://auth.example.test\nroutes: []\n' | base64
+    exit 0 ;;
+  *" create secret generic "*) printf 'apiVersion: v1\nkind: Secret\n'; exit 0 ;;
+  *" apply -f - "*|*" apply -f -") cat >/dev/null; exit 0 ;;
+  *" get deploy pomerium-proxy "*) exit 0 ;;
+  # observability.sh checks its context first (provision::check_context)
+  *" config current-context "*|*" config get-contexts "*) echo fake; exit 0 ;;
+esac
+exit 0

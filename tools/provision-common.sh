@@ -1164,10 +1164,15 @@ provision::pomerium_reload_routes() {
   return 0
 }
 
-# Add or replace a route with given "from" URL in the environment's pomerium-routes.yaml
+# Add or update the catch-all route of FROM_URL in the environment's pomerium-routes.yaml.
 # Usage: provision::pomerium_routes_add FROM_URL TO_URL [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true] [ALLOW_ANY=true] [EXTRA_JSON={}]
+#   ALLOW_ANY is the access of a new route only: a route of FROM_URL that is already in the file
+#   keeps its access fields (policy, allowed_*, allow_any_authenticated_user, ...); ALLOW_ANY is
+#   written only when it has none (provision::_pomerium_route_merge).
 #   EXTRA_JSON: a JSON object of further route options merged over the route, e.g.
 #   '{"set_response_headers": {"Content-Security-Policy": "frame-ancestors '\''self'\''"}}'.
+#   Objects merge key by key and a null value removes that key from the route, so
+#   '{"set_response_headers": {"Content-Security-Policy": null}}' takes back only that header.
 #   The default {} leaves the route exactly as without it.
 provision::pomerium_routes_add() {
   local from_url="$1" to_url="$2" namespace_sso="${3:-sso}"
@@ -1190,37 +1195,84 @@ provision::pomerium_routes_add() {
     provision::error "pomerium_routes_add: PRESERVE_HOST, PASS_ID and ALLOW_ANY must be true or false"
     return 1
   }
-  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso"
+  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso" default
 }
 
-# Add or replace a route that only members of the given groups may use (Pomerium policy on the
-# groups claim, which Dex fills with "<github-org>:<team>").
-# Usage: provision::pomerium_routes_add_for_groups FROM_URL TO_URL GROUPS [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true]
+# Add or update a route that only members of the given groups may use (Pomerium policy on the
+# groups claim, which Dex fills with "<github-org>:<team>"). The groups are the route's access:
+# they replace the access fields of a route of FROM_URL already in the file.
+# Usage: provision::pomerium_routes_add_for_groups FROM_URL TO_URL GROUPS [NAMESPACE_SSO] [PRESERVE_HOST=true] [PASS_ID=true] [EXTRA_JSON={}]
 #   GROUPS: comma-separated, e.g. "my-org:admins" or "my-org:admins,my-org:dba"
+#   EXTRA_JSON: as for provision::pomerium_routes_add (its access fields are ignored)
 provision::pomerium_routes_add_for_groups() {
   local from_url="$1" to_url="$2" groups="$3" namespace_sso="${4:-sso}"
   local preserve_host="${5:-true}" pass_identity_headers="${6:-true}"
+  local extra="${7:-}"
+  [[ -n "$extra" ]] || extra='{}'
 
   if [[ -z "$from_url" || -z "$to_url" || -z "$groups" ]]; then
     provision::error "pomerium_routes_add_for_groups: FROM_URL, TO_URL and GROUPS are required"
     return 1
   fi
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$extra"; then
+    provision::error "pomerium_routes_add_for_groups: EXTRA_JSON must be a JSON object"
+    return 1
+  fi
   local route
   route=$(jq -cn --arg f "$from_url" --arg t "$to_url" --arg g "$groups" --argjson ph "$preserve_host" \
-    --argjson pi "$pass_identity_headers" \
-    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi,
-      policy: [{allow: {or: [$g | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) | {"claim/groups": .}]}}]}' 2>/dev/null) || {
+    --argjson pi "$pass_identity_headers" --argjson extra "$extra" --argjson acc "$PROVISION_POMERIUM_ACCESS_KEYS" \
+    '{from: $f, to: $t, preserve_host_header: $ph, pass_identity_headers: $pi}
+     + ($extra | with_entries(select(.key | IN($acc[]) | not)))
+     + {policy: [{allow: {or: [$g | split(",")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) | {"claim/groups": .}]}}]}' 2>/dev/null) || {
     provision::error "pomerium_routes_add_for_groups: PRESERVE_HOST and PASS_ID must be true or false"
     return 1
   }
-  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso"
+  provision::_pomerium_routes_upsert "$from_url" "$route" "$namespace_sso" explicit
 }
 
-# Replace the host's catch-all route (same .from) with ROUTE_JSON and reload Pomerium. Routes on
-# the same host that match only a path (prefix/path/regex, e.g. Grafana's /mcp route) are kept.
-# Usage: provision::_pomerium_routes_upsert FROM_URL ROUTE_JSON [NAMESPACE_SSO]
+# The keys of a Pomerium route that decide who may use it.
+PROVISION_POMERIUM_ACCESS_KEYS='["policy","allow_any_authenticated_user","allow_public_unauthenticated_access","allowed_users","allowed_domains","allowed_groups","allowed_idp_claims"]'
+
+# The route an upsert of ROUTE_JSON makes of EXISTING_JSON (a route object, or null for none).
+# Usage: provision::_pomerium_route_merge EXISTING_JSON ROUTE_JSON ACCESS   -> echoes the route
+#   No existing route: ROUTE_JSON, its null values left out.
+#   Existing route: ROUTE_JSON is merged into it (objects key by key, a null value removes the
+#   key; keys ROUTE_JSON does not name stay as they are). Access fields
+#   (PROVISION_POMERIUM_ACCESS_KEYS):
+#     ACCESS=default   the existing route's access fields stay, ROUTE_JSON's are dropped; only a
+#                      route without any access field takes ROUTE_JSON's (the old behaviour)
+#     ACCESS=explicit  ROUTE_JSON's access fields replace all of the existing route's
+provision::_pomerium_route_merge() {
+  local existing="$1" route="$2" access="${3:-default}"
+  jq -cn --argjson e "$existing" --argjson r "$route" --arg mode "$access" \
+    --argjson acc "$PROVISION_POMERIUM_ACCESS_KEYS" '
+    def merge($b):
+      reduce ($b | keys_unsorted[]) as $k (.;
+        if $b[$k] == null then del(.[$k])
+        elif ($b[$k] | type) == "object" then
+          .[$k] = ((if (.[$k] | type) == "object" then .[$k] else {} end) | merge($b[$k]))
+          | if .[$k] == {} and ($b[$k] | length) > 0 then del(.[$k]) else . end
+        else .[$k] = $b[$k] end);
+    ($r | with_entries(select(.key | IN($acc[])))) as $racc
+    | ($r | with_entries(select(.key | IN($acc[]) | not))) as $rrest
+    | if $e == null then {} | merge($r)
+      else
+        ($e | merge($rrest))
+        | if $mode == "explicit" or ([$e | keys[] | IN($acc[])] | any | not) then
+            reduce $acc[] as $a (.; if $racc | has($a) then . else del(.[$a]) end) | merge($racc)
+          else . end
+      end'
+}
+
+# Upsert the host's catch-all route (same .from, no prefix/path/regex) with ROUTE_JSON and reload
+# Pomerium. The route keeps its place in the file and is changed field by field, so comments and
+# the routes around it stay; a new route goes last. Routes on the same host that match only a
+# path (e.g. Grafana's /mcp route) are not touched; further catch-all duplicates are removed.
+# When the file comes out byte for byte as it was, nothing is written and Pomerium is not reloaded.
+# Usage: provision::_pomerium_routes_upsert FROM_URL ROUTE_JSON [NAMESPACE_SSO] [ACCESS=default|explicit]
+#   ACCESS: see provision::_pomerium_route_merge
 provision::_pomerium_routes_upsert() {
-  local from_url="$1" route="$2" namespace_sso="${3:-sso}"
+  local from_url="$1" route="$2" namespace_sso="${3:-sso}" access="${4:-default}"
   local routes_file
   if ! routes_file=$(provision::pomerium_routes_file); then
     return 1
@@ -1235,22 +1287,109 @@ config:
 YAML
   fi
 
-  local tmp_out
-  tmp_out=$(mktemp)
-  if ! FROM="$from_url" ROUTE="$route" yq eval \
-      '.config.routes |= map(select(.from != strenv(FROM) or has("prefix") or has("path") or has("regex")))
-       | .config.routes += [env(ROUTE) | ... style=""]' "$routes_file" > "$tmp_out" 2>/dev/null; then
-    provision::error "Failed to update the route for ${from_url} in $routes_file using yq"
-    rm -f "$tmp_out"
+  local routes_json matches
+  if ! routes_json=$(yq -o=json -I=0 '.config.routes // []' "$routes_file" 2>/dev/null); then
+    provision::error "Failed to read the routes of $routes_file using yq"
     return 1
   fi
-  mv "$tmp_out" "$routes_file"
+  matches=$(jq -c --arg f "$from_url" \
+    '[to_entries[] | select(.value.from == $f and (.value | has("prefix") or has("path") or has("regex") | not)) | .key]' \
+    <<<"$routes_json") || return 1
+
+  local tmp_out idx
+  tmp_out=$(mktemp)
+  cp "$routes_file" "$tmp_out"
+  idx=$(jq -r '.[0] // empty' <<<"$matches")
+  if [[ -z "$idx" ]]; then
+    local merged
+    merged=$(provision::_pomerium_route_merge null "$route" "$access") || { rm -f "$tmp_out"; return 1; }
+    if ! ROUTE="$merged" yq eval -i '.config.routes += [env(ROUTE) | ... style=""]' "$tmp_out" 2>/dev/null; then
+      provision::error "Failed to add the route for ${from_url} to $routes_file using yq"
+      rm -f "$tmp_out"
+      return 1
+    fi
+  else
+    local existing merged key
+    existing=$(jq -c --argjson i "$idx" '.[$i]' <<<"$routes_json")
+    merged=$(provision::_pomerium_route_merge "$existing" "$route" "$access") || { rm -f "$tmp_out"; return 1; }
+    # Field by field: set what changed, delete what went; the route's own node (and its
+    # comments) stays in place.
+    local set_keys del_keys
+    if ! set_keys=$(jq -rn --argjson e "$existing" --argjson m "$merged" \
+           '$m | keys_unsorted[] as $k | select($e[$k] != $m[$k]) | $k') ||
+       ! del_keys=$(jq -rn --argjson e "$existing" --argjson m "$merged" \
+           '$e | keys_unsorted[] as $k | select($m | has($k) | not) | $k'); then
+      provision::error "Failed to compare the route for ${from_url} with its update"
+      rm -f "$tmp_out"
+      return 1
+    fi
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      if ! K="$key" V="$(jq -c --arg k "$key" '.[$k]' <<<"$merged")" yq eval -i \
+          ".config.routes[${idx}][strenv(K)] = (env(V) | ... style=\"\")" "$tmp_out" 2>/dev/null; then
+        provision::error "Failed to set ${key} of the route for ${from_url} in $routes_file using yq"
+        rm -f "$tmp_out"
+        return 1
+      fi
+    done <<<"$set_keys"
+    while IFS= read -r key; do
+      [[ -n "$key" ]] || continue
+      if ! K="$key" yq eval -i "del(.config.routes[${idx}][strenv(K)])" "$tmp_out" 2>/dev/null; then
+        provision::error "Failed to remove ${key} from the route for ${from_url} in $routes_file using yq"
+        rm -f "$tmp_out"
+        return 1
+      fi
+    done <<<"$del_keys"
+    # The route in the file must now be the merged one; anything else is not written.
+    local written
+    written=$(yq -o=json -I=0 ".config.routes[${idx}]" "$tmp_out" 2>/dev/null)
+    if ! jq -en --argjson w "${written:-null}" --argjson m "$merged" '$w == $m' >/dev/null 2>&1; then
+      provision::error "The route for ${from_url} did not come out as intended; $routes_file left unchanged"
+      rm -f "$tmp_out"
+      return 1
+    fi
+    # Further catch-all routes of the same host never match (Pomerium takes the first): drop them,
+    # last first so the indexes stay valid.
+    local dup
+    for dup in $(jq -r '.[1:] | reverse[]' <<<"$matches"); do
+      if ! yq eval -i "del(.config.routes[${dup}])" "$tmp_out" 2>/dev/null; then
+        provision::error "Failed to remove a duplicate route for ${from_url} from $routes_file using yq"
+        rm -f "$tmp_out"
+        return 1
+      fi
+    done
+  fi
+
+  if cmp -s "$tmp_out" "$routes_file"; then
+    rm -f "$tmp_out"
+    provision::info "Route in $routes_file unchanged: ${from_url} - Pomerium not reloaded"
+    return 0
+  fi
+  # In place, so the file keeps its mode (mktemp's is 0600)
+  cat "$tmp_out" > "$routes_file"
+  rm -f "$tmp_out"
 
   provision::info "Updated route in $routes_file: ${from_url} -> $(jq -r .to <<<"$route")"
 
-  # Apply the updated routes by running helm upgrade on pomerium
+  # Apply the updated routes to the pomerium-config secret and restart Pomerium
   provision::pomerium_reload_routes "$namespace_sso" "$routes_file"
   return 0
+}
+
+# Comma-separated "<github-org>:<team>" list, as GRAFANA_ALLOWED_GROUPS / PGWEB_ALLOWED_GROUPS take
+# it: at least one entry, every non-empty entry of that form (blanks around entries are allowed).
+# Usage: provision::pomerium_groups_valid GROUPS   -> returns 0 or 1
+provision::pomerium_groups_valid() {
+  local groups="$1" entry n=0
+  local IFS=','
+  for entry in $groups; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" ]] && continue
+    [[ "$entry" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?:[A-Za-z0-9._-]+$ ]] || return 1
+    n=$((n + 1))
+  done
+  (( n > 0 ))
 }
 
 # Remove a route by its FROM_URL from the environment's pomerium-routes.yaml
@@ -1282,9 +1421,15 @@ provision::pomerium_routes_remove() {
     return 1
   fi
 
-  # Write back to the file
-  mv "$tmp_out" "$routes_file"
-  
+  if cmp -s "$tmp_out" "$routes_file"; then
+    rm -f "$tmp_out"
+    provision::info "No route for ${from_url} in $routes_file - Pomerium not reloaded"
+    return 0
+  fi
+  # Write back to the file (in place, so it keeps its mode)
+  cat "$tmp_out" > "$routes_file"
+  rm -f "$tmp_out"
+
   provision::info "Removed route from $routes_file: ${from_url}"
   
   # Apply the updated routes by running helm upgrade on pomerium
