@@ -27,6 +27,7 @@ before.
 | `GRAFANA_REMOTE_PROMETHEUS="<name>=<url> ..."` | reading env | One Prometheus datasource per entry, named `Prometheus-<name>` with uid `Prometheus-<name>`, proxy access, basic auth, `timeInterval: 1m`, not the default datasource. `<name>` is lower-case letters, digits and dashes, at most 29 characters. `<url>` is the export's base URL, e.g. `https://prometheus-export.prod.example.com`. |
 | `GRAFANA_FRAME_ANCESTORS="https://portal.example.com ..."` | reading env | Origins (`scheme://host[:port]`, a leading `*.` allowed) that may show Grafana in an iframe. Sets `security.allow_embedding` in `grafana.ini`, and the Pomerium route of the Grafana host answers `Content-Security-Policy: frame-ancestors 'self' <origins>`. |
 | `GRAFANA_POMERIUM_JWT=true` | reading env | Grafana signs users in from the JWT Pomerium adds to every request, instead of asking them to sign in again. Off by default; its section says what changes for people (the role then follows `groups` on every request). |
+| `GRAFANA_ALLOWED_GROUPS="<github-org>:<team>,..."` | any env | Who may pass the Pomerium route of the Grafana host: a policy on the Dex `groups` claim (one `claim/groups` per entry, any of them admits), written over the route's access fields on every run. Unset: a route already in `envs/<env>/pomerium-routes.yaml` keeps its access (a hand-written `policy` stays); a new route admits any signed-in user. |
 
 Malformed values (a CIDR, a name, a URL or an origin that does not parse) fail the run before
 anything changes.
@@ -87,9 +88,12 @@ updates that name's keys only and restarts Grafana, which reads the keys at star
 
 With `GRAFANA_FRAME_ANCESTORS` set, Grafana allows embedding and the Pomerium route carries the
 CSP header. Browsers obey `frame-ancestors` over the `X-Frame-Options: SAMEORIGIN` Pomerium sends
-by default, so only `'self'` and the listed origins can frame Grafana. The route file is
-rewritten on every run (`envs/<env>/pomerium-routes.yaml`), and the header comes from the
-script, so editing it by hand does not last.
+by default, so only `'self'` and the listed origins can frame Grafana. Every run sets the
+header on the route in `envs/<env>/pomerium-routes.yaml` (and takes it off when the property is
+unset), so editing that header by hand does not last. The route's other fields stay as they are,
+and a run that changes nothing in the file does not reload Pomerium. When the reload fails (the
+Secret cannot be read or written, or the restart fails) the run fails and the file is left as it
+was, so the next run tries the same update again.
 
 `grafana.ini` is written only together with the Dex SSO block. A run that skips that block
 (`--skip-sso`, no Dex client, no GitHub org) cannot apply `allow_embedding` and says so; the

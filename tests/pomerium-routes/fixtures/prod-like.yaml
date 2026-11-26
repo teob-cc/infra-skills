@@ -1,0 +1,54 @@
+# Routes of the fake env, shaped like a real one: comments, quoted and plain scalars, a path
+# route on the Grafana host before its catch-all, and other apps' routes around them.
+config:
+  routes:
+    # Argo CD: admins only (hand-written policy)
+    - from: https://argocd.fake.example.test
+      to: http://argocd-server.argocd.svc.cluster.local:80
+      preserve_host_header: true
+      pass_identity_headers: true
+      policy:
+        - allow:
+            or:
+              - claim/groups: fake-org:admins
+    # Grafana MCP: keep this before the catch-all below.
+    - from: https://grafana.fake.example.test
+      prefix: /mcp
+      to: http://mcp-grafana.observability.svc.cluster.local:8000
+      name: grafana-mcp
+      preserve_host_header: true
+      mcp:
+        server: {}
+      policy:
+        - allow:
+            or:
+              - claim/groups: fake-org:admins
+    # Grafana UI: two teams.
+    - from: "https://grafana.fake.example.test"
+      to: "http://grafana.observability.svc.cluster.local:80"
+      preserve_host_header: true
+      pass_identity_headers: true
+      timeout: 60s
+      set_response_headers:
+        # keep crawlers out (comment on a sibling header)
+        X-Robots-Tag: noindex # inline comment
+      policy:
+        - allow:
+            or:
+              - claim/groups: fake-org:uce
+              - claim/groups: fake-org:admins
+    # pgweb: admins (postgres.sh)
+    - from: https://pgweb.fake.example.test
+      to: http://pgweb.postgres.svc.cluster.local:8081
+      preserve_host_header: true
+      pass_identity_headers: true
+      policy:
+        - allow:
+            or:
+              - claim/groups: fake-org:admins
+    # Nexus: any signed-in user (nexus.sh)
+    - from: https://nexus.fake.example.test
+      to: http://nexus.nexus.svc.cluster.local:8081
+      preserve_host_header: true
+      pass_identity_headers: true
+      allow_any_authenticated_user: true

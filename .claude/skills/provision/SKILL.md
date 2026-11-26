@@ -290,6 +290,8 @@ server (docs/GITOPS.md, "Read-only access for agents").
 One env's Grafana can also show other envs' metrics and be framed by named origins
 (`PROMETHEUS_EXPORT_ALLOWED_CIDRS`, `GRAFANA_REMOTE_PROMETHEUS`, `GRAFANA_FRAME_ANCESTORS`):
 docs/GRAFANA-ACROSS-CLUSTERS.md has the order of runs.
+`GRAFANA_ALLOWED_GROUPS="<org>:<team>,..."` limits Grafana's Pomerium route to those Dex groups;
+unset, a route already in `pomerium-routes.yaml` keeps its access (a new one admits any signed-in user).
 
 ### Step 8 — Databases and VPN (optional)
 

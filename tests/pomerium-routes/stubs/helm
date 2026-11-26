@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stand-in for helm in tests/pomerium-routes/run.sh: logs the call, does nothing.
+printf "helm %s\n" "$*" >> "${STUB_LOG:?}"
+exit 0
