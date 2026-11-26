@@ -1170,13 +1170,20 @@ provision::pomerium_reload_routes() {
   
   rm -f "$tmp_config"
   
-  # Restart Pomerium deployment to pick up changes
-  local deploy=""
-  if kubectl -n "$namespace_sso" get deploy pomerium-proxy >/dev/null 2>&1; then
-    deploy=pomerium-proxy
-  elif kubectl -n "$namespace_sso" get deploy pomerium >/dev/null 2>&1; then
-    deploy=pomerium
-  fi
+  # Restart Pomerium deployment to pick up changes. --ignore-not-found tells absence (exit 0, no
+  # output) from a failed lookup (Forbidden, unreachable API: non-zero), which is an error: the
+  # caller then keeps its routes file as it was, so the next run reloads again.
+  local deploy="" name found
+  for name in pomerium-proxy pomerium; do
+    if ! found=$(kubectl -n "$namespace_sso" get deploy "$name" --ignore-not-found -o name 2>/dev/null); then
+      provision::error "pomerium-config updated, but looking up deployment/${name} in ${namespace_sso} failed - not restarted"
+      return 1
+    fi
+    if [[ -n "$found" ]]; then
+      deploy="$name"
+      break
+    fi
+  done
   if [[ -z "$deploy" ]]; then
     provision::warn "No pomerium-proxy or pomerium deployment in ${namespace_sso}: the secret is updated, nothing restarted"
   elif ! kubectl -n "$namespace_sso" rollout restart "deployment/${deploy}" >/dev/null 2>&1; then
@@ -1333,8 +1340,14 @@ provision::_pomerium_routes_upsert() {
     return 1
   fi
 
-  local idx
-  idx=$(jq -r '.[0] // empty' <<<"$matches")
+  # Every step is checked on its own: callers run this inside `if` / `||`, where errexit is off.
+  local idx dups
+  if ! idx=$(jq -r '.[0] // empty' <<<"$matches") ||
+     ! dups=$(jq -r '.[1:] | reverse[]' <<<"$matches"); then
+    provision::error "Failed to read the routes of $routes_file"
+    rm -f "$tmp_out"
+    return 1
+  fi
   if [[ -z "$idx" ]]; then
     local merged
     merged=$(provision::_pomerium_route_merge null "$route" "$access") || { rm -f "$tmp_out"; return 1; }
@@ -1344,8 +1357,12 @@ provision::_pomerium_routes_upsert() {
       return 1
     fi
   else
-    local existing merged ops op
-    existing=$(jq -c --argjson i "$idx" '.[$i]' <<<"$routes_json")
+    local existing merged ops op kind path value
+    if ! existing=$(jq -c --argjson i "$idx" '.[$i]' <<<"$routes_json"); then
+      provision::error "Failed to read the route for ${from_url} in $routes_file"
+      rm -f "$tmp_out"
+      return 1
+    fi
     merged=$(provision::_pomerium_route_merge "$existing" "$route" "$access") || { rm -f "$tmp_out"; return 1; }
     # Path by path: an object present on both sides is descended into, so a changed header
     # leaves its sibling headers' nodes (and their comments) alone; anything else that differs
@@ -1365,21 +1382,28 @@ provision::_pomerium_routes_upsert() {
     fi
     while IFS= read -r op; do
       [[ -n "$op" ]] || continue
-      if jq -e 'has("set")' >/dev/null <<<"$op"; then
-        P="$(jq -c .set <<<"$op")" V="$(jq -c .value <<<"$op")" yq eval -i \
+      # A failed read here must not fall through to a delete.
+      if ! kind=$(jq -r 'if has("set") then "set" elif has("del") then "del" else error("bad op") end' <<<"$op") ||
+         ! path=$(jq -c '.set // .del' <<<"$op") || ! value=$(jq -c '.value' <<<"$op"); then
+        provision::error "Failed to read an update of the route for ${from_url}"
+        rm -f "$tmp_out"
+        return 1
+      fi
+      if [[ "$kind" == set ]]; then
+        P="$path" V="$value" yq eval -i \
           ".config.routes[${idx}] |= setpath(env(P); env(V) | ... style=\"\")" "$tmp_out" 2>/dev/null
       else
-        P="$(jq -c .del <<<"$op")" yq eval -i ".config.routes[${idx}] |= delpaths([env(P)])" "$tmp_out" 2>/dev/null
+        P="$path" yq eval -i ".config.routes[${idx}] |= delpaths([env(P)])" "$tmp_out" 2>/dev/null
       fi || {
-        provision::error "Failed to update $(jq -c '.set // .del' <<<"$op") of the route for ${from_url} using yq"
+        provision::error "Failed to update ${path} of the route for ${from_url} using yq"
         rm -f "$tmp_out"
         return 1
       }
     done <<<"$ops"
     # The route in the file must now be the merged one; anything else is not written.
     local written
-    written=$(yq -o=json -I=0 ".config.routes[${idx}]" "$tmp_out" 2>/dev/null)
-    if ! jq -en --argjson w "${written:-null}" --argjson m "$merged" '$w == $m' >/dev/null 2>&1; then
+    if ! written=$(yq -o=json -I=0 ".config.routes[${idx}]" "$tmp_out" 2>/dev/null) ||
+       ! jq -en --argjson w "${written:-null}" --argjson m "$merged" '$w == $m' >/dev/null 2>&1; then
       provision::error "The route for ${from_url} did not come out as intended; $routes_file left unchanged"
       rm -f "$tmp_out"
       return 1
@@ -1387,7 +1411,7 @@ provision::_pomerium_routes_upsert() {
     # Further catch-all routes of the same host never match (Pomerium takes the first): drop them,
     # last first so the indexes stay valid.
     local dup
-    for dup in $(jq -r '.[1:] | reverse[]' <<<"$matches"); do
+    for dup in $dups; do
       if ! yq eval -i "del(.config.routes[${dup}])" "$tmp_out" 2>/dev/null; then
         provision::error "Failed to remove a duplicate route for ${from_url} from $routes_file using yq"
         rm -f "$tmp_out"
@@ -1416,6 +1440,13 @@ provision::_pomerium_routes_commit() {
     provision::info "Route in $routes_file unchanged: ${what} - Pomerium not reloaded"
     return 0
   fi
+  # Where the write will land (the referent when the routes file is a symlink), checked before
+  # the reload so that a path we cannot write never gets a reload ahead of it.
+  local real
+  if ! real=$(provision::_resolve_symlinks "$routes_file") || [[ ! -d "$(dirname "$real")" ]]; then
+    provision::error "Cannot resolve where $routes_file points (a symlink loop, or its directory is missing) - Pomerium not reloaded"
+    return 1
+  fi
   if ! provision::pomerium_reload_routes "$namespace_sso" "$staged" "$routes_file (staged)"; then
     provision::error "Pomerium not reloaded; $routes_file left as it was, a rerun retries: ${what}"
     return 1
@@ -1424,22 +1455,49 @@ provision::_pomerium_routes_commit() {
     provision::error "Pomerium has the new routes, but $routes_file was not written; a rerun writes it: ${what}"
     return 1
   fi
-  provision::info "Updated route in $routes_file: ${what}"
+  if [[ "$real" != "$routes_file" ]]; then
+    provision::info "Updated route in $routes_file (symlink kept, wrote $real): ${what}"
+  else
+    provision::info "Updated route in $routes_file: ${what}"
+  fi
   return 0
 }
 
-# Replace TARGET with the content of SOURCE atomically: a temp file next to TARGET gets TARGET's
-# mode (cp -p; a new file gets 0666 minus the umask), the content, a byte-for-byte check against
-# SOURCE, then mv over TARGET. A failed or short write leaves TARGET untouched and returns 1.
+# The file PATH finally names, following symlinks (relative ones against the link's directory),
+# with plain readlink, which macOS and GNU both have (no readlink -f / realpath). A path that is
+# not a symlink comes back as it is. Returns 1 after 40 hops (a loop) or a failed readlink.
+# Usage: provision::_resolve_symlinks PATH   -> echoes the path
+provision::_resolve_symlinks() {
+  local path="$1" link hops=0
+  while [[ -L "$path" ]]; do
+    hops=$((hops + 1))
+    (( hops <= 40 )) || return 1
+    link=$(readlink "$path") || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *) path="$(dirname "$path")/${link}" ;;
+    esac
+  done
+  printf '%s\n' "$path"
+}
+
+# Replace TARGET with the content of SOURCE atomically. A symlink TARGET stays a symlink: its
+# referent (provision::_resolve_symlinks) is what gets replaced. A temp file next to that file gets
+# its mode (cp -p; a new file gets 0666 minus the umask), the content, a byte-for-byte check
+# against SOURCE, then mv over it. A failed or short write leaves it untouched and returns 1.
 # Usage: provision::_replace_file_atomic TARGET SOURCE
 provision::_replace_file_atomic() {
   local target="$1" source="$2" dir base stage
+  if ! target=$(provision::_resolve_symlinks "$1"); then
+    provision::error "Cannot resolve where $1 points (symlink loop?); left as it was"
+    return 1
+  fi
   dir=$(dirname "$target") base=$(basename "$target")
   stage=$(mktemp "${dir}/.${base}.XXXXXX") || { provision::error "Cannot create a temp file in ${dir}"; return 1; }
   if [[ -e "$target" ]]; then
     cp -p "$target" "$stage" || { provision::error "Cannot copy the mode of ${target}"; rm -f "$stage"; return 1; }
   else
-    chmod "$(printf '%o' $(( 0666 & ~8#$(umask) )))" "$stage" || { rm -f "$stage"; return 1; }
+    chmod "$(printf '%o' $(( 0666 & ~8#$(umask) )))" "$stage" || { provision::error "Cannot set the mode of ${stage}"; rm -f "$stage"; return 1; }
   fi
   if ! cat "$source" > "$stage" || ! cmp -s "$source" "$stage"; then
     provision::error "Writing ${stage} failed or came out short; ${target} left as it was"

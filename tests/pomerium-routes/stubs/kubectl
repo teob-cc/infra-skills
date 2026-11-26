@@ -7,6 +7,9 @@
 #   STUB_FAIL_SECRET_READ  the read of pomerium-config
 #   STUB_FAIL_APPLY        `apply -f -`
 #   STUB_FAIL_ROLLOUT      `rollout restart`
+#   STUB_FAIL_GET_DEPLOY   `get deploy` (Forbidden, like a missing RBAC verb)
+#   STUB_FAIL_INGRESS_APPLY  `apply -f -` of anything but the Secret (the Ingress)
+# STUB_NO_DEPLOY=1: no Pomerium deployment exists (`get deploy --ignore-not-found` prints nothing).
 set -uo pipefail
 printf '%s\n' "$*" >> "${STUB_LOG:?}"
 secret="${STUB_LOG}.secret"
@@ -36,12 +39,18 @@ case "$args" in
         rm -f "${secret}.staged"; echo "stub: apply refused" >&2; exit 1
       fi
       mv "${secret}.staged" "$secret"
+    elif [[ "${STUB_FAIL_INGRESS_APPLY:-0}" == 1 ]]; then
+      echo "stub: admission webhook denied the Ingress" >&2; exit 1
     fi
     exit 0 ;;
   *" rollout restart "*)
     [[ "${STUB_FAIL_ROLLOUT:-0}" == 1 ]] && { echo "stub: rollout refused" >&2; exit 1; }
     exit 0 ;;
-  *" get deploy pomerium-proxy "*) exit 0 ;;
+  *" get deploy "*)
+    [[ "${STUB_FAIL_GET_DEPLOY:-0}" == 1 ]] && { echo 'Error from server (Forbidden): deployments.apps is forbidden' >&2; exit 1; }
+    [[ "${STUB_NO_DEPLOY:-0}" == 1 ]] && exit 0
+    [[ "$args" == *" get deploy pomerium-proxy "* ]] && echo deployment.apps/pomerium-proxy
+    exit 0 ;;
   # observability.sh checks its context first (provision::check_context)
   *" config current-context "*|*" config get-contexts "*) echo fake; exit 0 ;;
 esac

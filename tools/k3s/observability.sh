@@ -715,9 +715,12 @@ grafana_remote_prometheus_blocks() {
 # apply behind it; its password login and basic-auth API are no longer reachable from
 # outside. In-cluster callers (provision::grafana_api, mcp-grafana) use the Service and are
 # unaffected. The host's path routes (grafana-mcp's /mcp) are kept by pomerium_routes_add.
+#
+# The caller runs it as `ensure_grafana_pomerium || exit 1`, which turns errexit off inside, so
+# every step that can fail is checked here and returns its failure.
 ensure_grafana_pomerium() {
   log "Fronting https://${GRAFANA_HOST} with Pomerium ..."
-  kubectl apply -f - <<YAML
+  kubectl apply -f - <<YAML || { err "Failed to apply ingress ${NAMESPACE_SSO}/grafana-pomerium - Pomerium route not touched"; return 1; }
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -749,7 +752,8 @@ YAML
   # response headers stay) and a new route is what it always was.
   local route_extra='{"set_response_headers":{"Content-Security-Policy":null}}'
   if [[ -n "$grafana_frame_csp" ]]; then
-    route_extra=$(jq -cn --arg csp "$grafana_frame_csp" '{set_response_headers: {"Content-Security-Policy": $csp}}')
+    route_extra=$(jq -cn --arg csp "$grafana_frame_csp" '{set_response_headers: {"Content-Security-Policy": $csp}}') ||
+      { err "Failed to build the CSP route option"; return 1; }
     info "Pomerium route for ${GRAFANA_HOST} answers Content-Security-Policy: ${grafana_frame_csp}"
   fi
   local from_url="https://${GRAFANA_HOST}" to_url="http://grafana.${NAMESPACE_OBSERVABILITY}.svc.cluster.local:80"

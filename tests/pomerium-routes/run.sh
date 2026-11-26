@@ -36,6 +36,12 @@
 #       files, and the validator checks the entries the renderer makes;
 #   R4. a CSP change keeps the head and inline comments of the sibling header; set then unset
 #       gives the fixture back byte for byte.
+#   R5. a Forbidden `get deploy` fails the reload (file kept, retried by the identical rerun); a
+#       real NotFound still succeeds with a warning;
+#   R6. a refused Ingress apply fails ensure_grafana_pomerium before any route call, also under
+#       set -e at the `|| exit 1` call site;
+#   R7. a relative symlink (and a chain of two) stays a link and its referent is replaced (mode
+#       kept, no temp files, rerun a no-op); a symlink loop is refused before any reload.
 #
 # Usage: tests/pomerium-routes/run.sh        (needs bash, jq, yq v4, git for check 1)
 # The helpers run in subshells on purpose (each case its own PATH, STUB_LOG and envs root), and the
@@ -421,6 +427,89 @@ check "R4 CSP set: the sibling header's inline comment stays" grep -q "X-Robots-
 check "R4 CSP set: the header is there" jqe '.set_response_headers["Content-Security-Policy"] | startswith("frame-ancestors")' <<<"$(catch_all r4 "$G")"
 grafana r4 "" ""
 check "R4 CSP set then unset: the file is byte for byte the fixture again" cmp -s "$HERE/fixtures/prod-like.yaml" "$(routes_file r4)"
+
+# ===== Round 3 (validator findings on 96e75e9, INFRA-253 comment 17348) ============================
+# --- R5. a failed deployment lookup (Forbidden) is an error, not "no deployment" -----------------
+setup r5-forbidden open-grafana.yaml
+cp "$(routes_file r5-forbidden)" "$WORK/r5-forbidden/before.yaml"
+rc=0; STUB_FAIL_GET_DEPLOY=1 grafana r5-forbidden "fake-org:admins" "" || rc=$?
+check "R5 get deploy Forbidden: ensure_grafana_pomerium fails (exit $rc)" [ "$rc" -ne 0 ]
+check "R5 get deploy Forbidden: says the lookup failed" grep -q "looking up deployment/pomerium-proxy in sso failed" "$WORK/r5-forbidden/output.txt"
+check "R5 get deploy Forbidden: routes file byte for byte as before, no rollout" \
+  bash -c "cmp -s '$WORK/r5-forbidden/before.yaml' '$(routes_file r5-forbidden)' && ! grep -q 'rollout restart' '$WORK/r5-forbidden/kubectl.log'"
+: > "$WORK/r5-forbidden/kubectl.log"
+rc=0; grafana r5-forbidden "fake-org:admins" "" || rc=$?
+check "R5 lookup recovered, identical rerun: applies, restarts pomerium-proxy, writes the file" \
+  bash -c "[ $rc -eq 0 ] && grep -q 'create secret generic pomerium-config' '$WORK/r5-forbidden/kubectl.log' && grep -q 'rollout restart deployment/pomerium-proxy' '$WORK/r5-forbidden/kubectl.log' && ! cmp -s '$WORK/r5-forbidden/before.yaml' '$(routes_file r5-forbidden)'"
+check "R5 rerun: the file has the policy" jqe '.policy | length == 1' <<<"$(catch_all r5-forbidden "$G")"
+# a real NotFound (no Pomerium deployment at all) is still a success with a warning
+setup r5-notfound open-grafana.yaml
+rc=0; STUB_NO_DEPLOY=1 grafana r5-notfound "fake-org:admins" "" || rc=$?
+check "R5 no deployment (NotFound): succeeds, warns, writes the file, no rollout" \
+  bash -c "[ $rc -eq 0 ] && grep -q 'nothing restarted' '$WORK/r5-notfound/output.txt' && ! grep -q 'rollout restart' '$WORK/r5-notfound/kubectl.log' && grep -q 'claim/groups: fake-org:admins' '$(routes_file r5-notfound)'"
+
+# --- R6. a refused Ingress apply fails before the route step --------------------------------------
+setup r6-ingress open-grafana.yaml
+cp "$(routes_file r6-ingress)" "$WORK/r6-ingress/before.yaml"
+rc=0; STUB_FAIL_INGRESS_APPLY=1 grafana r6-ingress "fake-org:admins" "" || rc=$?
+check "R6 Ingress apply refused: ensure_grafana_pomerium fails (exit $rc)" [ "$rc" -ne 0 ]
+check "R6 Ingress apply refused: says so" grep -q "Failed to apply ingress sso/grafana-pomerium" "$WORK/r6-ingress/output.txt"
+check "R6 Ingress apply refused: no Secret read or write, no rollout, file as before" \
+  bash -c "! grep -qE 'pomerium-config|rollout' '$WORK/r6-ingress/kubectl.log' && cmp -s '$WORK/r6-ingress/before.yaml' '$(routes_file r6-ingress)'"
+# as observability.sh calls it: under set -euo pipefail, `ensure_grafana_pomerium || exit 1`
+setup r6-callsite open-grafana.yaml
+callsite_rc=0
+( export PATH="$HERE/stubs:$PATH" STUB_LOG="$WORK/r6-callsite/kubectl.log" INFRA_ENVS_ROOT="$WORK/r6-callsite/envs" \
+    ENV_NAME=fake STUB_FAIL_INGRESS_APPLY=1
+  bash -c 'set -euo pipefail
+    source "$1/tools/provision-common.sh"
+    log() { :; }; info() { :; }; warn() { :; }; err() { echo "ERR $*"; }
+    GRAFANA_HOST=grafana.fake.example.test NAMESPACE_SSO=sso NAMESPACE_OBSERVABILITY=observability
+    CLUSTER_ISSUER=letsencrypt INGRESS_CLASS=traefik GRAFANA_ALLOWED_GROUPS=fake-org:admins grafana_frame_csp=""
+    source "$2"
+    ensure_grafana_pomerium || exit 1
+    echo "AFTER the route step"' _ "$REPO" "$GRAFANA_FN" ) >"$WORK/r6-callsite/output.txt" 2>&1 || callsite_rc=$?
+check "R6 call site under set -e with || exit 1: exits 1, never gets past, no route calls" \
+  bash -c "[ $callsite_rc = 1 ] && ! grep -q 'AFTER' '$WORK/r6-callsite/output.txt' && ! grep -qE 'pomerium-config|rollout' '$WORK/r6-callsite/kubectl.log'"
+
+# --- R7. a symlinked routes file stays a symlink; the referent is replaced atomically -------------
+setup r7 none
+mkdir -p "$WORK/r7/shared"
+cp "$HERE/fixtures/open-grafana.yaml" "$WORK/r7/shared/routes.yaml"
+chmod 640 "$WORK/r7/shared/routes.yaml"
+ln -s ../../shared/routes.yaml "$(routes_file r7)"
+rc=0; grafana r7 "fake-org:admins" "" || rc=$?
+check "R7 relative symlink: succeeds (exit $rc)" [ "$rc" -eq 0 ]
+check "R7 relative symlink: still a symlink with the same target text" \
+  bash -c "[ -L '$(routes_file r7)' ] && [ \"\$(readlink '$(routes_file r7)')\" = ../../shared/routes.yaml ]"
+check "R7 relative symlink: the referent has the new policy and kept mode 640" \
+  bash -c "grep -q 'claim/groups: fake-org:admins' '$WORK/r7/shared/routes.yaml' && ! grep -q allow_any_authenticated_user: '$WORK/r7/shared/routes.yaml' && [ \"\$(stat -f %Lp '$WORK/r7/shared/routes.yaml' 2>/dev/null || stat -c %a '$WORK/r7/shared/routes.yaml')\" = 640 ]"
+check "R7 relative symlink: no temp file left in either directory" \
+  [ -z "$(find "$WORK/r7/shared" "$WORK/r7/envs/fake" -name '.*.yaml.*')" ]
+: > "$WORK/r7/kubectl.log"
+grafana r7 "fake-org:admins" ""
+check "R7 relative symlink, identical rerun: no reload" no_reload_calls r7
+# a chain of two relative links
+setup r7-chain none
+mkdir -p "$WORK/r7-chain/shared/real"
+cp "$HERE/fixtures/open-grafana.yaml" "$WORK/r7-chain/shared/real/routes.yaml"
+ln -s real/routes.yaml "$WORK/r7-chain/shared/routes.yaml"
+ln -s ../../shared/routes.yaml "$(routes_file r7-chain)"
+rc=0; grafana r7-chain "fake-org:admins" "" || rc=$?
+check "R7 chain of two relative links: both stay links, the final file is updated" \
+  bash -c "[ $rc -eq 0 ] && [ -L '$(routes_file r7-chain)' ] && [ -L '$WORK/r7-chain/shared/routes.yaml' ] && grep -q 'claim/groups: fake-org:admins' '$WORK/r7-chain/shared/real/routes.yaml'"
+# a symlink loop is refused before any reload
+setup r7-loop none
+ln -s loop-b.yaml "$WORK/r7-loop/envs/fake/loop-a.yaml"
+ln -s loop-a.yaml "$WORK/r7-loop/envs/fake/loop-b.yaml"
+ln -s loop-a.yaml "$(routes_file r7-loop)"
+rc=0; grafana r7-loop "fake-org:admins" "" || rc=$?
+check "R7 symlink loop: fails, no Secret read or write, no rollout, links untouched" \
+  bash -c "[ $rc -ne 0 ] && ! grep -qE 'pomerium-config|rollout' '$WORK/r7-loop/kubectl.log' && [ -L '$(routes_file r7-loop)' ]"
+check "R7 provision::_resolve_symlinks: absolute target, plain file, missing file" \
+  bash -c "source '$REPO/tools/provision-common.sh'; d='$WORK/r7-resolve'; mkdir -p \"\$d\"; : > \"\$d/f\"; ln -sf \"\$d/f\" \"\$d/abs\";
+    [ \"\$(provision::_resolve_symlinks \"\$d/abs\")\" = \"\$d/f\" ] && [ \"\$(provision::_resolve_symlinks \"\$d/f\")\" = \"\$d/f\" ] &&
+    [ \"\$(provision::_resolve_symlinks \"\$d/none\")\" = \"\$d/none\" ]"
 echo
 if (( failures > 0 )); then
   echo "$failures check(s) failed (work dir kept: $WORK)"
